@@ -177,7 +177,13 @@ gguf_open(gguf *g, const char *path, char *err, size_t errlen)
 		goto fail;
 	}
 	g->size = (size_t)st.st_size;
+#ifdef MAP_PREFAULT_READ
+	/* map the pages already in memory now, not on first touch (the
+	 * first token would otherwise take ~650k soft faults) */
+	g->map = mmap(NULL, g->size, PROT_READ, MAP_SHARED | MAP_PREFAULT_READ, g->fd, 0);
+#else
 	g->map = mmap(NULL, g->size, PROT_READ, MAP_SHARED, g->fd, 0);
+#endif
 	if (g->map == MAP_FAILED) {
 		g->map = NULL;
 		snprintf(err, errlen, "%s: mmap failed", path);
