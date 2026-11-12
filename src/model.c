@@ -9,6 +9,7 @@
 #include "pool.h"
 #include "quant.h"
 #include "vk.h"
+#include "vmath.h"
 
 int g_ref;
 double g_gpu_share = 0.6;
@@ -480,20 +481,7 @@ tr(const char *name, int il, const float *v, int n)
 static void
 rmsnorm(float *o, const float *x, const float *w, int n, float eps)
 {
-	double ss = 0;
-	float sc;
-	int i;
-	for (i = 0; i < n; i++)
-		ss += (double)x[i] * x[i];
-	sc = 1.0f / sqrtf((float)(ss / n) + eps);
-	for (i = 0; i < n; i++)
-		o[i] = x[i] * sc * w[i];
-}
-
-static float
-silu(float x)
-{
-	return x / (1.0f + expf(-x));
+	v_rmsnorm(o, x, w, (size_t)n, eps);
 }
 
 static float
@@ -572,8 +560,9 @@ mamba2(const model *m, const layer *L, state *s, int il)
 		cs[c] = cs[CH + c];
 		cs[CH + c] = cs[2 * CH + c];
 		cs[2 * CH + c] = xbc_in[c];
-		s->xbc[c] = silu(v);
+		s->xbc[c] = v;
 	}
+	v_silu(s->xbc, (size_t)CH);
 	for (i = 0; i < h->ssm_heads; i++)
 		dt[i] = softplus(dtr[i] + L->dt_b[i]);
 
@@ -589,8 +578,7 @@ mamba2(const model *m, const layer *L, state *s, int il)
 	}
 
 	/* gate with silu(z), grouped (n_group = 1) rms norm */
-	for (i = 0; i < DI; i++)
-		s->y[i] *= silu(z[i]);
+	v_mul_silu(s->y, z, (size_t)DI);
 	rmsnorm(s->y, s->y, L->ssm_norm, DI, h->eps);
 
 	mv1(&L->ssm_out, 0, s->y, s->tmp);
@@ -623,26 +611,19 @@ att_worker(void *arg, int ith, int nth)
 		float mx = -INFINITY, sum = 0;
 		int t, d;
 		for (t = 0; t < j->n; t++) {
-			const float *k = kc + (size_t)t * kvd + off;
-			float sc = 0;
-			for (d = 0; d < hd; d++)
-				sc += q[d] * k[d];
-			a[t] = sc * h->attn_scale;
+			a[t] = v_dot(q, kc + (size_t)t * kvd + off, (size_t)hd) * h->attn_scale;
 			if (a[t] > mx)
 				mx = a[t];
 		}
-		for (t = 0; t < j->n; t++) {
-			a[t] = expf(a[t] - mx);
+		for (t = 0; t < j->n; t++)
+			a[t] -= mx;
+		v_exp(a, a, (size_t)j->n);
+		for (t = 0; t < j->n; t++)
 			sum += a[t];
-		}
 		for (d = 0; d < hd; d++)
 			o[d] = 0;
-		for (t = 0; t < j->n; t++) {
-			const float *v = vc + (size_t)t * kvd + off;
-			const float p = a[t] / sum;
-			for (d = 0; d < hd; d++)
-				o[d] += p * v[d];
-		}
+		for (t = 0; t < j->n; t++)
+			v_axpy(o, a[t] / sum, vc + (size_t)t * kvd + off, (size_t)hd);
 	}
 }
 
@@ -686,14 +667,8 @@ moe(const model *m, const layer *L, state *s)
 
 	/* router: softmax over experts, top-k, renormalise (= softmax over
 	 * the chosen logits) */
-	for (i = 0; i < h->n_expert; i++) {
-		const float *r = L->router + (size_t)i * E;
-		float acc = 0;
-		int d;
-		for (d = 0; d < E; d++)
-			acc += r[d] * s->xn[d];
-		s->rl[i] = acc;
-	}
+	for (i = 0; i < h->n_expert; i++)
+		s->rl[i] = v_dot(L->router + (size_t)i * E, s->xn, (size_t)E);
 	for (k = 0; k < K; k++) {
 		int best = -1;
 		for (i = 0; i < h->n_expert; i++) {
@@ -721,10 +696,8 @@ moe(const model *m, const layer *L, state *s)
 	}
 	mv_run(it, n);
 
-	for (i = 0; i < h->n_ff_sh; i++)
-		s->hs_g[i] = silu(s->hs_g[i]) * s->hs_u[i];
-	for (i = 0; i < K * FF; i++)
-		s->he_g[i] = silu(s->he_g[i]) * s->he_u[i];
+	v_swiglu(s->hs_g, s->hs_u, (size_t)h->n_ff_sh);
+	v_swiglu(s->he_g, s->he_u, (size_t)K * FF);
 
 	n = 0;
 	it[n].w = &L->down_s; it[n].e = 0; it[n].x = s->hs_g; it[n].y = s->so; n++;
@@ -734,16 +707,9 @@ moe(const model *m, const layer *L, state *s)
 	}
 	mv_run(it, n);
 
-	for (i = 0; i < E; i++) {
-		float acc = 0;
-		for (k = 0; k < K; k++)
-			acc += wk[k] / wsum * s->eo[k * E + i];
-		s->tmp[i] = acc;
-	}
-	tr("ffn_moe_out", (int)(L - m->L), s->tmp, E);
-	tr("ffn_shexp", (int)(L - m->L), s->so, E);
-	for (i = 0; i < E; i++)
-		s->tmp[i] += s->so[i];
+	memcpy(s->tmp, s->so, sizeof(float) * (size_t)E);
+	for (k = 0; k < K; k++)
+		v_axpy(s->tmp, wk[k] / wsum, s->eo + k * E, (size_t)E);
 }
 
 /* ---------------------------------------------------------------- */
@@ -772,14 +738,12 @@ model_forward(const model *m, state *s, int tok, int want_logits)
 		else
 			mamba2(m, L, s, il);
 		tr(L->attn ? "attn_out" : "mamba_out", il, s->tmp, E);
-		for (i = 0; i < E; i++)
-			s->x[i] += h->res_scale * s->tmp[i];
+		v_axpy(s->x, h->res_scale, s->tmp, (size_t)E);
 		tr("ffn_inp", il, s->x, E);
 
 		rmsnorm(s->xn, s->x, L->ffn_norm, E, h->eps);
 		moe(m, L, s);
-		for (i = 0; i < E; i++)
-			s->x[i] += h->res_scale * s->tmp[i];
+		v_axpy(s->x, h->res_scale, s->tmp, (size_t)E);
 		tr("l_out", il, s->x, E);
 	}
 	s->pos++;

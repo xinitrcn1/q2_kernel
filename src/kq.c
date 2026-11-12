@@ -24,6 +24,57 @@ q8k_quantize(const float *x, q8k *y, size_t n)
 
 	for (b = 0; b < n / 256; b++, x += 256, y++) {
 		float amax = 0, mx = 0, is;
+#if defined(__AVX2__)
+		/* same result as the scalar loop below: lrintf and cvtps both
+		 * round to nearest even, and |is*x| <= 127 */
+		__m256 vmax = _mm256_loadu_ps(x), vmin = vmax;
+		for (i = 8; i < 256; i += 8) {
+			__m256 v = _mm256_loadu_ps(x + i);
+			vmax = _mm256_max_ps(vmax, v);
+			vmin = _mm256_min_ps(vmin, v);
+		}
+		{
+			float mxs[8], mns[8], hi, lo;
+			_mm256_storeu_ps(mxs, vmax);
+			_mm256_storeu_ps(mns, vmin);
+			hi = mxs[0];
+			lo = mns[0];
+			for (i = 1; i < 8; i++) {
+				hi = mxs[i] > hi ? mxs[i] : hi;
+				lo = mns[i] < lo ? mns[i] : lo;
+			}
+			/* the signed extreme; on a tie ggml takes the first
+			 * index, but either sign gives the same products */
+			mx = hi >= -lo ? hi : lo;
+			amax = fabsf(mx);
+		}
+		if (amax == 0) {
+			memset(y, 0, sizeof(*y));
+			continue;
+		}
+		is = -127.0f / mx;
+		y->d = 1 / is;
+		{
+			__m256 vs = _mm256_set1_ps(is);
+			for (i = 0; i < 256; i += 32) {
+				__m256i a = _mm256_cvtps_epi32(_mm256_mul_ps(vs, _mm256_loadu_ps(x + i)));
+				__m256i c = _mm256_cvtps_epi32(_mm256_mul_ps(vs, _mm256_loadu_ps(x + i + 8)));
+				__m256i d = _mm256_cvtps_epi32(_mm256_mul_ps(vs, _mm256_loadu_ps(x + i + 16)));
+				__m256i e = _mm256_cvtps_epi32(_mm256_mul_ps(vs, _mm256_loadu_ps(x + i + 24)));
+				__m256i p = _mm256_packs_epi16(_mm256_packs_epi32(a, c), _mm256_packs_epi32(d, e));
+				/* packs interleave 128-bit lanes: restore order */
+				p = _mm256_permutevar8x32_epi32(p, _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7));
+				_mm256_storeu_si256((__m256i *)(y->qs + i), p);
+			}
+		}
+		for (j = 0; j < 16; j++) {
+			int s = 0;
+			for (i = 0; i < 16; i++)
+				s += y->qs[16 * j + i];
+			y->bsums[j] = (int16_t)s;
+		}
+		continue;
+#endif
 		/* same rounding as ggml's quantize_row_q8_K: scale by the
 		 * signed extreme, round to nearest even */
 		for (i = 0; i < 256; i++) {

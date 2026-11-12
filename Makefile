@@ -1,8 +1,8 @@
 # q2k: GGUF kernel for Granite 4.0-H (BSD make)
 
 PROG=		q2k
-SRCS=		main.c gguf.c quant.c kq.c pool.c model.c tok.c ucd.c vk.c
-HDRS=		gguf.h quant.h kq.h pool.h model.h tok.h vk.h
+SRCS=		main.c gguf.c quant.c kq.c pool.c model.c tok.c ucd.c vk.c vmath.c
+HDRS=		gguf.h quant.h kq.h pool.h model.h tok.h vk.h vmath.h
 QTYPES=		q2_k q3_k q4_k q5_k q6_k q8_0
 QT.q2_k=	10
 QT.q3_k=	11
