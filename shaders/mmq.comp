@@ -1,0 +1,284 @@
+#version 450
+/*
+ * Y[t][row] = dot(W[row], x_t) for one quantized weight type (QT) over a
+ * batch of tokens, x_t as q8k blocks (per 256 elements: float d, int8
+ * qs[256], int16 bsums[16] = 73 words): a tiled int8 GEMM (see main).
+ * dec() gives a lane's 16 weights of a 256-block as four groups of four
+ * (packed unsigned weights, offset, integer scales, D/M floats):
+ *   w = D * sa * u + M * sb   (per group)
+ * Blocks were repacked on upload to 4-byte alignment:
+ *   Q2_K  84 B: sc[16] qs[64] d dmin
+ *   Q3_K 112 B: hmask[32] qs[64] sc[12] d pad
+ *   Q4_K 144 B: d dmin sc[12] qs[128]
+ *   Q5_K 176 B: d dmin sc[12] qh[32] qs[128]
+ *   Q6_K 212 B: ql[128] qh[64] sc[16] d pad
+ */
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : require
+#ifndef NO_DOT
+#extension GL_EXT_integer_dot_product : require
+#endif
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer Wb { uint W[]; };
+layout(std430, binding = 1) buffer Yb { float Y[]; };
+layout(std430, binding = 2) readonly buffer Xb { uint X[]; };
+
+layout(push_constant) uniform PC {
+	uint w_off;     /* words */
+	uint row_words;
+	uint K;
+	uint N;
+	uint x_off;     /* words: first q8k block of token 0 */
+	uint y_off;     /* floats */
+	uint rps;       /* consecutive rows per subgroup */
+	uint T;         /* tokens */
+	uint x_stride;  /* words between tokens */
+	uint y_stride;  /* floats between tokens */
+} pc;
+
+#define ONES 0x01010101u
+
+#ifdef NO_DOT
+int idot(uint a, uint b)
+{
+	ivec4 x = (ivec4(a) << ivec4(24, 16, 8, 0)) >> 24;
+	ivec4 y = (ivec4(b) << ivec4(24, 16, 8, 0)) >> 24;
+	return x.x * y.x + x.y * y.y + x.z * y.z + x.w * y.w;
+}
+#else
+int idot(uint a, uint b) { return dotPacked4x8EXT(int(a), int(b)); }
+#endif
+
+uint b8(uint w, uint i) { return (w >> (8u * i)) & 0xffu; }
+
+/* a lane's 16 weights as four groups of four:
+ *   sum = D * sum_j sa_j*dot(q_j, x) + M * sum_j sb_j*dot(1, x)
+ * (integer scales: two conversions per token, not eight) */
+struct grp {
+	uint q[4];      /* packed weights */
+	uint o[4];      /* element offset in the block */
+	int sa[4], sb[4];
+	float D, M;
+};
+
+#if QT == 10 /* Q2_K: w = d*sc*u - dmin*m */
+#define BW 21u
+#define BE 256u
+void dec(uint bw, uint l, out grp g)
+{
+	uint c = l >> 3, o = (4u * l) & 31u, h = o >> 4;
+	uint q = W[bw + 4u + l];
+	uint s0 = W[bw + 2u * c] >> (8u * h), s1 = W[bw + 2u * c + 1u] >> (8u * h);
+	uint sc[4] = uint[4](s0 & 0xffu, (s0 >> 16) & 0xffu, s1 & 0xffu, (s1 >> 16) & 0xffu);
+	vec2 dm = unpackHalf2x16(W[bw + 20u]);
+	[[unroll]] for (uint j = 0u; j < 4u; j++) {
+		g.q[j] = (q >> (2u * j)) & 0x03030303u;
+		g.o[j] = 128u * c + 32u * j + o;
+		g.sa[j] = int(sc[j] & 15u);
+		g.sb[j] = int(sc[j] >> 4);
+	}
+	g.D = dm.x;
+	g.M = -dm.y;
+}
+#elif QT == 11 /* Q3_K: w = d*sc*(u - 4) */
+#define BW 28u
+#define BE 256u
+void dec(uint bw, uint l, out grp g)
+{
+	uint c = l >> 3, o = (4u * l) & 31u, h = o >> 4;
+	uint q = W[bw + 8u + l];
+	uint hm = W[bw + (o >> 2)];
+	uint lo0 = W[bw + 24u] >> (8u * h), lo1 = W[bw + 25u] >> (8u * h);
+	uint hi = W[bw + 26u] >> (8u * h);
+	float d = unpackHalf2x16(W[bw + 27u]).x;
+	[[unroll]] for (uint j = 0u; j < 4u; j++) {
+		uint lw = j < 2u ? lo0 : lo1;
+		uint lo = (lw >> (16u * (j & 1u) + 4u * c)) & 15u;
+		uint hb = (hi >> (16u * (j & 1u) + 2u * (2u * c + (j >> 1)))) & 3u;
+		int sc = int(lo | (hb << 4)) - 32;
+		g.q[j] = ((q >> (2u * j)) & 0x03030303u) | (((hm >> (4u * c + j)) & ONES) << 2);
+		g.o[j] = 128u * c + 32u * j + o;
+		g.sa[j] = sc;
+		g.sb[j] = -4 * sc;
+	}
+	g.D = d;
+	g.M = d;
+}
+#elif QT == 12 || QT == 13 /* Q4_K, Q5_K: w = d*sc*u - dmin*mn */
+#if QT == 12
+#define BW 36u
+#define QS 4u
+#else
+#define BW 44u
+#define QS 12u
+#endif
+#define BE 256u
+void dec(uint bw, uint l, out grp g)
+{
+	uint c = l >> 2, l0 = (8u * l) & 31u;
+	/* 6-bit scales/mins as whole words (the forms proved for kq.c) */
+	uint a0 = W[bw + 1u], a1 = W[bw + 2u], a2 = W[bw + 3u];
+	uint scw = c < 2u ? a0 & 0x3f3f3f3fu : (a2 & 0x0f0f0f0fu) | (((a0 >> 6) & 0x03030303u) << 4);
+	uint mnw = c < 2u ? a1 & 0x3f3f3f3fu : ((a2 >> 4) & 0x0f0f0f0fu) | (((a1 >> 6) & 0x03030303u) << 4);
+	uint sh = 16u * (c & 1u);
+	vec2 dm = unpackHalf2x16(W[bw]);
+	int s0 = int((scw >> sh) & 255u), s1 = int((scw >> (sh + 8u)) & 255u);
+	int m0 = int((mnw >> sh) & 255u), m1 = int((mnw >> (sh + 8u)) & 255u);
+	g.D = dm.x;
+	g.M = -dm.y;
+	[[unroll]] for (uint k = 0u; k < 2u; k++) {
+		uint q = W[bw + QS + 2u * l + k];
+		uint lo = q & 0x0f0f0f0fu, hi = (q >> 4) & 0x0f0f0f0fu;
+#if QT == 13
+		uint qh = W[bw + 4u + (l0 >> 2) + k];
+		lo |= ((qh >> (2u * c)) & ONES) << 4;
+		hi |= ((qh >> (2u * c + 1u)) & ONES) << 4;
+#endif
+		g.q[2u * k] = lo;
+		g.o[2u * k] = 64u * c + l0 + 4u * k;
+		g.sa[2u * k] = s0;
+		g.sb[2u * k] = m0;
+		g.q[2u * k + 1u] = hi;
+		g.o[2u * k + 1u] = 64u * c + 32u + l0 + 4u * k;
+		g.sa[2u * k + 1u] = s1;
+		g.sb[2u * k + 1u] = m1;
+	}
+}
+#elif QT == 14 /* Q6_K: w = d*sc*(u - 32) */
+#define BW 53u
+#define BE 256u
+void dec(uint bw, uint l, out grp g)
+{
+	uint c = l >> 3, l0 = 4u * (l & 7u);
+	uint la = W[bw + 16u * c + (l0 >> 2)], lb = W[bw + 16u * c + 8u + (l0 >> 2)];
+	uint hh = W[bw + 32u + 8u * c + (l0 >> 2)];
+	uint sw0 = W[bw + 48u + 2u * c], sw1 = W[bw + 49u + 2u * c];
+	float d = unpackHalf2x16(W[bw + 52u]).x;
+	[[unroll]] for (uint t = 0u; t < 4u; t++) {
+		uint w = (t & 1u) != 0u ? lb : la;
+		uint u = ((t & 2u) != 0u ? (w >> 4) : w) & 0x0f0f0f0fu;
+		uint sb = 2u * t + (l0 >> 4);
+		int sc = int((sb < 4u ? sw0 : sw1) << (24u - 8u * (sb & 3u))) >> 24;
+		g.q[t] = u | (((hh >> (2u * t)) & 0x03030303u) << 4);
+		g.o[t] = 128u * c + 32u * t + l0;
+		g.sa[t] = sc;
+		g.sb[t] = -32 * sc;
+	}
+	g.D = d;
+	g.M = d;
+}
+#elif QT == 8 /* Q8_0: w = d*q (signed) */
+#define BW 72u
+#define BE 256u
+void dec(uint bw, uint l, out grp g)
+{
+	uint qb = bw + 9u * (l >> 1), base = 4u * (l & 1u);
+	float d = unpackHalf2x16(W[qb + 8u]).x;
+	[[unroll]] for (uint k = 0u; k < 4u; k++) {
+		g.q[k] = W[qb + base + k];
+		g.o[k] = 16u * l + 4u * k;
+		g.sa[k] = 1;
+		g.sb[k] = 0;
+	}
+	g.D = d;
+	g.M = 0.0;
+}
+#else
+#error "QT"
+#endif
+
+/*
+ * Tiled int8 GEMM for batches: a workgroup computes a 32-row x 32-token
+ * tile.  Per 256-block, each row's weights are decoded once (dec())
+ * into shared memory as packed bytes with per-16 integer scales and the
+ * row's D/M, and the 32 tokens' q8k blocks are staged beside them; each
+ * thread then accumulates a 2x2 micro-tile with DP4A.  The B term uses
+ * the activations' 16-group sums (bsums), not a dot with ones:
+ *   y = sum_blocks xd * (D * sum_g sa_g dot(u_g, x_g) + M * sum_g sb_g bsum_g)
+ * (Q8_0 has one d per 32 and no B term: not built for MMQ.)
+ */
+#define TR 32u
+#define TK 32u
+shared uint su[TR * 64u];
+shared int ssa[TR * 16u], ssb[TR * 16u];
+shared float sD[TR], sM[TR];
+shared uint sx[TK * 73u];
+
+void main()
+{
+	const uint tid = gl_LocalInvocationID.x;
+	const uint r0 = gl_WorkGroupID.x * TR, k0 = gl_WorkGroupID.y * TK;
+	const uint nb = pc.K >> 8;
+	const uint mr = (tid >> 4) * 2u, mt = (tid & 15u) * 2u;   /* micro-tile */
+	float acc[4] = float[4](0.0, 0.0, 0.0, 0.0);
+
+	for (uint b = 0u; b < nb; b++) {
+		/* decode: 16 units per row, 256 threads -> 16 rows per pass */
+		for (uint pass = 0u; pass < TR / 16u; pass++) {
+			uint rl = pass * 16u + (tid >> 4), u = tid & 15u, row = r0 + rl;
+			if (row < pc.N) {
+				grp g;
+				dec(pc.w_off + row * pc.row_words + b * BW, u, g);
+				[[unroll]] for (uint j = 0u; j < 4u; j++) {
+					su[rl * 64u + (g.o[j] >> 2)] = g.q[j];
+					ssa[rl * 16u + (g.o[j] >> 4)] = g.sa[j];
+					ssb[rl * 16u + (g.o[j] >> 4)] = g.sb[j];
+				}
+				if (u == 0u) {
+					sD[rl] = g.D;
+					sM[rl] = g.M;
+				}
+			} else if (u == 0u) {
+				sD[rl] = 0.0;
+				sM[rl] = 0.0;
+				for (uint i = 0u; i < 64u; i++)
+					su[rl * 64u + i] = 0u;
+				for (uint i = 0u; i < 16u; i++)
+					ssa[rl * 16u + i] = ssb[rl * 16u + i] = 0;
+			}
+		}
+		/* the tokens' q8k blocks (zero past the end) */
+		for (uint i = tid; i < TK * 73u; i += 256u) {
+			uint t = i / 73u, w = i - t * 73u;
+			sx[i] = k0 + t < pc.T ? X[pc.x_off + (k0 + t) * pc.x_stride + 73u * b + w] : 0u;
+		}
+		barrier();
+
+		int ia[4] = int[4](0, 0, 0, 0), ib[4] = int[4](0, 0, 0, 0);
+		for (uint gq = 0u; gq < 16u; gq++) {
+			int sa0 = ssa[mr * 16u + gq], sa1 = ssa[(mr + 1u) * 16u + gq];
+			int sb0 = ssb[mr * 16u + gq], sb1 = ssb[(mr + 1u) * 16u + gq];
+			uint bs0 = sx[mt * 73u + 65u + (gq >> 1)], bs1 = sx[(mt + 1u) * 73u + 65u + (gq >> 1)];
+			int x0s = int(bs0 << (16u - 16u * (gq & 1u))) >> 16;
+			int x1s = int(bs1 << (16u - 16u * (gq & 1u))) >> 16;
+			int d00 = 0, d01 = 0, d10 = 0, d11 = 0;
+			[[unroll]] for (uint w = 0u; w < 4u; w++) {
+				uint u0 = su[mr * 64u + 4u * gq + w], u1 = su[(mr + 1u) * 64u + 4u * gq + w];
+				uint x0 = sx[mt * 73u + 1u + 4u * gq + w], x1 = sx[(mt + 1u) * 73u + 1u + 4u * gq + w];
+				d00 += idot(u0, x0);
+				d01 += idot(u0, x1);
+				d10 += idot(u1, x0);
+				d11 += idot(u1, x1);
+			}
+			ia[0] += sa0 * d00; ia[1] += sa0 * d01; ia[2] += sa1 * d10; ia[3] += sa1 * d11;
+			ib[0] += sb0 * x0s; ib[1] += sb0 * x1s; ib[2] += sb1 * x0s; ib[3] += sb1 * x1s;
+		}
+		{
+			float xd0 = uintBitsToFloat(sx[mt * 73u]), xd1 = uintBitsToFloat(sx[(mt + 1u) * 73u]);
+			float D0 = sD[mr], M0 = sM[mr], D1 = sD[mr + 1u], M1 = sM[mr + 1u];
+			acc[0] += xd0 * (D0 * float(ia[0]) + M0 * float(ib[0]));
+			acc[1] += xd1 * (D0 * float(ia[1]) + M0 * float(ib[1]));
+			acc[2] += xd0 * (D1 * float(ia[2]) + M1 * float(ib[2]));
+			acc[3] += xd1 * (D1 * float(ia[3]) + M1 * float(ib[3]));
+		}
+		barrier();
+	}
+	[[unroll]] for (uint q = 0u; q < 4u; q++) {
+		uint row = r0 + mr + (q >> 1), t = k0 + mt + (q & 1u);
+		if (row < pc.N && t < pc.T)
+			Y[pc.y_off + t * pc.y_stride + row] = acc[q];
+	}
+}
