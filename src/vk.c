@@ -11,8 +11,8 @@
 #include "shaders.h"
 
 #define ACAP (3u << 20)          /* activation words per sequence */
-#define XQ_RES ACAP              /* reserved: q8k of the MoE input */
-#define ABUF (ACAP + 2048u)
+#define NSLOT 2                  /* command sequences in flight */
+#define ABUF (NSLOT * ACAP)
 #define Q8W ((uint32_t)(sizeof(q8k) / 4))
 #define BMAX 64
 #define MOE_MAX 72
@@ -77,6 +77,17 @@ static struct {
 	VkBufferCopy up[MOE_MAX + 8];
 	struct { uint32_t off, n; float *dst; } dl[MOE_MAX + 8];
 	int inflight;
+	/* slots: the current one's state lives in the fields above, the
+	 * others' here (vk_slot swaps); each has its own command buffer,
+	 * fence, fetch list and activation region */
+	struct slotst {
+		VkCommandBuffer cb;
+		VkFence fence;
+		int inflight, ndl;
+		struct { uint32_t off, n; float *dst; } dl[MOE_MAX + 8];
+	} sl[NSLOT];
+	int cs;
+	uint32_t abase;
 	/* fused paths */
 	struct lay { int ok; uint32_t an, cw, cb, dtb, a, d, sn, sconv, sssm; } *lay;
 	int hg;                 /* decode: the GPU's heads per mixer */
@@ -467,10 +478,15 @@ vk_init(size_t budget, size_t state_bytes, int devidx, int verbose)
 	cbai.commandPool = V.cp;
 	cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
 	cbai.commandBufferCount = 1;
-	CK(vkAllocateCommandBuffers(V.dev, &cbai, &V.cb));
 	memset(&fci, 0, sizeof(fci));
 	fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-	CK(vkCreateFence(V.dev, &fci, NULL, &V.fence));
+	for (i = 0; i < NSLOT; i++) {
+		CK(vkAllocateCommandBuffers(V.dev, &cbai, &V.sl[i].cb));
+		CK(vkCreateFence(V.dev, &fci, NULL, &V.sl[i].fence));
+	}
+	V.cb = V.sl[0].cb;
+	V.fence = V.sl[0].fence;
+	V.cs = 0;
 
 	if (getenv("Q2K_GPUPROF") && pp.limits.timestampComputeAndGraphics) {
 		VkQueryPoolCreateInfo qi2;
@@ -500,7 +516,10 @@ vk_shutdown(void)
 	for (i = 0; i < 64; i++)
 		if (V.pipe[i])
 			vkDestroyPipeline(V.dev, V.pipe[i], NULL);
-	if (V.fence) vkDestroyFence(V.dev, V.fence, NULL);
+	vk_slot(0);
+	for (i = 0; i < NSLOT; i++)
+		if (V.sl[i].fence)
+			vkDestroyFence(V.dev, V.sl[i].fence, NULL);
 	if (V.cp) vkDestroyCommandPool(V.dev, V.cp, NULL);
 	if (V.dp) vkDestroyDescriptorPool(V.dev, V.dp, NULL);
 	if (V.pl) vkDestroyPipelineLayout(V.dev, V.pl, NULL);
@@ -944,10 +963,28 @@ seq_begin(void)
 	V.upw = 0;
 }
 
+/* switch the recording/waiting slot */
+void
+vk_slot(int s)
+{
+	if (s == V.cs || s < 0 || s >= NSLOT)
+		return;
+	V.sl[V.cs].inflight = V.inflight;
+	V.sl[V.cs].ndl = V.ndl;
+	memcpy(V.sl[V.cs].dl, V.dl, sizeof(V.dl));
+	V.cs = s;
+	V.cb = V.sl[s].cb;
+	V.fence = V.sl[s].fence;
+	V.inflight = V.sl[s].inflight;
+	V.ndl = V.sl[s].ndl;
+	memcpy(V.dl, V.sl[s].dl, sizeof(V.dl));
+	V.abase = (uint32_t)s * ACAP;
+}
+
 static uint32_t
 seq_alloc(uint32_t words)
 {
-	uint32_t o = V.aused;
+	uint32_t o = V.abase + V.aused;
 	V.aused += (words + 3) & ~3u;
 	if (V.aused > ACAP) {
 		fprintf(stderr, "vulkan: activation buffer overflow\n");

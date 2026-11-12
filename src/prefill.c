@@ -165,6 +165,23 @@ static struct {
 	float *wk;
 } B;
 
+/* two chunks in flight: their residual stream, mixer output and the
+ * GPU mixer's results (B.x / B.tmp point at the active chunk's) */
+static struct ch {
+	int T, pos, gpu;
+	float *x, *tmp, *og, *ss;
+} C[2];
+
+static void
+use(int c)
+{
+	B.x = C[c].x;
+	B.tmp = C[c].tmp;
+	B.og = C[c].og;
+	B.ss = C[c].ss;
+	vk_slot(c);
+}
+
 static int
 bufs(const hparams *h)
 {
@@ -172,9 +189,9 @@ bufs(const hparams *h)
 	if (B.ok)
 		return 0;
 #define A(p, n) if (!((p) = calloc((n), sizeof(*(p))))) return -1
-	A(B.x, T * E); A(B.xn, T * E); A(B.zx, T * (size_t)h->d_in_proj);
+	A(B.xn, T * E); A(B.zx, T * (size_t)h->d_in_proj);
 	A(B.xbc, T * (size_t)h->conv_ch); A(B.dt, T * (size_t)h->ssm_heads);
-	A(B.y, T * (size_t)h->d_inner); A(B.tmp, T * E); A(B.q, T * E); A(B.ao, T * E);
+	A(B.y, T * (size_t)h->d_inner); A(B.q, T * E); A(B.ao, T * E);
 	A(B.hg, T * K * (size_t)h->n_ff); A(B.hu, T * K * (size_t)h->n_ff);
 	A(B.eo, T * K * E);
 	A(B.sg, T * (size_t)h->n_ff_sh); A(B.su, T * (size_t)h->n_ff_sh); A(B.so, T * E);
@@ -182,7 +199,13 @@ bufs(const hparams *h)
 	A(B.hq, T * K * (size_t)h->n_ff / 256); A(B.sq, T * (size_t)h->n_ff_sh / 256);
 	A(B.gq, T * K * E / 256);
 	A(B.sel, T * K); A(B.wk, T * K);
-	A(B.og, T * E); A(B.ss, T * (size_t)h->d_inner / 256);
+	{
+		int c;
+		for (c = 0; c < 2; c++) {
+			A(C[c].x, T * E); A(C[c].tmp, T * E);
+			A(C[c].og, T * E); A(C[c].ss, T * (size_t)h->d_inner / 256);
+		}
+	}
 #undef A
 	B.ok = 1;
 	return 0;
@@ -327,6 +350,35 @@ scan_worker(void *arg, int ith, int nth)
 	}
 }
 
+static int
+gpu_mixer(int il)
+{
+	return vk_mamba_ok(il) && !getenv("Q2K_NO_GPU_MIX");
+}
+
+/* collect a GPU mixer: the gated RMS norm is folded through ssm_out,
+ * out = ssm_out(y*w) / rms(y) */
+static void
+mamba2_finish(const model *m, int T)
+{
+	const hparams *h = &m->hp;
+	const int E = h->n_embd, DI = h->d_inner, nb = DI / 256;
+	double t0 = now();
+	int t, i;
+
+	vk_wait();
+	vk_prof_collect();
+	pf_t[6] += now() - t0;
+	for (t = 0; t < T; t++) {
+		float ss = 0, r;
+		for (i = 0; i < nb; i++)
+			ss += B.ss[(size_t)t * nb + i];
+		r = 1.0f / sqrtf(ss / (float)DI + h->eps);
+		for (i = 0; i < E; i++)
+			B.tmp[(size_t)t * E + i] = B.og[(size_t)t * E + i] * r;
+	}
+}
+
 static void
 mamba2_batch(const model *m, const layer *L, state *s, int il, int T)
 {
@@ -340,23 +392,10 @@ mamba2_batch(const model *m, const layer *L, state *s, int il, int T)
 	for (t = 0; t < T; t++)
 		v_rmsnorm(B.xn + (size_t)t * E, B.x + (size_t)t * E, L->attn_norm, (size_t)E, h->eps);
 	quant_rows(B.xn, B.xq, T, E);
-	if (vk_mamba_ok(il) && !getenv("Q2K_NO_GPU_MIX")) {
-		/* the whole mixer on the GPU, every head; the gated RMS norm
-		 * is folded through ssm_out: out = ssm_out(y*w) / rms(y) */
-		const int nb = DI / 256;
-		double t0 = now();
+	if (gpu_mixer(il)) {
+		/* the whole mixer on the GPU, every head (async: see
+		 * mamba2_finish) */
 		vk_mamba_submit(m, il, B.xq, T, NH, B.og, B.ss);
-		vk_wait();
-		vk_prof_collect();
-		pf_t[6] += now() - t0;
-		for (t = 0; t < T; t++) {
-			float ss = 0, r;
-			for (i = 0; i < nb; i++)
-				ss += B.ss[(size_t)t * nb + i];
-			r = 1.0f / sqrtf(ss / (float)DI + h->eps);
-			for (i = 0; i < E; i++)
-				B.tmp[(size_t)t * E + i] = B.og[(size_t)t * E + i] * r;
-		}
 		return;
 	}
 	it[0] = mmi(&L->ssm_in, 0, B.xq, E / 256, T, B.zx, DP);
@@ -518,6 +557,18 @@ route_worker(void *arg, int ith, int nth)
 	}
 }
 
+/* routed experts go to the GPU in a batch only with enough tokens:
+ * small token groups make poor GEMMs, and the GPU is busy with the
+ * other chunk's mixer anyway */
+static int
+moe_gpu_min(void)
+{
+	static int v = -1;
+	if (v < 0)
+		v = getenv("Q2K_MOE_GPU_MIN") ? atoi(getenv("Q2K_MOE_GPU_MIN")) : 1000000;
+	return v;
+}
+
 static void
 moe_batch(const model *m, const layer *L, int T)
 {
@@ -568,7 +619,7 @@ moe_batch(const model *m, const layer *L, int T)
 		vk_moe_begin();
 		any = gsh = vk_moe_add(&L->gate_s, &L->up_s, &L->down_s, 0, B.xq, T, B.so) == 0;
 		for (e = 0; e < NE; e++)
-			if (cnt[e])
+			if (cnt[e] >= moe_gpu_min())
 				any |= gpu[e] = vk_moe_add(&L->gate_e, &L->up_e, &L->down_e, e,
 				    B.gq + (size_t)base[e] * eb, cnt[e], B.eo + (size_t)base[e] * E) == 0;
 		if (any)
@@ -624,32 +675,92 @@ moe_batch(const model *m, const layer *L, int T)
 /* ---------------------------------------------------------------- */
 
 static void
-chunk(const model *m, state *s, const int *tok, int T)
+embed(const model *m, int c, const int *tok)
 {
 	const hparams *h = &m->hp;
 	const int E = h->n_embd;
-	int il, t;
+	int t, i;
 
-	for (t = 0; t < T; t++) {
+	for (t = 0; t < C[c].T; t++) {
 		int id = tok[t] < 0 || tok[t] >= h->n_vocab ? 0 : tok[t];
-		float *x = B.x + (size_t)t * E;
-		int i;
+		float *x = C[c].x + (size_t)t * E;
 		dequant_row(m->tok_embd.type, m->tok_embd.data + (size_t)id * m->tok_embd.row_bytes,
 		    x, (size_t)E);
 		for (i = 0; i < E; i++)
 			x[i] *= h->emb_scale;
 	}
-	for (il = 0; il < h->n_layer; il++) {
-		const layer *L = &m->L[il];
-		if (L->attn)
-			attention_batch(m, L, s, il, T);
-		else
-			mamba2_batch(m, L, s, il, T);
-		v_axpy(B.x, h->res_scale, B.tmp, (size_t)T * E);
-		moe_batch(m, L, T);
-		v_axpy(B.x, h->res_scale, B.tmp, (size_t)T * E);
+}
+
+/* mixer of chunk c at layer il: GPU mixers are only started here */
+static void
+mix_begin(const model *m, state *s, int il, int c)
+{
+	const layer *L = &m->L[il];
+	use(c);
+	s->pos = C[c].pos;
+	C[c].gpu = !L->attn && gpu_mixer(il);
+	if (L->attn)
+		attention_batch(m, L, s, il, C[c].T);
+	else
+		mamba2_batch(m, L, s, il, C[c].T);
+}
+
+static void
+mix_end(const model *m, int c)
+{
+	use(c);
+	if (C[c].gpu)
+		mamba2_finish(m, C[c].T);
+	v_axpy(B.x, m->hp.res_scale, B.tmp, (size_t)C[c].T * m->hp.n_embd);
+}
+
+static void
+moe_step(const model *m, int il, int c)
+{
+	use(c);
+	moe_batch(m, &m->L[il], C[c].T);
+	v_axpy(B.x, m->hp.res_scale, B.tmp, (size_t)C[c].T * m->hp.n_embd);
+}
+
+/*
+ * One or two chunks through all layers.  With two (A then B in token
+ * order) the GPU's mixer of one overlaps the CPU's experts of the
+ * other:
+ *   mixer(A,l) ; [mixer(B,l) | moe(A,l)] ; [mixer(A,l+1) | moe(B,l)] ...
+ * Each chunk has its own GPU slot.  State order is kept: at every
+ * layer A's mixer runs before B's, and attention puts A's tokens in
+ * the KV cache first.
+ */
+static void
+chunks(const model *m, state *s, const int *tok, int nc)
+{
+	const int L = m->hp.n_layer;
+	int il, c;
+
+	for (c = 0; c < nc; c++)
+		embed(m, c, tok + (c ? C[0].T : 0));
+	if (nc == 1) {
+		for (il = 0; il < L; il++) {
+			mix_begin(m, s, il, 0);
+			mix_end(m, 0);
+			moe_step(m, il, 0);
+		}
+	} else {
+		mix_begin(m, s, 0, 0);
+		mix_end(m, 0);
+		for (il = 0; il < L; il++) {
+			mix_begin(m, s, il, 1);
+			moe_step(m, il, 0);
+			mix_end(m, 1);
+			if (il + 1 < L)
+				mix_begin(m, s, il + 1, 0);
+			moe_step(m, il, 1);
+			if (il + 1 < L)
+				mix_end(m, 0);
+		}
 	}
-	s->pos += T;
+	use(0);
+	s->pos = C[nc - 1].pos + C[nc - 1].T;
 }
 
 const float *
@@ -674,9 +785,25 @@ model_prefill(const model *m, state *s, const int *tok, int n)
 	{
 	double t0 = now();
 	while (done < n - 1) {
-		int T = n - 1 - done > PB ? PB : n - 1 - done;
-		chunk(m, s, tok + done, T);
-		done += T;
+		/* a pair of chunks; a short rest is halved so the two still
+		 * overlap */
+		int rest = n - 1 - done, nc = 2;
+		if (rest > 2 * PB)
+			C[0].T = C[1].T = PB;
+		else if (rest > PB) {
+			C[0].T = PB;
+			C[1].T = rest - PB;
+		} else if (rest >= 32 && vk_ready()) {
+			C[0].T = rest / 2;
+			C[1].T = rest - rest / 2;
+		} else {
+			C[0].T = rest;
+			nc = 1;
+		}
+		C[0].pos = s->pos;
+		C[1].pos = s->pos + C[0].T;
+		chunks(m, s, tok + done, nc);
+		done += C[0].T + (nc > 1 ? C[1].T : 0);
 		/* the residual stream of the last token feeds nothing else */
 	}
 	pf_t[5] += now() - t0;

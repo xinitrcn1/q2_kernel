@@ -34,6 +34,9 @@ void vk_begin(void);
 int vk_add(const wt *w, int e, const float *xkey, const q8k *xq, float *y);
 void vk_submit(void);
 void vk_wait(void);
+/* two independent command sequences can be in flight: vk_slot selects
+ * the one recorded / submitted / waited on next (slot 0 by default) */
+void vk_slot(int s);
 
 /* split Mamba2 mixer: the GPU's heads (0 if none); vk_mamba_submit
  * starts the GPU half, vk_wait delivers its partial ssm_out and its
