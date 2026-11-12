@@ -10,8 +10,9 @@
 #include "kq.h"
 #include "model.h"
 
-/* all of our device memory stays within this (1.25 GiB available) */
-#define VK_VRAM_LIMIT ((size_t)1280 << 20)
+/* all of our device memory stays within this (default 1.25 GiB: the
+ * GPU is shared with the desktop); --vram MIB changes it */
+extern size_t vk_vram_limit;
 
 /* state_bytes: device memory for recurrent state (fused Mamba2 path) */
 int vk_init(size_t weight_budget, size_t state_bytes, int device_index, int verbose);

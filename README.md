@@ -49,8 +49,8 @@ order, until the budget is spent:
 
 Per layer the GPU gets two submits (mixer half; resident experts as
 gate/up -> SwiGLU -> down) that run alongside the CPU's work.  All device
-memory stays within 1.25 GiB (`VK_VRAM_LIMIT`) and the driver's heap
-budget; a larger `-g` is clamped.
+memory stays within `--vram` (default 1280 MiB, the GPU is shared with
+the desktop) and the driver's heap budget; a larger `-g` is clamped.
 
 GPU weights are the GGUF blocks repacked to 4-byte alignment; the
 shaders take the CPU path's `q8k` activation blocks and use packed

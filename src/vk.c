@@ -40,6 +40,8 @@ typedef struct {
 	uint32_t w_off, row_words, K, N, x_off, y_off, rps, T, x_stride, y_stride;
 } pushc;
 
+size_t vk_vram_limit = (size_t)1280 << 20;
+
 static struct {
 	int ok;
 	VkInstance inst;
@@ -358,7 +360,7 @@ vk_init(size_t budget, size_t state_bytes, int devidx, int verbose)
 	 * at most VK_VRAM_LIMIT, and the driver's budget for the heap when
 	 * VK_EXT_memory_budget reports it */
 	{
-		size_t limit = VK_VRAM_LIMIT, other = (size_t)ABUF * 4 + state_bytes + ((size_t)32 << 20);
+		size_t limit = vk_vram_limit, other = (size_t)ABUF * 4 + state_bytes + ((size_t)32 << 20);
 		if (has_budget) {
 			VkPhysicalDeviceMemoryBudgetPropertiesEXT mb;
 			VkPhysicalDeviceMemoryProperties2 mp2;

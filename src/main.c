@@ -53,6 +53,7 @@ usage(void)
 	    "  -g MIB         GPU weight split in MiB (default 512, 0 = CPU only)\n"
 	    "  -d N           Vulkan device index\n"
 	    "  --split F      GPU share of Mamba2 heads and output rows (0.5)\n"
+	    "  --vram MIB     cap on all of our GPU memory (default 1280)\n"
 	    "  --temp F       temperature (default 0 = greedy)\n"
 	    "  --top-k N      (default 40)  --top-p F (default 0.95)  --seed N\n"
 	    "  --ref          reference float kernels on the CPU\n"
@@ -112,6 +113,7 @@ parse(int argc, char **argv)
 		else if (!strcmp(a, "-g")) O.gpu_mib = atoi(ARG());
 		else if (!strcmp(a, "-d")) O.device = atoi(ARG());
 		else if (!strcmp(a, "--split")) g_split = atof(ARG());
+		else if (!strcmp(a, "--vram")) vk_vram_limit = (size_t)atoi(ARG()) << 20;
 		else if (!strcmp(a, "--temp")) O.temp = (float)atof(ARG());
 		else if (!strcmp(a, "--top-k")) O.top_k = atoi(ARG());
 		else if (!strcmp(a, "--top-p")) O.top_p = (float)atof(ARG());
