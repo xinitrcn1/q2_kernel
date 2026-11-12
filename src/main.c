@@ -526,7 +526,8 @@ main(int argc, char **argv)
 	}
 	pool_init(O.threads);
 	if (O.gpu_mib > 0 && !O.tokens) {
-		if (vk_init((size_t)O.gpu_mib << 20, O.device, O.verbose) == 0)
+		if (vk_init((size_t)O.gpu_mib << 20, model_gpu_state_bytes(&M), O.device,
+		    O.verbose) == 0)
 			vk_plan_and_upload(&M, O.verbose);
 		else
 			fprintf(stderr, "q2k: Vulkan unavailable, running on the CPU\n");
@@ -595,9 +596,11 @@ main(int argc, char **argv)
 			extern double vk_t_wait, vk_t_sub;
 			extern long vk_n_sub;
 			fprintf(stderr, "time: cpu matvec %.3f s (+%.3f s alongside gpu), "
-			    "gpu wait %.3f s, ssm scan %.3f s, attention %.3f s\n",
+			    "gpu wait %.3f s, gpu mixer %.3f s, cpu ssm scan %.3f s, attention %.3f s\n",
 			    prof_t[PROF_CPU_MV], prof_t[PROF_CPU_MV_OVERLAP],
-			    prof_t[PROF_GPU_WAIT], prof_t[PROF_SCAN], prof_t[PROF_ATTN]);
+			    prof_t[PROF_GPU_WAIT], prof_t[PROF_GPU_MIXER], prof_t[PROF_SCAN],
+			    prof_t[PROF_ATTN]);
+			vk_prof_report();
 			if (vk_n_sub)
 				fprintf(stderr, "vulkan: %ld batches, %.3f s recording\n",
 				    vk_n_sub, vk_t_sub);

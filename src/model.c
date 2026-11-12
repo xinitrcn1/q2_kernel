@@ -195,6 +195,18 @@ model_load(model *m, const char *path, char *err, size_t errlen)
 	return 0;
 }
 
+size_t
+model_gpu_state_bytes(const model *m)
+{
+	const hparams *h = &m->hp;
+	size_t n = 0;
+	int i;
+	for (i = 0; i < h->n_layer; i++)
+		if (!m->L[i].attn)
+			n += 3 * (size_t)h->conv_ch + (size_t)h->d_inner * (size_t)h->d_state;
+	return n * sizeof(float);
+}
+
 void
 model_free(model *m)
 {
@@ -242,6 +254,7 @@ state_init(state *s, const model *m, int ctx)
 	s->eo = fa((size_t)h->n_expert_used * (size_t)h->n_embd);
 	s->so = fa((size_t)h->n_embd);
 	s->logits = fa(big);
+	s->xq = malloc(sizeof(q8k) * (size_t)(h->n_embd / 256));
 	s->conv = calloc((size_t)h->n_layer, sizeof(float *));
 	s->ssm = calloc((size_t)h->n_layer, sizeof(float *));
 	s->kc = calloc((size_t)h->n_layer, sizeof(float *));
@@ -270,6 +283,7 @@ state_reset(state *s, const model *m)
 	const hparams *h = &m->hp;
 	int i;
 	s->pos = 0;
+	vk_state_reset();
 	for (i = 0; i < h->n_layer; i++) {
 		if (s->conv[i])
 			memset(s->conv[i], 0, sizeof(float) * (size_t)(h->d_conv - 1) * (size_t)h->conv_ch);
@@ -292,7 +306,7 @@ state_free(state *s, const model *m)
 	free(s->x); free(s->xn); free(s->tmp); free(s->zxbcdt); free(s->xbc);
 	free(s->y); free(s->q); free(s->k); free(s->v); free(s->att); free(s->ao);
 	free(s->rl); free(s->hs_g); free(s->hs_u); free(s->he_g); free(s->he_u);
-	free(s->eo); free(s->so); free(s->logits);
+	free(s->eo); free(s->so); free(s->logits); free(s->xq);
 	memset(s, 0, sizeof(*s));
 }
 
@@ -358,8 +372,16 @@ mv_worker(void *arg, int ith, int nth)
 	}
 }
 
+static void mv_run_ex(const mv_item *it, int n, int allow_gpu);
+
 void
 mv_run(const mv_item *it, int n)
+{
+	mv_run_ex(it, n, 1);
+}
+
+static void
+mv_run_ex(const mv_item *it, int n, int allow_gpu)
 {
 	mv_item cpu[MV_MAX];
 	const q8k *xq[MV_MAX], *cxq[MV_MAX];
@@ -393,11 +415,11 @@ mv_run(const mv_item *it, int n)
 		used += (size_t)it[i].w->K / 256;
 	}
 
-	if (vk_ready())
+	if (allow_gpu && vk_ready())
 		vk_begin();
 	/* each matvec runs where its tensor/expert lives */
 	for (i = 0; i < n; i++) {
-		if (vk_ready() && it[i].w->gpu_n && it[i].w->gslot[it[i].e] >= 0 &&
+		if (allow_gpu && vk_ready() && it[i].w->gpu_n && it[i].w->gslot[it[i].e] >= 0 &&
 		    vk_add(it[i].w, it[i].e, it[i].x, xq[i], it[i].y) == 0) {
 			ngpu++;
 			continue;
@@ -649,12 +671,12 @@ attention(const model *m, const layer *L, state *s, int il)
 /* mixture of experts + shared expert                               */
 
 static void
-moe(const model *m, const layer *L, state *s)
+moe(const model *m, const layer *L, state *s, int xq_on_gpu)
 {
 	const hparams *h = &m->hp;
 	const int E = h->n_embd, K = h->n_expert_used, FF = h->n_ff;
 	mv_item it[MV_MAX];
-	int sel[16], i, k, n;
+	int sel[16], gk[16], gsh, i, k, n;
 	float wsum = 0, wk[16], mx;
 
 	/* router: softmax over experts, top-k, renormalise (= softmax over
@@ -678,26 +700,59 @@ moe(const model *m, const layer *L, state *s)
 		wsum += wk[k];
 	}
 
-	/* gate/up for shared + routed experts in one batch */
-	n = 0;
-	it[n].w = &L->gate_s; it[n].e = 0; it[n].x = s->xn; it[n].y = s->hs_g; n++;
-	it[n].w = &L->up_s; it[n].e = 0; it[n].x = s->xn; it[n].y = s->hs_u; n++;
-	for (k = 0; k < K; k++) {
-		it[n].w = &L->gate_e; it[n].e = sel[k]; it[n].x = s->xn; it[n].y = s->he_g + k * FF; n++;
-		it[n].w = &L->up_e; it[n].e = sel[k]; it[n].x = s->xn; it[n].y = s->he_u + k * FF; n++;
+	/* experts resident on the GPU run there as one async submit (gate,
+	 * up, SwiGLU, down); the CPU does the others meanwhile */
+	gsh = 0;
+	for (k = 0; k < K; k++)
+		gk[k] = 0;
+	if (vk_ready()) {
+		int any;
+		vk_moe_begin();
+		gsh = vk_moe_add(&L->gate_s, &L->up_s, &L->down_s, 0, s->so) == 0;
+		any = gsh;
+		for (k = 0; k < K; k++)
+			any |= gk[k] = vk_moe_add(&L->gate_e, &L->up_e, &L->down_e, sel[k],
+			    s->eo + k * E) == 0;
+		if (any) {
+			if (!xq_on_gpu)
+				q8k_quantize(s->xn, s->xq, (size_t)E);
+			vk_moe_submit(xq_on_gpu ? NULL : s->xq, E);
+		}
 	}
-	mv_run(it, n);
-
-	v_swiglu(s->hs_g, s->hs_u, (size_t)h->n_ff_sh);
-	v_swiglu(s->he_g, s->he_u, (size_t)K * FF);
 
 	n = 0;
-	it[n].w = &L->down_s; it[n].e = 0; it[n].x = s->hs_g; it[n].y = s->so; n++;
-	for (k = 0; k < K; k++) {
-		it[n].w = &L->down_e; it[n].e = sel[k]; it[n].x = s->he_g + k * FF;
-		it[n].y = s->eo + k * E; n++;
+	if (!gsh) {
+		it[n].w = &L->gate_s; it[n].e = 0; it[n].x = s->xn; it[n].y = s->hs_g; n++;
+		it[n].w = &L->up_s; it[n].e = 0; it[n].x = s->xn; it[n].y = s->hs_u; n++;
 	}
-	mv_run(it, n);
+	for (k = 0; k < K; k++)
+		if (!gk[k]) {
+			it[n].w = &L->gate_e; it[n].e = sel[k]; it[n].x = s->xn; it[n].y = s->he_g + k * FF; n++;
+			it[n].w = &L->up_e; it[n].e = sel[k]; it[n].x = s->xn; it[n].y = s->he_u + k * FF; n++;
+		}
+	if (n) {
+		mv_run_ex(it, n, 0);
+		if (!gsh)
+			v_swiglu(s->hs_g, s->hs_u, (size_t)h->n_ff_sh);
+		for (k = 0; k < K; k++)
+			if (!gk[k])
+				v_swiglu(s->he_g + k * FF, s->he_u + k * FF, (size_t)FF);
+		n = 0;
+		if (!gsh) {
+			it[n].w = &L->down_s; it[n].e = 0; it[n].x = s->hs_g; it[n].y = s->so; n++;
+		}
+		for (k = 0; k < K; k++)
+			if (!gk[k]) {
+				it[n].w = &L->down_e; it[n].e = sel[k]; it[n].x = s->he_g + k * FF;
+				it[n].y = s->eo + k * E; n++;
+			}
+		mv_run_ex(it, n, 0);
+	}
+	if (vk_ready()) {
+		double t0 = pnow();
+		vk_wait();
+		prof_t[PROF_GPU_WAIT] += pnow() - t0;
+	}
 
 	memcpy(s->tmp, s->so, sizeof(float) * (size_t)E);
 	for (k = 0; k < K; k++)
@@ -724,6 +779,17 @@ model_forward(const model *m, state *s, int tok, int want_logits)
 	for (il = 0; il < h->n_layer; il++) {
 		const layer *L = &m->L[il];
 
+		if (!L->attn && vk_mamba_ok(il)) {
+			/* whole mixer + residual + ffn_norm on the GPU */
+			double t0 = pnow();
+			vk_mamba_layer(m, il, s->x, s->xn);
+			prof_t[PROF_GPU_MIXER] += pnow() - t0;
+			tr("ffn_inp", il, s->x, E);
+			moe(m, L, s, 1);
+			v_axpy(s->x, h->res_scale, s->tmp, (size_t)E);
+			tr("l_out", il, s->x, E);
+			continue;
+		}
 		rmsnorm(s->xn, s->x, L->attn_norm, E, h->eps);
 		if (L->attn)
 			attention(m, L, s, il);
@@ -734,7 +800,7 @@ model_forward(const model *m, state *s, int tok, int want_logits)
 		tr("ffn_inp", il, s->x, E);
 
 		rmsnorm(s->xn, s->x, L->ffn_norm, E, h->eps);
-		moe(m, L, s);
+		moe(m, L, s, 0);
 		v_axpy(s->x, h->res_scale, s->tmp, (size_t)E);
 		tr("l_out", il, s->x, E);
 	}

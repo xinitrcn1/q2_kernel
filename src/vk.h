@@ -13,7 +13,8 @@
 /* all of our device memory stays within this (1.25 GiB available) */
 #define VK_VRAM_LIMIT ((size_t)1280 << 20)
 
-int vk_init(size_t weight_budget, int device_index, int verbose);
+/* state_bytes: device memory for recurrent state (fused Mamba2 path) */
+int vk_init(size_t weight_budget, size_t state_bytes, int device_index, int verbose);
 int vk_ready(void);
 void vk_shutdown(void);
 const char *vk_device_name(void);
@@ -33,5 +34,19 @@ void vk_begin(void);
 int vk_add(const wt *w, int e, const float *xkey, const q8k *xq, float *y);
 void vk_submit(void);
 void vk_wait(void);
+
+/* fused Mamba2 layer: x in/out (after the mixer residual add), xn =
+ * ffn_norm(x); synchronous.  Only for layers with vk_mamba_ok. */
+int vk_mamba_ok(int il);
+void vk_mamba_layer(const model *m, int il, float *x, float *xn);
+void vk_state_reset(void);
+void vk_prof_report(void);
+
+/* MoE experts resident on the GPU (gate/up -> SwiGLU -> down each),
+ * run asynchronously while the CPU does the rest; vk_wait collects.
+ * xq NULL: use the q8k input the fused mixer left on the GPU. */
+void vk_moe_begin(void);
+int vk_moe_add(const wt *gate, const wt *up, const wt *down, int e, float *out);
+void vk_moe_submit(const q8k *xq, int K);
 
 #endif

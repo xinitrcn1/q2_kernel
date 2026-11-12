@@ -1,0 +1,177 @@
+#version 450
+/*
+ * Non-matvec ops of the fused GPU layer path, one per build (OP):
+ *   1 NORM  v = a [+ s*b | silu(a)*b], optional residual write-back,
+ *           optional RMS norm with weights, outputs f32 and/or q8k
+ *   2 CONV  Mamba2 causal depthwise conv + SiLU with resident state;
+ *           dt = softplus(dt + bias)
+ *   3 SCAN  Mamba2 selective scan, one subgroup per (head, channel):
+ *           s = s*exp(dt*A) + dt*x*B; y = s.C + D*x; y *= silu(z)
+ * Buffers: W weights (f32 vectors stored as raw words), A activations
+ * (as float and as uint words), S recurrent state.
+ */
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer Wb { uint W[]; };
+layout(std430, binding = 1) buffer Ab { float A[]; };
+layout(std430, binding = 2) buffer Xb { uint X[]; };
+layout(std430, binding = 3) buffer Sb { float S[]; };
+
+layout(push_constant) uniform PC { uint p[16]; } pc;
+
+#define NONE 0xffffffffu
+
+float wf(uint i) { return uintBitsToFloat(W[i]); }
+float silu(float v) { return v / (1.0 + exp(-v)); }
+
+#if OP == 1
+/* p: 0 a, 1 b, 2 scale bits, 3 n, 4 x_out, 5 w (W words), 6 eps bits,
+ *    7 f_out, 8 q_out (words), 9 mode (0 add, 1 swiglu) */
+#define MAXK 12
+shared float red[16];
+shared int sq[256];
+
+float wg_sum(float v)
+{
+	v = subgroupAdd(v);
+	if (gl_SubgroupInvocationID == 0u)
+		red[gl_SubgroupID] = v;
+	barrier();
+	float t = 0.0;
+	for (uint i = 0u; i < gl_NumSubgroups; i++)
+		t += red[i];
+	barrier();
+	return t;
+}
+
+float wg_max(float v)
+{
+	v = subgroupMax(v);
+	if (gl_SubgroupInvocationID == 0u)
+		red[gl_SubgroupID] = v;
+	barrier();
+	float t = red[0];
+	for (uint i = 1u; i < gl_NumSubgroups; i++)
+		t = max(t, red[i]);
+	barrier();
+	return t;
+}
+
+void main()
+{
+	uint t = gl_LocalInvocationID.x, n = pc.p[3], nk = (n + 255u) / 256u;
+	float s = uintBitsToFloat(pc.p[2]);
+	float v[MAXK];
+	float ss = 0.0;
+
+	for (uint k = 0u; k < nk; k++) {
+		uint i = 256u * k + t;
+		float a = 0.0;
+		if (i < n) {
+			a = A[pc.p[0] + i];
+			if (pc.p[1] != NONE)
+				a = pc.p[9] == 1u ? silu(a) * A[pc.p[1] + i] : a + s * A[pc.p[1] + i];
+			if (pc.p[4] != NONE)
+				A[pc.p[4] + i] = a;
+		}
+		v[k] = a;
+		ss += a * a;
+	}
+	if (pc.p[5] != NONE) {
+		float r = inversesqrt(wg_sum(ss) / float(n) + uintBitsToFloat(pc.p[6]));
+		for (uint k = 0u; k < nk; k++) {
+			uint i = 256u * k + t;
+			v[k] = i < n ? v[k] * r * wf(pc.p[5] + i) : 0.0;
+		}
+	}
+	if (pc.p[7] != NONE)
+		for (uint k = 0u; k < nk; k++)
+			if (256u * k + t < n)
+				A[pc.p[7] + 256u * k + t] = v[k];
+	if (pc.p[8] == NONE)
+		return;
+	/* q8k, as the CPU's q8k_quantize: scale by the signed extreme,
+	 * round to nearest even; n is a multiple of 256 here */
+	for (uint k = 0u; k < nk; k++) {
+		uint qo = pc.p[8] + 73u * k;
+		float hi = wg_max(v[k]), lo = -wg_max(-v[k]);
+		float mx = hi >= -lo ? hi : lo;
+		int q = 0;
+		if (mx != 0.0) {
+			float is = -127.0 / mx;
+			q = min(int(roundEven(is * v[k])), 127);
+			if (t == 0u)
+				X[qo] = floatBitsToUint(1.0 / is);
+		} else if (t == 0u)
+			X[qo] = 0u;
+		sq[t] = q;
+		barrier();
+		if (t < 64u) {
+			uint w = 0u;
+			for (uint j = 0u; j < 4u; j++)
+				w |= (uint(sq[4u * t + j]) & 255u) << (8u * j);
+			X[qo + 1u + t] = w;
+		} else if (t < 72u) {
+			uint g = 2u * (t - 64u);
+			int b0 = 0, b1 = 0;
+			for (uint j = 0u; j < 16u; j++) {
+				b0 += sq[16u * g + j];
+				b1 += sq[16u * g + 16u + j];
+			}
+			X[qo + 65u + (t - 64u)] = (uint(b0) & 0xffffu) | (uint(b1) << 16);
+		}
+		barrier();
+	}
+}
+
+#elif OP == 2
+/* p: 0 xbc in, 1 dt in, 2 xbc out, 3 dt out, 4 state (S), 5 conv w
+ *    (W, [ch][4]), 6 conv b, 7 dt bias, 8 channels, 9 heads */
+void main()
+{
+	uint c = gl_GlobalInvocationID.x, ch = pc.p[8];
+	if (c < pc.p[9]) {
+		float d = A[pc.p[1] + c] + wf(pc.p[7] + c);
+		A[pc.p[3] + c] = d > 20.0 ? d : log(1.0 + exp(d));
+	}
+	if (c >= ch)
+		return;
+	uint st = pc.p[4], w = pc.p[5] + 4u * c;
+	float s0 = S[st + c], s1 = S[st + ch + c], s2 = S[st + 2u * ch + c];
+	float x = A[pc.p[0] + c];
+	float v = s0 * wf(w) + s1 * wf(w + 1u) + s2 * wf(w + 2u) + x * wf(w + 3u) + wf(pc.p[6] + c);
+	S[st + c] = s1;
+	S[st + ch + c] = s2;
+	S[st + 2u * ch + c] = x;
+	A[pc.p[2] + c] = silu(v);
+}
+
+#elif OP == 3
+/* p: 0 xbc (x | B | C), 1 dt, 2 z, 3 y out, 4 state, 5 A (W), 6 D (W),
+ *    7 d_inner, 8 d_state, 9 head_dim */
+void main()
+{
+	uint r = gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID;
+	uint di = pc.p[7], ds = pc.p[8];
+	if (r >= di)
+		return;
+	uint h = r / pc.p[9], lane = gl_SubgroupInvocationID;
+	float dt = A[pc.p[1] + h];
+	float dA = exp(dt * wf(pc.p[5] + h));
+	float x = A[pc.p[0] + r];
+	float xdt = x * dt;
+	uint B = pc.p[0] + di, C = B + ds, st = pc.p[4] + r * ds;
+	float acc = 0.0;
+	for (uint n = lane; n < ds; n += gl_SubgroupSize) {
+		float sv = S[st + n] * dA + A[B + n] * xdt;
+		S[st + n] = sv;
+		acc += sv * A[C + n];
+	}
+	acc = subgroupAdd(acc);
+	if (lane == 0u)
+		A[pc.p[3] + r] = (acc + wf(pc.p[6] + h) * x) * silu(A[pc.p[2] + r]);
+}
+#endif

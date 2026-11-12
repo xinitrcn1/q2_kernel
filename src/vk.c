@@ -10,10 +10,15 @@
 #include "gguf.h"
 #include "shaders.h"
 
-#define XCAP (64u * 1024u)       /* words of q8k input blocks per batch */
+#define ACAP (320u * 1024u)      /* activation words per sequence */
+#define XQ_RES ACAP              /* reserved: q8k of the MoE input */
+#define ABUF (ACAP + 2048u)
 #define Q8W ((uint32_t)(sizeof(q8k) / 4))
-#define YCAP (256u * 1024u)      /* floats of outputs per batch */
 #define BMAX 64
+#define NONE 0xffffffffu
+#define PIPE_NORM 20
+#define PIPE_CONV 21
+#define PIPE_SCAN 22
 #define UPCHUNK (32u << 20)
 
 static double
@@ -40,8 +45,9 @@ static struct {
 	char name[256];
 	VkPhysicalDeviceMemoryProperties mp;
 
-	VkBuffer wbuf, abuf, hbuf, ubuf;
-	VkDeviceMemory wmem, amem, hmem, umem;
+	VkBuffer wbuf, abuf, hbuf, ubuf, sbuf;
+	VkDeviceMemory wmem, amem, hmem, umem, smem;
+	size_t scap, sused;           /* state buffer, floats */
 	size_t wcap, wused;
 	float *hmap;
 	uint8_t *umap;
@@ -50,19 +56,34 @@ static struct {
 	VkPipelineLayout pl;
 	VkDescriptorPool dp;
 	VkDescriptorSet ds;
-	VkPipeline pipe[16];
+	VkPipeline pipe[32];
 	VkCommandPool cp;
 	VkCommandBuffer cb;
 	VkFence fence;
-	uint32_t rows_per_wg;
+	uint32_t rows_per_wg, sg_per_wg;
 	int dot;                /* native packed int8 dot product */
 
-	/* current batch */
+	/* plain matvec batch */
 	int nx, nd;
-	uint32_t xused, yused;
-	struct { const float *x; uint32_t off, K; } xs[BMAX];  /* off in words */
-	struct { float *y; uint32_t type; pushc pc; } d[BMAX];
+	struct { const wt *w; int e; const float *x; const q8k *xq; float *y; } d[BMAX];
+	/* recording */
+	uint32_t aused, cur;
+	int nup, upw, ndl;
+	VkBufferCopy up[BMAX];
+	struct { uint32_t off, n; float *dst; } dl[BMAX];
 	int inflight;
+	/* fused paths */
+	struct lay { int ok; uint32_t an, fn, cw, cb, dtb, a, d, sn, sconv, sssm; } *lay;
+	int nlay;
+	uint32_t xq_moe, x_out, xn_out;
+	int nmoe;
+	struct { const wt *g, *u, *d; int e; float *out; } moe[16];
+	/* Q2K_GPUPROF: per-stage GPU timestamps of the fused mixer */
+	VkQueryPool qp;
+	int prof, nts;
+	float ts_period;
+	double stage[16];
+	long nstage;
 } V;
 
 #define CK(x) do { VkResult r_ = (x); if (r_ != VK_SUCCESS) { \
@@ -169,7 +190,7 @@ mkpipe(uint32_t type, const uint32_t *code, size_t bytes)
 }
 
 int
-vk_init(size_t budget, int devidx, int verbose)
+vk_init(size_t budget, size_t state_bytes, int devidx, int verbose)
 {
 	VkApplicationInfo app;
 	VkInstanceCreateInfo ici;
@@ -183,15 +204,15 @@ vk_init(size_t budget, int devidx, int verbose)
 	float prio = 1;
 	VkDeviceQueueCreateInfo qi;
 	VkDeviceCreateInfo dci;
-	VkDescriptorSetLayoutBinding lb[3];
+	VkDescriptorSetLayoutBinding lb[4];
 	VkDescriptorSetLayoutCreateInfo lci;
 	VkPushConstantRange pr;
 	VkPipelineLayoutCreateInfo plci;
 	VkDescriptorPoolSize ps;
 	VkDescriptorPoolCreateInfo dpci;
 	VkDescriptorSetAllocateInfo dsai;
-	VkDescriptorBufferInfo dbi[3];
-	VkWriteDescriptorSet wr[3];
+	VkDescriptorBufferInfo dbi[4];
+	VkWriteDescriptorSet wr[4];
 	VkCommandPoolCreateInfo cpci;
 	VkCommandBufferAllocateInfo cbai;
 	VkFenceCreateInfo fci;
@@ -245,11 +266,12 @@ vk_init(size_t budget, int devidx, int verbose)
 	vkGetPhysicalDeviceProperties2(V.pd, &pp2);
 	if (!(sp.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) ||
 	    !(sp.supportedOperations & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT) ||
-	    sp.subgroupSize == 0 || 128 % sp.subgroupSize) {
+	    sp.subgroupSize == 0 || 256 % sp.subgroupSize) {
 		fprintf(stderr, "vulkan: %s lacks subgroup arithmetic\n", V.name);
 		return -1;
 	}
-	V.rows_per_wg = 128 / sp.subgroupSize;
+	V.rows_per_wg = 256 / sp.subgroupSize;
+	V.sg_per_wg = 256 / sp.subgroupSize;
 
 	vkGetPhysicalDeviceQueueFamilyProperties(V.pd, &nqf, NULL);
 	if (nqf > 16)
@@ -317,7 +339,7 @@ vk_init(size_t budget, int devidx, int verbose)
 	 * at most VK_VRAM_LIMIT, and the driver's budget for the heap when
 	 * VK_EXT_memory_budget reports it */
 	{
-		size_t limit = VK_VRAM_LIMIT, other = (size_t)(XCAP + YCAP) * 4 + ((size_t)32 << 20);
+		size_t limit = VK_VRAM_LIMIT, other = (size_t)ABUF * 4 + state_bytes + ((size_t)32 << 20);
 		if (has_budget) {
 			VkPhysicalDeviceMemoryBudgetPropertiesEXT mb;
 			VkPhysicalDeviceMemoryProperties2 mp2;
@@ -349,17 +371,21 @@ vk_init(size_t budget, int devidx, int verbose)
 	if (mkbuf(V.wcap, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
 	    0, &V.wbuf, &V.wmem, NULL))
 		return -1;
-	if (mkbuf((XCAP + YCAP) * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+	if (mkbuf((VkDeviceSize)ABUF * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
 	    VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
 	    0, &V.abuf, &V.amem, NULL))
 		return -1;
-	if (mkbuf((XCAP + YCAP) * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+	if (mkbuf((VkDeviceSize)ABUF * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT |
 	    VK_BUFFER_USAGE_TRANSFER_SRC_BIT, 1, &V.hbuf, &V.hmem, &p))
+		return -1;
+	V.scap = state_bytes / 4;
+	if (mkbuf(state_bytes > 256 ? state_bytes : 256, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+	    VK_BUFFER_USAGE_TRANSFER_DST_BIT, 0, &V.sbuf, &V.smem, NULL))
 		return -1;
 	V.hmap = p;
 
 	memset(lb, 0, sizeof(lb));
-	for (i = 0; i < 3; i++) {
+	for (i = 0; i < 4; i++) {
 		lb[i].binding = i;
 		lb[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
 		lb[i].descriptorCount = 1;
@@ -367,12 +393,12 @@ vk_init(size_t budget, int devidx, int verbose)
 	}
 	memset(&lci, 0, sizeof(lci));
 	lci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-	lci.bindingCount = 3;
+	lci.bindingCount = 4;
 	lci.pBindings = lb;
 	CK(vkCreateDescriptorSetLayout(V.dev, &lci, NULL, &V.dsl));
 	pr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 	pr.offset = 0;
-	pr.size = sizeof(pushc);
+	pr.size = 64;
 	memset(&plci, 0, sizeof(plci));
 	plci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
 	plci.setLayoutCount = 1;
@@ -381,7 +407,7 @@ vk_init(size_t budget, int devidx, int verbose)
 	plci.pPushConstantRanges = &pr;
 	CK(vkCreatePipelineLayout(V.dev, &plci, NULL, &V.pl));
 	ps.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-	ps.descriptorCount = 3;
+	ps.descriptorCount = 4;
 	memset(&dpci, 0, sizeof(dpci));
 	dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
 	dpci.maxSets = 1;
@@ -396,7 +422,8 @@ vk_init(size_t budget, int devidx, int verbose)
 	CK(vkAllocateDescriptorSets(V.dev, &dsai, &V.ds));
 	dbi[0].buffer = V.wbuf;
 	dbi[1].buffer = dbi[2].buffer = V.abuf;
-	for (i = 0; i < 3; i++) {
+	dbi[3].buffer = V.sbuf;
+	for (i = 0; i < 4; i++) {
 		dbi[i].offset = 0;
 		dbi[i].range = VK_WHOLE_SIZE;
 		memset(&wr[i], 0, sizeof(wr[i]));
@@ -407,7 +434,7 @@ vk_init(size_t budget, int devidx, int verbose)
 		wr[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
 		wr[i].pBufferInfo = &dbi[i];
 	}
-	vkUpdateDescriptorSets(V.dev, 3, wr, 0, NULL);
+	vkUpdateDescriptorSets(V.dev, 4, wr, 0, NULL);
 
 #define PIPE(t, a) (V.dot ? mkpipe(t, a, sizeof(a)) : mkpipe(t, a##_nd, sizeof(a##_nd)))
 	if (PIPE(GT_Q2_K, spv_q2_k) || PIPE(GT_Q3_K, spv_q3_k) ||
@@ -415,6 +442,10 @@ vk_init(size_t budget, int devidx, int verbose)
 	    PIPE(GT_Q6_K, spv_q6_k) || PIPE(GT_Q8_0, spv_q8_0))
 		return -1;
 #undef PIPE
+	if (mkpipe(PIPE_NORM, spv_op_norm, sizeof(spv_op_norm)) ||
+	    mkpipe(PIPE_CONV, spv_op_conv, sizeof(spv_op_conv)) ||
+	    mkpipe(PIPE_SCAN, spv_op_scan, sizeof(spv_op_scan)))
+		return -1;
 
 	memset(&cpci, 0, sizeof(cpci));
 	cpci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
@@ -431,6 +462,17 @@ vk_init(size_t budget, int devidx, int verbose)
 	fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
 	CK(vkCreateFence(V.dev, &fci, NULL, &V.fence));
 
+	if (getenv("Q2K_GPUPROF") && pp.limits.timestampComputeAndGraphics) {
+		VkQueryPoolCreateInfo qi2;
+		memset(&qi2, 0, sizeof(qi2));
+		qi2.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+		qi2.queryType = VK_QUERY_TYPE_TIMESTAMP;
+		qi2.queryCount = 16;
+		if (vkCreateQueryPool(V.dev, &qi2, NULL, &V.qp) == VK_SUCCESS) {
+			V.prof = 1;
+			V.ts_period = pp.limits.timestampPeriod;
+		}
+	}
 	if (verbose)
 		fprintf(stderr, "vulkan: %s, subgroup %u, %s dot, arena %zu MiB\n",
 		    V.name, sp.subgroupSize, V.dot ? "dp4a" : "emulated", V.wcap >> 20);
@@ -445,7 +487,7 @@ vk_shutdown(void)
 	if (!V.dev)
 		return;
 	vkDeviceWaitIdle(V.dev);
-	for (i = 0; i < 16; i++)
+	for (i = 0; i < 32; i++)
 		if (V.pipe[i])
 			vkDestroyPipeline(V.dev, V.pipe[i], NULL);
 	if (V.fence) vkDestroyFence(V.dev, V.fence, NULL);
@@ -457,6 +499,9 @@ vk_shutdown(void)
 	if (V.abuf) vkDestroyBuffer(V.dev, V.abuf, NULL);
 	if (V.hbuf) vkDestroyBuffer(V.dev, V.hbuf, NULL);
 	if (V.ubuf) vkDestroyBuffer(V.dev, V.ubuf, NULL);
+	if (V.sbuf) vkDestroyBuffer(V.dev, V.sbuf, NULL);
+	if (V.smem) vkFreeMemory(V.dev, V.smem, NULL);
+	free(V.lay);
 	if (V.wmem) vkFreeMemory(V.dev, V.wmem, NULL);
 	if (V.amem) vkFreeMemory(V.dev, V.amem, NULL);
 	if (V.hmem) vkFreeMemory(V.dev, V.hmem, NULL);
@@ -590,6 +635,56 @@ vk_upload(wt *w, const int *ex, int n)
 	return 0;
 }
 
+/* a small f32 vector into the arena; returns its word offset or NONE */
+static uint32_t
+upload_raw(const void *src, size_t bytes)
+{
+	uint64_t off = V.wused;
+	void *p;
+	if (V.wused + bytes > V.wcap)
+		return NONE;
+	if (!V.ubuf) {
+		if (mkbuf(UPCHUNK, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, 1, &V.ubuf, &V.umem, &p))
+			return NONE;
+		V.umap = p;
+	}
+	memcpy(V.umap, src, bytes);
+	if (flush_upload((bytes + 3) & ~(size_t)3, off))
+		return NONE;
+	V.wused += (bytes + 255) & ~(size_t)255;
+	return (uint32_t)(off / 4);
+}
+
+/* norms, conv and SSM parameters of a Mamba2 layer whose projections
+ * are resident, and its state slots: enables vk_mamba_layer */
+static void
+setup_mamba(const model *m, int il)
+{
+	const hparams *h = &m->hp;
+	const layer *L = &m->L[il];
+	struct lay *ly = &V.lay[il];
+	size_t E = (size_t)h->n_embd, CH = (size_t)h->conv_ch, DI = (size_t)h->d_inner;
+	size_t need = 3 * CH + DI * (size_t)h->d_state;
+
+	if (L->attn || !L->ssm_in.gpu_n || !L->ssm_out.gpu_n || V.sused + need > V.scap)
+		return;
+	ly->an = upload_raw(L->attn_norm, E * 4);
+	ly->fn = upload_raw(L->ffn_norm, E * 4);
+	ly->cw = upload_raw(L->conv_w, 4 * CH * 4);
+	ly->cb = upload_raw(L->conv_b, CH * 4);
+	ly->dtb = upload_raw(L->dt_b, (size_t)h->ssm_heads * 4);
+	ly->a = upload_raw(L->A, (size_t)h->ssm_heads * 4);
+	ly->d = upload_raw(L->D, (size_t)h->ssm_heads * 4);
+	ly->sn = upload_raw(L->ssm_norm, DI * 4);
+	if (ly->an == NONE || ly->fn == NONE || ly->cw == NONE || ly->cb == NONE ||
+	    ly->dtb == NONE || ly->a == NONE || ly->d == NONE || ly->sn == NONE)
+		return;
+	ly->sconv = (uint32_t)V.sused;
+	ly->sssm = (uint32_t)(V.sused + 3 * CH);
+	V.sused += need;
+	ly->ok = 1;
+}
+
 static int
 by_size(const void *a, const void *b)
 {
@@ -629,6 +724,13 @@ vk_plan_and_upload(model *m, int verbose)
 			dense_b += V.wused - before;
 		}
 	}
+	/* fused mixer for every Mamba2 layer whose projections fit */
+	V.nlay = nl;
+	V.lay = calloc((size_t)nl, sizeof(*V.lay));
+	for (l = 0; V.lay && l < nl; l++)
+		setup_mamba(m, l);
+	if (V.lay)
+		vk_state_reset();
 
 	/* experts: choose per layer in rounds, then upload per tensor */
 	sel = calloc((size_t)nl, sizeof(*sel));
@@ -684,50 +786,16 @@ out:
 }
 
 /* ---------------------------------------------------------------- */
-/* batches                                                          */
+/* command sequences                                                */
 
-void
-vk_begin(void)
-{
-	V.nx = V.nd = 0;
-	V.xused = V.yused = 0;
-}
-
-int
-vk_add(const wt *w, int e, const float *x, const q8k *xq, float *y)
-{
-	int i;
-	uint32_t xo, nw = (uint32_t)w->K / 256 * Q8W;
-
-	if (!w->gpu_n || w->gslot[e] < 0 || V.nd >= BMAX || V.yused + (uint32_t)w->N > YCAP)
-		return -1;
-	for (i = 0; i < V.nx; i++)
-		if (V.xs[i].x == x && V.xs[i].K == (uint32_t)w->K)
-			break;
-	if (i == V.nx) {
-		if (V.nx >= BMAX || V.xused + nw > XCAP)
-			return -1;
-		V.xs[i].x = x;
-		V.xs[i].K = (uint32_t)w->K;
-		V.xs[i].off = V.xused;
-		memcpy(V.hmap + V.xused, xq, (size_t)nw * 4);
-		V.xused += nw;
-		V.nx++;
-	}
-	xo = V.xs[i].off;
-	V.d[V.nd].y = y;
-	V.d[V.nd].type = w->type;
-	V.d[V.nd].pc.w_off = (uint32_t)((w->gpu_off + (uint64_t)w->gslot[e] * (uint64_t)w->N *
-	    w->gpu_row_bytes) / 4);
-	V.d[V.nd].pc.row_words = (uint32_t)(w->gpu_row_bytes / 4);
-	V.d[V.nd].pc.K = (uint32_t)w->K;
-	V.d[V.nd].pc.N = (uint32_t)w->N;
-	V.d[V.nd].pc.x_off = xo;
-	V.d[V.nd].pc.y_off = XCAP + V.yused;
-	V.yused += ((uint32_t)w->N + 3) & ~3u;
-	V.nd++;
-	return 0;
-}
+/*
+ * Everything the GPU does per token is a recorded sequence in one
+ * command buffer: inputs are staged in the host-visible mirror of the
+ * activation buffer and copied in, dispatches run with barriers
+ * between dependent steps, outputs are copied back and handed to their
+ * destinations by vk_wait.  Activation space is a bump allocator, reset
+ * per sequence; host and device copies use the same offsets.
+ */
 
 static void
 barrier(VkAccessFlags src, VkAccessFlags dst, VkPipelineStageFlags ss, VkPipelineStageFlags ds)
@@ -740,44 +808,159 @@ barrier(VkAccessFlags src, VkAccessFlags dst, VkPipelineStageFlags ss, VkPipelin
 	vkCmdPipelineBarrier(V.cb, ss, ds, 0, 1, &mb, 0, NULL, 0, NULL);
 }
 
-void
-vk_submit(void)
+static void
+ts(void)
+{
+	if (V.prof)
+		vkCmdWriteTimestamp(V.cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, V.qp, (uint32_t)V.nts++);
+}
+
+/* compute -> compute */
+static void
+cbar(void)
+{
+	ts();
+	barrier(VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+	    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+}
+
+static void
+seq_begin(void)
 {
 	VkCommandBufferBeginInfo bi;
-	VkBufferCopy rg;
-	VkSubmitInfo si;
-	uint32_t cur = UINT32_MAX;
-	int i;
-
-	double t0 = vnow();
-	if (V.nd == 0)
-		return;
-	vk_n_sub++;
 	memset(&bi, 0, sizeof(bi));
 	bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
 	bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 	vkBeginCommandBuffer(V.cb, &bi);
-	rg.srcOffset = rg.dstOffset = 0;
-	rg.size = (VkDeviceSize)V.xused * 4;
-	vkCmdCopyBuffer(V.cb, V.hbuf, V.abuf, 1, &rg);
+	vkCmdBindDescriptorSets(V.cb, VK_PIPELINE_BIND_POINT_COMPUTE, V.pl, 0, 1, &V.ds, 0, NULL);
+	V.aused = 0;
+	V.ndl = 0;
+	V.cur = UINT32_MAX;
+	V.nup = 0;
+	V.upw = 0;
+}
+
+static uint32_t
+seq_alloc(uint32_t words)
+{
+	uint32_t o = V.aused;
+	V.aused += (words + 3) & ~3u;
+	if (V.aused > ACAP) {
+		fprintf(stderr, "vulkan: activation buffer overflow\n");
+		exit(1);
+	}
+	return o;
+}
+
+/* stage words for upload; the copies are recorded by seq_flush_up */
+static uint32_t
+seq_put(const void *src, uint32_t words)
+{
+	uint32_t o = seq_alloc(words);
+	memcpy(V.hmap + o, src, (size_t)words * 4);
+	if (V.nup && V.up[V.nup - 1].srcOffset + V.up[V.nup - 1].size == (VkDeviceSize)o * 4)
+		V.up[V.nup - 1].size += (VkDeviceSize)((words + 3) & ~3u) * 4;
+	else {
+		V.up[V.nup].srcOffset = V.up[V.nup].dstOffset = (VkDeviceSize)o * 4;
+		V.up[V.nup].size = (VkDeviceSize)((words + 3) & ~3u) * 4;
+		V.nup++;
+	}
+	return o;
+}
+
+static void
+seq_flush_up(void)
+{
+	if (!V.nup)
+		return;
+	vkCmdCopyBuffer(V.cb, V.hbuf, V.abuf, (uint32_t)V.nup, V.up);
 	barrier(VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
 	    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-	vkCmdBindDescriptorSets(V.cb, VK_PIPELINE_BIND_POINT_COMPUTE, V.pl, 0, 1, &V.ds, 0, NULL);
-	for (i = 0; i < V.nd; i++) {
-		if (V.d[i].type != cur) {
-			cur = V.d[i].type;
-			vkCmdBindPipeline(V.cb, VK_PIPELINE_BIND_POINT_COMPUTE, V.pipe[cur]);
-		}
-		vkCmdPushConstants(V.cb, V.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pushc), &V.d[i].pc);
-		vkCmdDispatch(V.cb, (V.d[i].pc.N + V.rows_per_wg - 1) / V.rows_per_wg, 1, 1);
+	V.nup = 0;
+}
+
+static void
+seq_pipe(uint32_t id)
+{
+	if (V.cur != id) {
+		V.cur = id;
+		vkCmdBindPipeline(V.cb, VK_PIPELINE_BIND_POINT_COMPUTE, V.pipe[id]);
 	}
-	barrier(VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
-	    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-	rg.srcOffset = rg.dstOffset = (VkDeviceSize)XCAP * 4;
-	rg.size = (VkDeviceSize)V.yused * 4;
-	vkCmdCopyBuffer(V.cb, V.abuf, V.hbuf, 1, &rg);
-	barrier(VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT,
-	    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT);
+}
+
+static void
+seq_matvec(const wt *w, int e, uint32_t xq, uint32_t y)
+{
+	pushc pc;
+	pc.w_off = (uint32_t)((w->gpu_off + (uint64_t)w->gslot[e] * (uint64_t)w->N *
+	    w->gpu_row_bytes) / 4);
+	pc.row_words = (uint32_t)(w->gpu_row_bytes / 4);
+	pc.K = (uint32_t)w->K;
+	pc.N = (uint32_t)w->N;
+	pc.x_off = xq;
+	pc.y_off = y;
+	seq_pipe(w->type);
+	vkCmdPushConstants(V.cb, V.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+	vkCmdDispatch(V.cb, (pc.N + V.rows_per_wg - 1) / V.rows_per_wg, 1, 1);
+}
+
+static void
+seq_op(uint32_t pipe, const uint32_t *p, uint32_t groups)
+{
+	seq_pipe(pipe);
+	vkCmdPushConstants(V.cb, V.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, 64, p);
+	vkCmdDispatch(V.cb, groups, 1, 1);
+}
+
+static uint32_t
+fbits(float f)
+{
+	uint32_t u;
+	memcpy(&u, &f, 4);
+	return u;
+}
+
+/* v = a [+ s*b | silu(a)*b]; x_out <- v; v = rmsnorm(v)*w; f_out <- v;
+ * q_out <- q8k(v).  Unused offsets are NONE. */
+static void
+seq_norm(uint32_t a, uint32_t b, float s, uint32_t n, uint32_t x_out, uint32_t w,
+    float eps, uint32_t f_out, uint32_t q_out, uint32_t mode)
+{
+	uint32_t p[16];
+	memset(p, 0, sizeof(p));
+	p[0] = a; p[1] = b; p[2] = fbits(s); p[3] = n; p[4] = x_out; p[5] = w;
+	p[6] = fbits(eps); p[7] = f_out; p[8] = q_out; p[9] = mode;
+	seq_op(PIPE_NORM, p, 1);
+}
+
+static void
+seq_get(uint32_t off, uint32_t n, float *dst)
+{
+	V.dl[V.ndl].off = off;
+	V.dl[V.ndl].n = n;
+	V.dl[V.ndl].dst = dst;
+	V.ndl++;
+}
+
+static void
+seq_submit(void)
+{
+	VkSubmitInfo si;
+	double t0 = vnow();
+	int i;
+
+	if (V.ndl) {
+		VkBufferCopy rg[BMAX];
+		barrier(VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+		    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+		for (i = 0; i < V.ndl; i++) {
+			rg[i].srcOffset = rg[i].dstOffset = (VkDeviceSize)V.dl[i].off * 4;
+			rg[i].size = (VkDeviceSize)V.dl[i].n * 4;
+		}
+		vkCmdCopyBuffer(V.cb, V.abuf, V.hbuf, (uint32_t)V.ndl, rg);
+		barrier(VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT,
+		    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT);
+	}
 	vkEndCommandBuffer(V.cb);
 	memset(&si, 0, sizeof(si));
 	si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -788,6 +971,7 @@ vk_submit(void)
 		exit(1);
 	}
 	V.inflight = 1;
+	vk_n_sub++;
 	vk_t_sub += vnow() - t0;
 }
 
@@ -808,6 +992,224 @@ vk_wait(void)
 	vk_t_wait += vnow() - t0;
 	vkResetFences(V.dev, 1, &V.fence);
 	V.inflight = 0;
-	for (i = 0; i < V.nd; i++)
-		memcpy(V.d[i].y, V.hmap + V.d[i].pc.y_off, sizeof(float) * V.d[i].pc.N);
+	for (i = 0; i < V.ndl; i++)
+		memcpy(V.dl[i].dst, V.hmap + V.dl[i].off, sizeof(float) * V.dl[i].n);
+	V.ndl = 0;
+}
+
+/* ---------------------------------------------------------------- */
+/* plain matvec batches                                             */
+
+void
+vk_begin(void)
+{
+	V.nx = V.nd = 0;
+}
+
+int
+vk_add(const wt *w, int e, const float *x, const q8k *xq, float *y)
+{
+	if (!w->gpu_n || w->gslot[e] < 0 || V.nd >= BMAX)
+		return -1;
+	V.d[V.nd].w = w;
+	V.d[V.nd].e = e;
+	V.d[V.nd].x = x;
+	V.d[V.nd].xq = xq;
+	V.d[V.nd].y = y;
+	V.nd++;
+	return 0;
+}
+
+void
+vk_submit(void)
+{
+	uint32_t xo[BMAX], yo[BMAX];
+	int i, k;
+
+	if (V.nd == 0)
+		return;
+	seq_begin();
+	for (i = 0; i < V.nd; i++) {
+		for (k = 0; k < i; k++)
+			if (V.d[k].x == V.d[i].x && V.d[k].w->K == V.d[i].w->K)
+				break;
+		xo[i] = k < i ? xo[k] : seq_put(V.d[i].xq, (uint32_t)V.d[i].w->K / 256 * Q8W);
+	}
+	seq_flush_up();
+	for (i = 0; i < V.nd; i++) {
+		yo[i] = seq_alloc((uint32_t)V.d[i].w->N);
+		seq_matvec(V.d[i].w, V.d[i].e, xo[i], yo[i]);
+		seq_get(yo[i], (uint32_t)V.d[i].w->N, V.d[i].y);
+	}
+	seq_submit();
+}
+
+/* ---------------------------------------------------------------- */
+/* fused Mamba2 layer                                               */
+
+int
+vk_mamba_ok(int il)
+{
+	return V.ok && V.lay && il < V.nlay && V.lay[il].ok;
+}
+
+void
+vk_state_reset(void)
+{
+	if (!V.ok || !V.sbuf)
+		return;
+	vk_wait();
+	{
+		VkCommandBufferBeginInfo bi;
+		memset(&bi, 0, sizeof(bi));
+		bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+		bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+		vkBeginCommandBuffer(V.cb, &bi);
+		vkCmdFillBuffer(V.cb, V.sbuf, 0, VK_WHOLE_SIZE, 0);
+		vkEndCommandBuffer(V.cb);
+		submit_wait();
+	}
+}
+
+/*
+ * x (residual stream) in, x out after the mixer's residual add, and
+ * xn = ffn_norm(x) for the MoE block; one submit:
+ *   attn_norm+q8k, ssm_in, conv, scan, ssm_norm+q8k, ssm_out,
+ *   residual + ffn_norm (+ q8k kept on the GPU for the MoE)
+ */
+void
+vk_mamba_layer(const model *m, int il, float *x, float *xn)
+{
+	const hparams *h = &m->hp;
+	const layer *L = &m->L[il];
+	const struct lay *ly = &V.lay[il];
+	const uint32_t E = (uint32_t)h->n_embd, DI = (uint32_t)h->d_inner;
+	const uint32_t CH = (uint32_t)h->conv_ch, NH = (uint32_t)h->ssm_heads;
+	uint32_t ax, q1, zx, xbc, dt, y, q2, o, p[16];
+
+	seq_begin();
+	if (V.prof) {
+		vkCmdResetQueryPool(V.cb, V.qp, 0, 16);
+		V.nts = 0;
+	}
+	ax = seq_put(x, E);
+	seq_flush_up();
+	ts();
+	q1 = seq_alloc(E / 256 * Q8W);
+	seq_norm(ax, NONE, 0, E, NONE, ly->an, h->eps, NONE, q1, 0);
+	cbar();
+	zx = seq_alloc((uint32_t)h->d_in_proj);
+	seq_matvec(&L->ssm_in, 0, q1, zx);
+	cbar();
+	xbc = seq_alloc(CH);
+	dt = seq_alloc(NH);
+	memset(p, 0, sizeof(p));
+	p[0] = zx + DI; p[1] = zx + DI + CH; p[2] = xbc; p[3] = dt; p[4] = ly->sconv;
+	p[5] = ly->cw; p[6] = ly->cb; p[7] = ly->dtb; p[8] = CH; p[9] = NH;
+	seq_op(PIPE_CONV, p, (CH + 255) / 256);
+	cbar();
+	y = seq_alloc(DI);
+	memset(p, 0, sizeof(p));
+	p[0] = xbc; p[1] = dt; p[2] = zx; p[3] = y; p[4] = ly->sssm; p[5] = ly->a; p[6] = ly->d;
+	p[7] = DI; p[8] = (uint32_t)h->d_state; p[9] = (uint32_t)h->ssm_head_dim;
+	seq_op(PIPE_SCAN, p, (DI + V.sg_per_wg - 1) / V.sg_per_wg);
+	cbar();
+	q2 = seq_alloc(DI / 256 * Q8W);
+	seq_norm(y, NONE, 0, DI, NONE, ly->sn, h->eps, NONE, q2, 0);
+	cbar();
+	o = seq_alloc(E);
+	seq_matvec(&L->ssm_out, 0, q2, o);
+	cbar();
+	V.xq_moe = XQ_RES;      /* outside the bump allocator: read by the MoE submit */
+	V.x_out = seq_alloc(E);
+	V.xn_out = seq_alloc(E);
+	seq_norm(ax, o, h->res_scale, E, V.x_out, ly->fn, h->eps, V.xn_out, V.xq_moe, 0);
+	seq_get(V.x_out, E, x);
+	seq_get(V.xn_out, E, xn);
+	ts();
+	seq_submit();
+	vk_wait();
+	if (V.prof) {
+		uint64_t t[16];
+		int i;
+		if (vkGetQueryPoolResults(V.dev, V.qp, 0, (uint32_t)V.nts, sizeof(t), t, 8,
+		    VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS) {
+			for (i = 1; i < V.nts; i++)
+				V.stage[i - 1] += (double)(t[i] - t[i - 1]) * V.ts_period * 1e-9;
+			V.nstage++;
+		}
+	}
+	(void)0;
+}
+
+void
+vk_prof_report(void)
+{
+	static const char *nm[] = { "attn_norm+q", "ssm_in", "conv", "scan", "ssm_norm+q",
+	    "ssm_out", "res+ffn_norm" };
+	int i;
+	if (!V.prof || !V.nstage)
+		return;
+	fprintf(stderr, "gpu mixer per layer (us):");
+	for (i = 0; i < 7; i++)
+		fprintf(stderr, " %s %.1f", nm[i], V.stage[i] / V.nstage * 1e6);
+	fprintf(stderr, "\n");
+}
+
+/* ---------------------------------------------------------------- */
+/* MoE: GPU-resident experts, while the CPU runs the others          */
+
+void
+vk_moe_begin(void)
+{
+	V.nmoe = 0;
+}
+
+int
+vk_moe_add(const wt *gate, const wt *up, const wt *down, int e, float *out)
+{
+	if (V.nmoe >= 16 || !gate->gpu_n || gate->gslot[e] < 0 || !up->gpu_n ||
+	    up->gslot[e] < 0 || !down->gpu_n || down->gslot[e] < 0)
+		return -1;
+	V.moe[V.nmoe].g = gate;
+	V.moe[V.nmoe].u = up;
+	V.moe[V.nmoe].d = down;
+	V.moe[V.nmoe].e = e;
+	V.moe[V.nmoe].out = out;
+	V.nmoe++;
+	return 0;
+}
+
+/* xq: the block input as q8k, or NULL to use the one the fused mixer
+ * left on the GPU */
+void
+vk_moe_submit(const q8k *xq, int K)
+{
+	uint32_t xo, g[16], u[16], hq[16], o[16];
+	int i;
+
+	if (!V.nmoe)
+		return;
+	seq_begin();
+	xo = xq ? seq_put(xq, (uint32_t)K / 256 * Q8W) : V.xq_moe;
+	seq_flush_up();
+	for (i = 0; i < V.nmoe; i++) {
+		g[i] = seq_alloc((uint32_t)V.moe[i].g->N);
+		u[i] = seq_alloc((uint32_t)V.moe[i].u->N);
+		seq_matvec(V.moe[i].g, V.moe[i].e, xo, g[i]);
+		seq_matvec(V.moe[i].u, V.moe[i].e, xo, u[i]);
+	}
+	cbar();
+	for (i = 0; i < V.nmoe; i++) {
+		uint32_t ff = (uint32_t)V.moe[i].g->N;
+		hq[i] = seq_alloc(ff / 256 * Q8W);
+		seq_norm(g[i], u[i], 0, ff, NONE, NONE, 0, NONE, hq[i], 1);
+	}
+	cbar();
+	for (i = 0; i < V.nmoe; i++) {
+		o[i] = seq_alloc((uint32_t)V.moe[i].d->N);
+		seq_matvec(V.moe[i].d, V.moe[i].e, hq[i], o[i]);
+		seq_get(o[i], (uint32_t)V.moe[i].d->N, V.moe[i].out);
+	}
+	seq_submit();
 }

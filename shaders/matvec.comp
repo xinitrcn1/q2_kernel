@@ -24,7 +24,11 @@
 #extension GL_EXT_integer_dot_product : require
 #endif
 
-layout(local_size_x = 128) in;
+layout(local_size_x = 256) in;
+
+/* the input vector, staged once per workgroup (K <= 4096) */
+#define XMAX (16u * 73u)
+shared uint xs[XMAX];
 
 layout(std430, binding = 0) readonly buffer Wb { uint W[]; };
 layout(std430, binding = 1) buffer Yb { float Y[]; };
@@ -55,8 +59,9 @@ int idot(uint a, uint b) { return dotPacked4x8EXT(int(a), int(b)); }
 uint b8(uint w, uint i) { return (w >> (8u * i)) & 0xffu; }
 /* byte i of the block starting at word bw */
 uint bb(uint bw, uint i) { return b8(W[bw + (i >> 2)], i & 3u); }
-/* activation word holding elements e..e+3 of the q8k block at xb */
-uint xw(uint xb, uint e) { return X[xb + 1u + (e >> 2)]; }
+/* activation word holding elements e..e+3 of the q8k block at xb
+ * (xb is relative to the staged copy) */
+uint xw(uint xb, uint e) { return xs[xb + 1u + (e >> 2)]; }
 
 #if QT == 10 /* Q2_K */
 #define BW 21u
@@ -175,6 +180,11 @@ float unit(uint bw, uint l, uint xb)
 
 void main()
 {
+	uint nx = (pc.K >> 8) * 73u;
+	for (uint i = gl_LocalInvocationID.x; i < nx; i += gl_WorkGroupSize.x)
+		xs[i] = X[pc.x_off + i];
+	barrier();
+
 	uint row = gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID;
 	if (row >= pc.N)
 		return;
@@ -183,8 +193,8 @@ void main()
 	uint base = pc.w_off + row * pc.row_words;
 	float sum = 0.0;
 	for (uint i = lane; i < nu; i += gl_SubgroupSize) {
-		uint b = i >> 4, xb = pc.x_off + 73u * b;
-		sum += uintBitsToFloat(X[xb]) * unit(base + b * BW, i & 15u, xb);
+		uint b = i >> 4, xb = 73u * b;
+		sum += uintBitsToFloat(xs[xb]) * unit(base + b * BW, i & 15u, xb);
 	}
 	sum = subgroupAdd(sum);
 	if (lane == 0u)

@@ -46,6 +46,15 @@ gen/spv_${t}_nd.h: shaders/matvec.comp
 	    -o ${.TARGET} shaders/matvec.comp >/dev/null
 .endfor
 
+OPS=		norm:1 conv:2 scan:3
+.for o in ${OPS}
+gen/spv_op_${o:C/:.*//}.h: shaders/ops.comp
+	@mkdir -p gen
+	${GLSLANG} -V --target-env vulkan1.1 -DOP=${o:C/.*://} --vn spv_op_${o:C/:.*//} \
+	    -o ${.TARGET} shaders/ops.comp >/dev/null
+SPVH+=		gen/spv_op_${o:C/:.*//}.h
+.endfor
+
 gen/shaders.h: ${SPVH}
 	@mkdir -p gen
 	( echo '#include <stdint.h>'; \

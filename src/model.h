@@ -65,6 +65,7 @@ typedef struct {
 	float *rl;              /* router logits */
 	float *hs_g, *hs_u, *he_g, *he_u, *eo, *so;
 	float *logits;
+	void *xq;               /* q8k scratch for the MoE input */
 } state;
 
 int model_load(model *m, const char *path, char *err, size_t errlen);
@@ -73,6 +74,9 @@ void model_free(model *m);
 int state_init(state *s, const model *m, int ctx);
 void state_reset(state *s, const model *m);
 void state_free(state *s, const model *m);
+
+/* device memory the fused Mamba2 path needs for recurrent state */
+size_t model_gpu_state_bytes(const model *m);
 
 /* consume one token at s->pos; returns logits if want_logits */
 const float *model_forward(const model *m, state *s, int tok, int want_logits);
@@ -88,7 +92,8 @@ typedef struct {
 void mv_run(const mv_item *it, int n);
 
 /* time spent per phase, seconds */
-enum { PROF_CPU_MV, PROF_CPU_MV_OVERLAP, PROF_GPU_WAIT, PROF_SCAN, PROF_ATTN, PROF_N };
+enum { PROF_CPU_MV, PROF_CPU_MV_OVERLAP, PROF_GPU_WAIT, PROF_SCAN, PROF_ATTN,
+	PROF_GPU_MIXER, PROF_N };
 extern double prof_t[PROF_N];
 
 /* compute settings */
