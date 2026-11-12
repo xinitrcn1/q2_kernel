@@ -16,7 +16,17 @@ enum ggml_type {
 	GT_F32 = 0, GT_F16 = 1, GT_Q8_0 = 8,
 	GT_Q2_K = 10, GT_Q3_K = 11, GT_Q4_K = 12, GT_Q5_K = 13, GT_Q6_K = 14,
 	GT_IQ2_XXS = 16, GT_IQ2_XS = 17, GT_IQ3_XXS = 18, GT_IQ1_S = 19,
-	GT_IQ3_S = 21, GT_IQ2_S = 22, GT_IQ4_XS = 23
+	GT_IQ3_S = 21, GT_IQ2_S = 22, GT_IQ4_XS = 23,
+	/* q2k's lossless transcodes of the codebook i-quants (transcode.c):
+	 * per 256 weights, d (f16) and integer multipliers, then
+	 *   X2  (IQ2_*):   mult[16] lv[64] (2-bit, Q2_K order) sg[32] (Q3_K
+	 *                  hmask order); w = d/8 * mult * {8,25,43}[lv] * sign
+	 *   X3  (IQ3_XXS): mult[8] q[128] (4-bit code = level | sign << 3,
+	 *                  IQ4_XS order); w = d/4 * mult * +-{4,12,..,52,62}
+	 *   X3S (IQ3_S):   as X3; w = d * mult * +-{1,3,..,15}
+	 *   X1  (IQ1_S):   sd[8] (mult | delta-negative << 7) lv[64] (g+1,
+	 *                  Q2_K order); w = d * mult * (g + delta) */
+	GT_X2 = 100, GT_X3 = 101, GT_X3S = 102, GT_X1 = 103
 };
 
 typedef struct {
@@ -52,6 +62,7 @@ typedef struct {
 	gtensor *t;
 	size_t alignment;
 	const uint8_t *data;
+	const uint8_t *kv_end;  /* end of the key/value section */
 } gguf;
 
 int gguf_open(gguf *g, const char *path, char *err, size_t errlen);

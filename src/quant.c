@@ -350,6 +350,52 @@ dq_iq4_xs(const uint8_t *b, float *y)
 	}
 }
 
+/* ---- q2k's transcoded types (gguf.h) ---- */
+
+static const float x2mag[4] = { 8, 25, 43, 0 };
+
+/* 2-bit value of element e in Q2_K order */
+static int
+get2(const uint8_t *p, int e)
+{
+	return (p[32 * (e / 128) + e % 32] >> (2 * ((e % 128) / 32))) & 3;
+}
+
+static void
+dq_x2(const uint8_t *b, float *y)
+{
+	const float d = h16(b) * 0.125f;
+	int e;
+	for (e = 0; e < 256; e++) {
+		int sg = (b[82 + e % 32] >> (4 * (e / 128) + (e % 128) / 32)) & 1;
+		y[e] = d * b[2 + e / 16] * x2mag[get2(b + 18, e)] * (sg ? -1.f : 1.f);
+	}
+}
+
+static void
+dq_x3(const uint8_t *b, float *y, int s)
+{
+	const float d = h16(b) * (s ? 1.0f : 0.25f);
+	int ib, j;
+	for (ib = 0; ib < 8; ib++)
+		for (j = 0; j < 32; j++) {
+			int q = b[10 + 16 * ib + j % 16] >> (j < 16 ? 0 : 4) & 15;
+			float v = s ? (float)(2 * (q & 7) + 1) : (float)(8 * (q & 7) + 4 + ((q & 7) == 7 ? 2 : 0));
+			y[32 * ib + j] = d * b[2 + ib] * (q & 8 ? -v : v);
+		}
+}
+
+static void
+dq_x1(const uint8_t *b, float *y)
+{
+	const float d = h16(b);
+	int e;
+	for (e = 0; e < 256; e++) {
+		uint8_t sd = b[2 + e / 32];
+		y[e] = d * (sd & 127) * ((float)(get2(b + 10, e) - 1) + (sd & 128 ? -0.125f : 0.125f));
+	}
+}
+
 void
 dequant_row(uint32_t t, const void *src, float *dst, size_t n)
 {
@@ -380,6 +426,10 @@ dequant_row(uint32_t t, const void *src, float *dst, size_t n)
 		case GT_IQ3_S: dq_iq3_s(b, dst); break;
 		case GT_IQ1_S: dq_iq1_s(b, dst); break;
 		case GT_IQ4_XS: dq_iq4_xs(b, dst); break;
+		case GT_X2: dq_x2(b, dst); break;
+		case GT_X3: dq_x3(b, dst, 0); break;
+		case GT_X3S: dq_x3(b, dst, 1); break;
+		case GT_X1: dq_x1(b, dst); break;
 		default: memset(dst, 0, bs * sizeof(float)); break;
 		}
 	}

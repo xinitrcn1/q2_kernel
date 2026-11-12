@@ -18,7 +18,7 @@
 #define DEFAULT_SYSTEM "You are a helpful assistant. Please ensure responses are professional, accurate, and safe."
 
 typedef struct {
-	const char *model, *prompt, *system, *dump;
+	const char *model, *prompt, *system, *dump, *transcode;
 	int n_predict, threads, ctx, gpu_mib, device, chat, raw, info, tokens;
 	int bench, check, kbench, top_k, verbose, show_special, logits, noprefill, think, sys_given;
 	float temp, top_p;
@@ -68,6 +68,8 @@ usage(void)
 	    "  --check        compare CPU/GPU kernels against the reference\n"
 	    "  --kbench       single-thread CPU kernel throughput per type\n"
 	    "  --no-batch     feed prompts token by token (no batched prefill)\n"
+	    "  --transcode F  write the model to F with the codebook i-quants in\n"
+	    "                 q2k's faster lossless layouts (X2/X3/X1), then exit\n"
 	    "  -v             verbose\n");
 	exit(2);
 }
@@ -131,6 +133,7 @@ parse(int argc, char **argv)
 		else if (!strcmp(a, "--bench")) O.bench = 1;
 		else if (!strcmp(a, "--check")) O.check = 1;
 		else if (!strcmp(a, "--kbench")) O.kbench = 1;
+		else if (!strcmp(a, "--transcode")) O.transcode = ARG();
 		else if (!strcmp(a, "--no-batch")) O.noprefill = 1;
 		else if (!strcmp(a, "-v")) O.verbose = 1;
 		else if (a[0] == '-') usage();
@@ -625,6 +628,15 @@ main(int argc, char **argv)
 
 	parse(argc, argv);
 	rng = O.seed * 2654435761ull + 1;
+	if (O.transcode) {
+		gguf g;
+		extern int gguf_transcode(const gguf *g, const char *out, int verbose);
+		if (gguf_open(&g, expand_home(O.model), err, sizeof(err)) != 0) {
+			fprintf(stderr, "q2k: %s\n", err);
+			return 1;
+		}
+		return gguf_transcode(&g, O.transcode, O.verbose) ? 1 : 0;
+	}
 	t0 = now();
 	if (model_load(&M, expand_home(O.model), err, sizeof(err)) != 0 ||
 	    tok_load(&T, &M.g, err, sizeof(err)) != 0) {

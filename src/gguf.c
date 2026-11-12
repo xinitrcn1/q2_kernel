@@ -113,6 +113,7 @@ ggml_type_block(uint32_t t)
 	case GT_Q2_K: case GT_Q3_K: case GT_Q4_K: case GT_Q5_K: case GT_Q6_K:
 	case GT_IQ2_XXS: case GT_IQ2_XS: case GT_IQ3_XXS: case GT_IQ1_S:
 	case GT_IQ3_S: case GT_IQ2_S: case GT_IQ4_XS:
+	case GT_X2: case GT_X3: case GT_X3S: case GT_X1:
 		return 256;
 	default: return 0;
 	}
@@ -137,6 +138,9 @@ ggml_type_bytes(uint32_t t)
 	case GT_IQ3_S: return 110;
 	case GT_IQ2_S: return 82;
 	case GT_IQ4_XS: return 136;
+	case GT_X2: return 114;
+	case GT_X3: case GT_X3S: return 138;
+	case GT_X1: return 74;
 	default: return 0;
 	}
 }
@@ -160,6 +164,10 @@ ggml_type_name(uint32_t t)
 	case GT_IQ3_S: return "IQ3_S";
 	case GT_IQ2_S: return "IQ2_S";
 	case GT_IQ4_XS: return "IQ4_XS";
+	case GT_X2: return "X2";
+	case GT_X3: return "X3";
+	case GT_X3S: return "X3S";
+	case GT_X1: return "X1";
 	default: return "?";
 	}
 }
@@ -248,6 +256,7 @@ gguf_open(gguf *g, const char *path, char *err, size_t errlen)
 			skip_val(&r, kv->type);
 		}
 	}
+	g->kv_end = r.p;
 	g->alignment = 32;
 	for (i = 0; i < g->n_tensors && !r.bad; i++) {
 		gtensor *t = &g->t[i];

@@ -785,6 +785,122 @@ dot_iq4_xs(const uint8_t *b, const q8k *x, size_t nb)
 	return hsumf(acc);
 }
 
+/* ---------------------------------------------------------------- */
+/* q2k's transcoded types (gguf.h): bit planes and table shuffles     */
+
+static const int8_t x3tab[16] = { 4, 12, 20, 28, 36, 44, 52, 62, -4, -12, -20, -28, -36, -44, -52, -62 };
+static const int8_t x3stab[16] = { 1, 3, 5, 7, 9, 11, 13, 15, -1, -3, -5, -7, -9, -11, -13, -15 };
+
+/* X2 block -> per 32-chunk magnitudes u[j], +-1 signs sg[j], i16 scale
+ * pairs s[j] (Q2_K order) */
+static void
+dec_x2(const uint8_t *b, __m256i *u, __m256i *sg, __m256i *s)
+{
+	const __m256i m3 = _mm256_set1_epi8(3), m1 = _mm256_set1_epi8(1);
+	const __m256i mag = _mm256_setr_epi8(8, 25, 43, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	    8, 25, 43, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+	const __m256i s16 = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i *)(b + 2)));
+	const __m256i hv = _mm256_loadu_si256((const __m256i *)(b + 82));
+	int c, j;
+	for (c = 0; c < 2; c++) {
+		__m256i qv = _mm256_loadu_si256((const __m256i *)(b + 18 + 32 * c));
+		__m256i sb = _mm256_broadcastsi128_si256(c ? _mm256_extracti128_si256(s16, 1)
+		    : _mm256_castsi256_si128(s16));
+		for (j = 0; j < 4; j++) {
+			__m256i h = _mm256_and_si256(_mm256_srli_epi16(hv, 4 * c + j), m1);
+			u[4 * c + j] = _mm256_shuffle_epi8(mag, _mm256_and_si256(_mm256_srli_epi16(qv, 2 * j), m3));
+			sg[4 * c + j] = _mm256_sub_epi8(m1, _mm256_add_epi8(h, h));
+			s[4 * c + j] = _mm256_shuffle_epi8(sb, pair_mask(j));
+		}
+	}
+}
+
+static float
+dot_x2(const uint8_t *b, const q8k *x, size_t nb)
+{
+	__m256 acc = _mm256_setzero_ps();
+	__m256i u[8], sg[8], s[8];
+	size_t i;
+	int j;
+	for (i = 0; i < nb; i++, b += 114, x++) {
+		__m256i isum = _mm256_setzero_si256();
+		dec_x2(b, u, sg, s);
+		for (j = 0; j < 8; j++) {
+			__m256i xv = _mm256_loadu_si256((const __m256i *)(x->qs + 32 * j));
+			isum = _mm256_add_epi32(isum, _mm256_madd_epi16(
+			    _mm256_maddubs_epi16(u[j], _mm256_sign_epi8(xv, sg[j])), s[j]));
+		}
+		acc = _mm256_fmadd_ps(_mm256_set1_ps(h16f(b) * 0.125f * x->d), _mm256_cvtepi32_ps(isum), acc);
+	}
+	return hsumf(acc);
+}
+
+/* X3/X3S: signed 4-bit codes through a 16-entry table */
+static float
+dot_x3(const uint8_t *b, const q8k *x, size_t nb, int s3)
+{
+	const __m256i tbl = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)(s3 ? x3stab : x3tab)));
+	const __m256i m4 = _mm256_set1_epi8(15);
+	const float ds = s3 ? 1.0f : 0.25f;
+	__m256 acc = _mm256_setzero_ps();
+	size_t i;
+	int ib;
+	for (i = 0; i < nb; i++, b += 138, x++) {
+		const uint8_t *qs = b + 10;
+		__m256i s = _mm256_setzero_si256();
+		for (ib = 0; ib < 8; ib++, qs += 16) {
+			__m128i q = _mm_loadu_si128((const __m128i *)qs);
+			__m256i w = _mm256_shuffle_epi8(tbl, _mm256_and_si256(_mm256_setr_m128i(q, _mm_srli_epi16(q, 4)), m4));
+			__m256i xv = _mm256_loadu_si256((const __m256i *)(x->qs + 32 * ib));
+			s = _mm256_add_epi32(s, _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_sign_epi8(w, w),
+			    _mm256_sign_epi8(xv, w)), _mm256_set1_epi16((short)b[2 + ib])));
+		}
+		acc = _mm256_fmadd_ps(_mm256_set1_ps(h16f(b) * ds * x->d), _mm256_cvtepi32_ps(s), acc);
+	}
+	return hsumf(acc);
+}
+
+/* X1: w = mult*(g + delta) = mult*(g+1) + mult*(delta - 1), the second
+ * term through the bsums ((delta - 1)*8 is -7 or -9) */
+static void
+x1_m16(const uint8_t *b, short *m16)
+{
+	int ib;
+	for (ib = 0; ib < 8; ib++) {
+		int mult = b[2 + ib] & 127;
+		m16[2 * ib] = m16[2 * ib + 1] = (short)(mult * (b[2 + ib] & 128 ? -9 : -7));
+	}
+}
+
+static float
+dot_x1(const uint8_t *b, const q8k *x, size_t nb)
+{
+	const __m256i m3 = _mm256_set1_epi8(3);
+	__m256 acc = _mm256_setzero_ps();
+	size_t i;
+	int c, j;
+	for (i = 0; i < nb; i++, b += 74, x++) {
+		short m16[16];
+		const int8_t *xq = x->qs;
+		__m256i isum = _mm256_setzero_si256(), msum;
+		x1_m16(b, m16);
+		msum = _mm256_madd_epi16(_mm256_loadu_si256((const __m256i *)m16),
+		    _mm256_loadu_si256((const __m256i *)x->bsums));
+		for (c = 0; c < 2; c++) {
+			__m256i qv = _mm256_loadu_si256((const __m256i *)(b + 10 + 32 * c));
+			for (j = 0; j < 4; j++, xq += 32) {
+				__m256i u = _mm256_and_si256(_mm256_srli_epi16(qv, 2 * j), m3);
+				int mult = b[2 + 4 * c + j] & 127;
+				isum = _mm256_add_epi32(isum, _mm256_madd_epi16(_mm256_maddubs_epi16(u,
+				    _mm256_loadu_si256((const __m256i *)xq)), _mm256_set1_epi16((short)mult)));
+			}
+		}
+		acc = _mm256_fmadd_ps(_mm256_set1_ps(h16f(b) * x->d), _mm256_cvtepi32_ps(isum), acc);
+		acc = _mm256_fmadd_ps(_mm256_set1_ps(h16f(b) * 0.125f * x->d), _mm256_cvtepi32_ps(msum), acc);
+	}
+	return hsumf(acc);
+}
+
 float
 kq_dot(uint32_t t, const void *row, const q8k *x, size_t n)
 {
@@ -802,6 +918,10 @@ kq_dot(uint32_t t, const void *row, const q8k *x, size_t n)
 	case GT_IQ3_S: return dot_iq3_s(row, x, n / 256);
 	case GT_IQ1_S: return dot_iq1_s(row, x, n / 256);
 	case GT_IQ4_XS: return dot_iq4_xs(row, x, n / 256);
+	case GT_X2: return dot_x2(row, x, n / 256);
+	case GT_X3: return dot_x3(row, x, n / 256, 0);
+	case GT_X3S: return dot_x3(row, x, n / 256, 1);
+	case GT_X1: return dot_x1(row, x, n / 256);
 	default: return kq_dot_scalar(t, row, x, n);
 	}
 }
@@ -940,8 +1060,46 @@ dec_block_iq(uint32_t t, const uint8_t *b, kblk *k)
 		k->A = h16f(b);
 		return 1;
 	}
+	case GT_X2:
+		dec_x2(b, k->u, k->sg, k->s);
+		k->A = h16f(b) * 0.125f;
+		return 1;
+	case GT_X3:
+	case GT_X3S: {
+		const __m256i tbl = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)
+		    (t == GT_X3S ? x3stab : x3tab)));
+		const uint8_t *qs = b + 10;
+		for (ib = 0; ib < 8; ib++, qs += 16) {
+			__m128i q = _mm_loadu_si128((const __m128i *)qs);
+			__m256i w = _mm256_shuffle_epi8(tbl, _mm256_and_si256(_mm256_setr_m128i(q,
+			    _mm_srli_epi16(q, 4)), _mm256_set1_epi8(15)));
+			k->u[ib] = _mm256_sign_epi8(w, w);
+			k->sg[ib] = w;
+			k->s[ib] = s16pair(b[2 + ib], b[2 + ib]);
+		}
+		k->A = h16f(b) * (t == GT_X3S ? 1.0f : 0.25f);
+		return 1;
 	}
-	(void)l;
+	case GT_X1: {
+		const __m256i m3 = _mm256_set1_epi8(3);
+		short m16[16];
+		int c;
+		k->sgn = 0;
+		for (c = 0; c < 2; c++) {
+			__m256i qv = _mm256_loadu_si256((const __m256i *)(b + 10 + 32 * c));
+			for (l = 0; l < 4; l++) {
+				int mult = b[2 + 4 * c + l] & 127;
+				k->u[4 * c + l] = _mm256_and_si256(_mm256_srli_epi16(qv, 2 * l), m3);
+				k->s[4 * c + l] = s16pair(mult, mult);
+			}
+		}
+		x1_m16(b, m16);
+		k->m = _mm256_loadu_si256((const __m256i *)m16);
+		k->A = h16f(b);
+		k->C = h16f(b) * 0.125f;
+		return 1;
+	}
+	}
 	return 0;
 }
 
@@ -1059,7 +1217,8 @@ kq_dotT(uint32_t t, const void *row, const q8k *x, size_t xs, int T, size_t n,
 	int tt, j;
 
 	const int iq = t == GT_IQ2_XXS || t == GT_IQ2_XS || t == GT_IQ2_S || t == GT_IQ3_XXS ||
-	    t == GT_IQ3_S || t == GT_IQ1_S || t == GT_IQ4_XS;
+	    t == GT_IQ3_S || t == GT_IQ1_S || t == GT_IQ4_XS || t == GT_X2 || t == GT_X3 ||
+	    t == GT_X3S || t == GT_X1;
 
 	if (T > 64 || (!iq && t != GT_Q2_K && t != GT_Q3_K && t != GT_Q4_K && t != GT_Q5_K &&
 	    t != GT_Q6_K))
