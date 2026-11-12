@@ -48,7 +48,7 @@ usage(void)
 	    "  -n N           tokens to generate (default 256)\n"
 	    "  -i, --chat     interactive chat using the model's template\n"
 	    "  -s TEXT        system message for chat\n"
-	    "  -t N           CPU threads (default: online CPUs)\n"
+	    "  -t N           CPU threads (default: online CPUs - 1)\n"
 	    "  -c N           context size (default 4096)\n"
 	    "  -g MIB         GPU weight split in MiB (default 512, 0 = CPU only)\n"
 	    "  -d N           Vulkan device index\n"
@@ -90,7 +90,9 @@ parse(int argc, char **argv)
 
 	O.model = getenv("Q2K_MODEL") ? getenv("Q2K_MODEL") : DEFAULT_MODEL;
 	O.n_predict = 256;
-	O.threads = nc > 0 ? (int)nc : 1;
+	/* one core left for the GPU driver, the fence polling and the
+	 * rest of the system: measured faster than all of them */
+	O.threads = nc > 1 ? (int)nc - 1 : 1;
 	O.ctx = 4096;
 	O.gpu_mib = 512;
 	O.device = -1;
