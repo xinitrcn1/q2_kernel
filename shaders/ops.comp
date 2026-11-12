@@ -130,44 +130,69 @@ void main()
 }
 
 #elif OP == 3
-/* Mamba2 selective scan over T tokens, one subgroup per channel r of
- * the GPU's heads, its d_state values held in the lanes' registers.
+/* Mamba2 selective scan over T tokens: one workgroup per head of the
+ * GPU's heads, 8 channels per subgroup with their d_state values in the
+ * lanes' registers; a tile of tokens' B, C and dt is staged in shared
+ * memory once for all 64 channels.
  * p: 0 xbc (x | B | C, token 0), 1 xbc stride, 2 dt, 3 dt stride,
  *    4 z (token 0), 5 z stride, 6 y out, 7 y stride, 8 state, 9 A (W),
- *    10 D (W), 11 channels (gdi), 12 d_state, 13 head_dim, 14 T */
-#define SMAX 8u
+ *    10 D (W), 11 channels (gdi), 12 d_state (<= 128), 13 head_dim
+ *    (<= 8 x subgroups), 14 T */
+#define STT 16u
+#define RPW 8u
+shared float sB[STT * 128u], sC[STT * 128u], sdt[STT];
 void main()
 {
-	uint r = gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID;
-	uint gdi = pc.p[11], ds = pc.p[12], T = pc.p[14];
-	if (r >= gdi)
-		return;
-	uint h = r / pc.p[13], lane = gl_SubgroupInvocationID, sg = gl_SubgroupSize;
-	uint st = pc.p[8] + r * ds, nk = (ds + sg - 1u) / sg;
+	uint h = gl_WorkGroupID.x, gdi = pc.p[11], ds = pc.p[12], P = pc.p[13], T = pc.p[14];
+	uint lane = gl_SubgroupInvocationID, sg = gl_SubgroupSize, tid = gl_LocalInvocationID.x;
+	uint nk = ds / sg;          /* states per lane (d_state a multiple of the subgroup) */
 	float Ah = wf(pc.p[9] + h), Dh = wf(pc.p[10] + h);
-	float sv[SMAX];
-	for (uint k = 0u; k < SMAX; k++)
-		sv[k] = k < nk && lane + k * sg < ds ? S[st + lane + k * sg] : 0.0;
-	for (uint t = 0u; t < T; t++) {
-		uint xb = pc.p[0] + t * pc.p[1];
-		float dt = A[pc.p[2] + t * pc.p[3] + h];
-		float dA = exp(dt * Ah);
-		float x = A[xb + r];
-		float xdt = x * dt, acc = 0.0;
-		for (uint k = 0u; k < SMAX; k++) {
-			uint n = lane + k * sg;
-			if (k < nk && n < ds) {
-				sv[k] = sv[k] * dA + A[xb + gdi + n] * xdt;
-				acc += sv[k] * A[xb + gdi + ds + n];
+	float sv[RPW * 4u];
+	uint rbase = h * P + gl_SubgroupID * RPW;
+
+	for (uint i = 0u; i < RPW; i++)
+		for (uint k = 0u; k < 4u; k++)
+			sv[i * 4u + k] = (rbase + i < (h + 1u) * P && k < nk) ?
+			    S[pc.p[8] + (rbase + i) * ds + lane + k * sg] : 0.0;
+	for (uint t0 = 0u; t0 < T; t0 += STT) {
+		uint nt = min(STT, T - t0);
+		for (uint i = tid; i < nt * ds; i += gl_WorkGroupSize.x) {
+			uint t = i / ds, n = i - t * ds, xb = pc.p[0] + (t0 + t) * pc.p[1] + gdi;
+			sB[t * 128u + n] = A[xb + n];
+			sC[t * 128u + n] = A[xb + ds + n];
+		}
+		if (tid < nt)
+			sdt[tid] = A[pc.p[2] + (t0 + tid) * pc.p[3] + h];
+		barrier();
+		for (uint t = 0u; t < nt; t++) {
+			float dt = sdt[t], dA = exp(dt * Ah);
+			float bv[4], cv[4];
+			for (uint k = 0u; k < 4u; k++) {
+				bv[k] = k < nk ? sB[t * 128u + lane + k * sg] : 0.0;
+				cv[k] = k < nk ? sC[t * 128u + lane + k * sg] : 0.0;
+			}
+			uint xb = pc.p[0] + (t0 + t) * pc.p[1];
+			for (uint i = 0u; i < RPW; i++) {
+				uint r = rbase + i;
+				if (r >= (h + 1u) * P)
+					break;
+				float x = A[xb + r], xdt = x * dt, acc = 0.0;
+				for (uint k = 0u; k < 4u; k++) {
+					sv[i * 4u + k] = sv[i * 4u + k] * dA + bv[k] * xdt;
+					acc += sv[i * 4u + k] * cv[k];
+				}
+				acc = subgroupAdd(acc);
+				if (lane == 0u)
+					A[pc.p[6] + (t0 + t) * pc.p[7] + r] = (acc + Dh * x) *
+					    silu(A[pc.p[4] + (t0 + t) * pc.p[5] + r]);
 			}
 		}
-		acc = subgroupAdd(acc);
-		if (lane == 0u)
-			A[pc.p[6] + t * pc.p[7] + r] = (acc + Dh * x) * silu(A[pc.p[4] + t * pc.p[5] + r]);
+		barrier();
 	}
-	for (uint k = 0u; k < SMAX; k++)
-		if (k < nk && lane + k * sg < ds)
-			S[st + lane + k * sg] = sv[k];
+	for (uint i = 0u; i < RPW; i++)
+		for (uint k = 0u; k < 4u; k++)
+			if (rbase + i < (h + 1u) * P && k < nk)
+				S[pc.p[8] + (rbase + i) * ds + lane + k * sg] = sv[i * 4u + k];
 }
 #elif OP == 5
 /* bandwidth probe: p0 words to read (uvec4 units), p1 out (A) */

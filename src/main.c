@@ -419,6 +419,23 @@ check(void)
 			}
 			if (rr)
 				printf("[dotT max|diff| %.2e of %.2e] ", md, mr);
+			if (w->gpu_n) {
+				/* GPU tiled GEMM (5 tokens) vs kq_dot */
+				float *g5 = malloc(sizeof(float) * 5 * (size_t)w->N);
+				float gd = 0, gr = 0;
+				vk_matmul_test(w, e, x5, 5, g5);
+				for (rr = 0; rr < w->N; rr++)
+					for (t5 = 0; t5 < 5; t5++) {
+						const uint8_t *row = w->data + ((size_t)e * w->N + rr) * w->row_bytes;
+						float ref = kq_dot(w->type, row, x5 + t5 * (w->K / 256), (size_t)w->K);
+						if (fabsf(g5[t5 * w->N + rr] - ref) > gd)
+							gd = fabsf(g5[t5 * w->N + rr] - ref);
+						if (fabsf(ref) > gr)
+							gr = fabsf(ref);
+					}
+				printf("[gpu mm max|diff| %.2e of %.2e] ", gd, gr);
+				free(g5);
+			}
 			free(x5);
 		}
 		printf("%-32s %-5s %10.2e %10.2e ", w->name, ggml_type_name(w->type),

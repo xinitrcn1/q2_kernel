@@ -15,7 +15,11 @@
 #define ABUF (ACAP + 2048u)
 #define Q8W ((uint32_t)(sizeof(q8k) / 4))
 #define BMAX 64
+#define MOE_MAX 72
 #define NONE 0xffffffffu
+#ifndef VK_SPIN_S
+#define VK_SPIN_S 0.1
+#endif
 #define PIPE_CONV 21
 #define PIPE_SCAN 22
 #define PIPE_QBLK 23
@@ -70,8 +74,8 @@ static struct {
 	/* recording */
 	uint32_t aused, cur;
 	int nup, upw, ndl;
-	VkBufferCopy up[BMAX];
-	struct { uint32_t off, n; float *dst; } dl[BMAX];
+	VkBufferCopy up[MOE_MAX + 8];
+	struct { uint32_t off, n; float *dst; } dl[MOE_MAX + 8];
 	int inflight;
 	/* fused paths */
 	struct lay { int ok; uint32_t an, cw, cb, dtb, a, d, sn, sconv, sssm; } *lay;
@@ -80,7 +84,7 @@ static struct {
 	wt lm;                  /* leading rows of the output projection */
 	int has_lm;
 	int nmoe;
-	struct { const wt *g, *u, *d; int e; float *out; } moe[16];
+	struct { const wt *g, *u, *d; int e; const q8k *xq; int n; float *out; } moe[MOE_MAX];
 	/* Q2K_GPUPROF: per-stage GPU timestamps of the fused mixer */
 	VkQueryPool qp;
 	int prof, nts;
@@ -1008,10 +1012,31 @@ seq_matmul(const wt *w, int e, uint32_t r0, uint32_t n, uint32_t kel, uint32_t x
 	pc.y_stride = ys;
 	/* big single-token matrices: 4 rows per subgroup amortize staging */
 	pc.rps = T == 1 ? 4 : 1;
+	if (T > 1 && w->type != GT_Q8_0) {
+		/* tiled GEMM: 32 rows x 32 tokens per workgroup */
+		seq_pipe(32 + w->type);
+		vkCmdPushConstants(V.cb, V.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+		vkCmdDispatch(V.cb, (n + 31) / 32, (T + 31) / 32, 1);
+		return;
+	}
+	if (T > 1) {
+		/* Q8_0 has no GEMM variant: one matvec per token */
+		uint32_t t;
+		pc.T = 1;
+		pc.rps = 4;
+		seq_pipe(w->type);
+		for (t = 0; t < T; t++) {
+			pc.x_off = xq + t * xs;
+			pc.y_off = y + t * ys;
+			vkCmdPushConstants(V.cb, V.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+			vkCmdDispatch(V.cb, (n + V.sg_per_wg * 4 - 1) / (V.sg_per_wg * 4), 1, 1);
+		}
+		return;
+	}
 	per = V.sg_per_wg * pc.rps;
-	seq_pipe(T > 1 ? 32 + w->type : w->type);
+	seq_pipe(w->type);
 	vkCmdPushConstants(V.cb, V.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-	vkCmdDispatch(V.cb, (n + per - 1) / per, (T + 7) / 8, 1);
+	vkCmdDispatch(V.cb, (n + per - 1) / per, 1, 1);
 }
 
 static void
@@ -1030,15 +1055,6 @@ seq_op(uint32_t pipe, const uint32_t *p, uint32_t groups)
 
 /* n/256 workgroups: [silu(a)*b | a] -> per-block sum of squares, *w,
  * q8k */
-static void
-seq_qblk(uint32_t a, uint32_t b, uint32_t w, uint32_t q_out, uint32_t ss_out, uint32_t n)
-{
-	uint32_t p[16];
-	memset(p, 0, sizeof(p));
-	p[0] = a; p[1] = b; p[2] = w; p[3] = q_out; p[4] = ss_out;
-	seq_op(PIPE_QBLK, p, n / 256);
-}
-
 /* the same over T tokens: a/b at stride as (floats), q at qs (words),
  * ss at sss */
 static void
@@ -1071,7 +1087,7 @@ seq_submit(void)
 	int i;
 
 	if (V.ndl) {
-		VkBufferCopy rg[BMAX];
+		VkBufferCopy rg[MOE_MAX + 8];
 		barrier(VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
 		    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
 		for (i = 0; i < V.ndl; i++) {
@@ -1104,7 +1120,7 @@ vk_wait(void)
 	if (!V.inflight)
 		return;
 	/* poll first: a blocking wait lets the core sleep and clock down */
-	while (vkGetFenceStatus(V.dev, V.fence) == VK_NOT_READY && vnow() - t0 < 0.005)
+	while (vkGetFenceStatus(V.dev, V.fence) == VK_NOT_READY && vnow() - t0 < VK_SPIN_S)
 		;
 	if (vkWaitForFences(V.dev, 1, &V.fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
 		fprintf(stderr, "vulkan: device lost\n");
@@ -1310,7 +1326,7 @@ vk_mamba_submit(const model *m, int il, const q8k *xq, int T, int hg, float *out
 	p[0] = xbc; p[1] = gch; p[2] = dt; p[3] = (uint32_t)hg; p[4] = zx; p[5] = zs;
 	p[6] = y; p[7] = gdi; p[8] = ly->sssm; p[9] = ly->a; p[10] = ly->d;
 	p[11] = gdi; p[12] = DS; p[13] = (uint32_t)h->ssm_head_dim; p[14] = t;
-	seq_op(PIPE_SCAN, p, (gdi + V.sg_per_wg - 1) / V.sg_per_wg);
+	seq_op(PIPE_SCAN, p, (uint32_t)hg);     /* one workgroup per head */
 	cbar();
 	q2 = seq_alloc(t * nb * Q8W);
 	sso = seq_alloc(t * nb);
@@ -1375,6 +1391,21 @@ vk_bandwidth(size_t bytes, uint32_t groups)
 	return best;
 }
 
+/* GPU batched matmul of expert e over T tokens (for --check) */
+void
+vk_matmul_test(const wt *w, int e, const q8k *xq, int T, float *out)
+{
+	uint32_t xw = (uint32_t)w->K / 256 * Q8W, xo, y;
+	seq_begin();
+	xo = seq_put(xq, (uint32_t)T * xw);
+	seq_flush_up();
+	y = seq_alloc((uint32_t)(T * w->N));
+	seq_matmul(w, e, 0, (uint32_t)w->N, (uint32_t)w->K, xo, xw, (uint32_t)T, y, (uint32_t)w->N);
+	seq_get(y, (uint32_t)(T * w->N), out);
+	seq_submit();
+	vk_wait();
+}
+
 void
 vk_prof_report(void)
 {
@@ -1408,25 +1439,29 @@ vk_moe_begin(void)
 }
 
 int
-vk_moe_add(const wt *gate, const wt *up, const wt *down, int e, float *out)
+vk_moe_add(const wt *gate, const wt *up, const wt *down, int e, const q8k *xq, int n, float *out)
 {
-	if (V.nmoe >= 16 || !gate->gpu_n || gate->gslot[e] < 0 || !up->gpu_n ||
+	if (V.nmoe >= MOE_MAX || n <= 0 || !gate->gpu_n || gate->gslot[e] < 0 || !up->gpu_n ||
 	    up->gslot[e] < 0 || !down->gpu_n || down->gslot[e] < 0)
 		return -1;
 	V.moe[V.nmoe].g = gate;
 	V.moe[V.nmoe].u = up;
 	V.moe[V.nmoe].d = down;
 	V.moe[V.nmoe].e = e;
+	V.moe[V.nmoe].xq = xq;
+	V.moe[V.nmoe].n = n;
 	V.moe[V.nmoe].out = out;
 	V.nmoe++;
 	return 0;
 }
 
+/* gate/up -> SwiGLU -> down for every added expert over its tokens */
 void
-vk_moe_submit(const q8k *xq, int K)
+vk_moe_submit(int K)
 {
-	uint32_t xo, g[16], u[16], hq[16], o[16];
-	int i;
+	const uint32_t eb = (uint32_t)K / 256 * Q8W;
+	uint32_t xo[MOE_MAX], g[MOE_MAX], u[MOE_MAX], hq[MOE_MAX], o[MOE_MAX];
+	int i, k;
 
 	if (!V.nmoe)
 		return;
@@ -1437,26 +1472,34 @@ vk_moe_submit(const q8k *xq, int K)
 		V.moe_prof = 1;
 	}
 	V.nmoe_last = V.nmoe;
-	xo = seq_put(xq, (uint32_t)K / 256 * Q8W);
+	for (i = 0; i < V.nmoe; i++) {
+		for (k = 0; k < i; k++)
+			if (V.moe[k].xq == V.moe[i].xq && V.moe[k].n == V.moe[i].n)
+				break;
+		xo[i] = k < i ? xo[k] : seq_put(V.moe[i].xq, (uint32_t)V.moe[i].n * eb);
+	}
 	seq_flush_up();
 	ts();
 	for (i = 0; i < V.nmoe; i++) {
-		g[i] = seq_alloc((uint32_t)V.moe[i].g->N);
-		u[i] = seq_alloc((uint32_t)V.moe[i].u->N);
-		seq_matvec(V.moe[i].g, V.moe[i].e, xo, g[i]);
-		seq_matvec(V.moe[i].u, V.moe[i].e, xo, u[i]);
+		const uint32_t n = (uint32_t)V.moe[i].n, ff = (uint32_t)V.moe[i].g->N;
+		g[i] = seq_alloc(n * ff);
+		u[i] = seq_alloc(n * ff);
+		seq_matmul(V.moe[i].g, V.moe[i].e, 0, ff, (uint32_t)K, xo[i], eb, n, g[i], ff);
+		seq_matmul(V.moe[i].u, V.moe[i].e, 0, ff, (uint32_t)K, xo[i], eb, n, u[i], ff);
 	}
 	cbar();
 	for (i = 0; i < V.nmoe; i++) {
-		uint32_t ff = (uint32_t)V.moe[i].g->N;
-		hq[i] = seq_alloc(ff / 256 * Q8W);
-		seq_qblk(g[i], u[i], NONE, hq[i], NONE, ff);
+		const uint32_t n = (uint32_t)V.moe[i].n, ff = (uint32_t)V.moe[i].g->N;
+		hq[i] = seq_alloc(n * (ff / 256) * Q8W);
+		seq_qblk_t(g[i], u[i], NONE, hq[i], NONE, ff, n, ff, (ff / 256) * Q8W, 0);
 	}
 	cbar();
 	for (i = 0; i < V.nmoe; i++) {
-		o[i] = seq_alloc((uint32_t)V.moe[i].d->N);
-		seq_matvec(V.moe[i].d, V.moe[i].e, hq[i], o[i]);
-		seq_get(o[i], (uint32_t)V.moe[i].d->N, V.moe[i].out);
+		const uint32_t n = (uint32_t)V.moe[i].n, ff = (uint32_t)V.moe[i].g->N;
+		const uint32_t N = (uint32_t)V.moe[i].d->N;
+		o[i] = seq_alloc(n * N);
+		seq_matmul(V.moe[i].d, V.moe[i].e, 0, N, ff, hq[i], (ff / 256) * Q8W, n, o[i], N);
+		seq_get(o[i], n * N, V.moe[i].out);
 	}
 	ts();
 	seq_submit();

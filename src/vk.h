@@ -46,6 +46,7 @@ void vk_mamba_submit(const model *m, int il, const q8k *xq, int T, int hg, float
 void vk_prof_collect(void);
 void vk_prof_report(void);
 double vk_bandwidth(size_t bytes, uint32_t groups);
+void vk_matmul_test(const wt *w, int e, const q8k *xq, int T, float *out);
 void vk_state_reset(void);
 /* state of heads [h0, h1) (+ B/C conv) of layer il to (to_gpu=1) or
  * from (0) the CPU arrays */
@@ -56,7 +57,9 @@ const wt *vk_lm(void);
 /* MoE experts resident on the GPU (gate/up -> SwiGLU -> down each),
  * run asynchronously while the CPU does the rest; vk_wait collects. */
 void vk_moe_begin(void);
-int vk_moe_add(const wt *gate, const wt *up, const wt *down, int e, float *out);
-void vk_moe_submit(const q8k *xq, int K);
+/* expert e over n tokens: xq = n q8k vectors (K/256 blocks each),
+ * out = n x down->N floats */
+int vk_moe_add(const wt *gate, const wt *up, const wt *down, int e, const q8k *xq, int n, float *out);
+void vk_moe_submit(int K);
 
 #endif

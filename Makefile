@@ -35,8 +35,8 @@ build/${s:R}.o: src/${s} ${HDRS:%=src/%}
 
 build/vk.o: gen/shaders.h
 
-# per type: DP4A and emulated-dot (_nd) variants, each with a 1-token
-# (decode) and an 8-token (_b, batched) tile
+# per type: DP4A and emulated-dot (_nd) variants, each as a matvec (1
+# token per pass, decode) and a tiled GEMM (_b, batches)
 .for t in ${QTYPES}
 gen/spv_${t}.h: shaders/matvec.comp
 	@mkdir -p gen
@@ -48,11 +48,11 @@ gen/spv_${t}_nd.h: shaders/matvec.comp
 	    -o ${.TARGET} shaders/matvec.comp >/dev/null
 gen/spv_${t}_b.h: shaders/matvec.comp
 	@mkdir -p gen
-	${GLSLANG} -V --target-env vulkan1.1 -DQT=${QT.${t}} -DTT=8u --vn spv_${t}_b \
+	${GLSLANG} -V --target-env vulkan1.1 -DQT=${QT.${t}} -DMMQ --vn spv_${t}_b \
 	    -o ${.TARGET} shaders/matvec.comp >/dev/null
 gen/spv_${t}_ndb.h: shaders/matvec.comp
 	@mkdir -p gen
-	${GLSLANG} -V --target-env vulkan1.1 -DQT=${QT.${t}} -DNO_DOT -DTT=8u --vn spv_${t}_ndb \
+	${GLSLANG} -V --target-env vulkan1.1 -DQT=${QT.${t}} -DNO_DOT -DMMQ --vn spv_${t}_ndb \
 	    -o ${.TARGET} shaders/matvec.comp >/dev/null
 .endfor
 

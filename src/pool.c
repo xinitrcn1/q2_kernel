@@ -12,7 +12,9 @@
  * The spin only reads 'gen'; the job itself is always picked up under
  * the mutex, which orders it.
  */
-#define SPIN_NS 2000000L        /* 2 ms */
+#ifndef SPIN_NS
+#define SPIN_NS 100000000L      /* 100 ms */
+#endif
 
 static struct {
 	int n;

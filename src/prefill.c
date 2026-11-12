@@ -159,7 +159,7 @@ mmi(const wt *w, int e, const q8k *xq, int xs, int T, float *y, int ldy)
 static struct {
 	int ok;
 	float *x, *xn, *zx, *xbc, *dt, *y, *tmp, *q, *ao;
-	float *hg, *hu, *eo, *sg, *su, *so;
+	float *hg, *hu, *eo, *sg, *su, *so, *og, *ss;
 	q8k *xq, *yq, *hq, *sq, *gq;
 	int *sel;
 	float *wk;
@@ -182,6 +182,7 @@ bufs(const hparams *h)
 	A(B.hq, T * K * (size_t)h->n_ff / 256); A(B.sq, T * (size_t)h->n_ff_sh / 256);
 	A(B.gq, T * K * E / 256);
 	A(B.sel, T * K); A(B.wk, T * K);
+	A(B.og, T * E); A(B.ss, T * (size_t)h->d_inner / 256);
 #undef A
 	B.ok = 1;
 	return 0;
@@ -339,6 +340,25 @@ mamba2_batch(const model *m, const layer *L, state *s, int il, int T)
 	for (t = 0; t < T; t++)
 		v_rmsnorm(B.xn + (size_t)t * E, B.x + (size_t)t * E, L->attn_norm, (size_t)E, h->eps);
 	quant_rows(B.xn, B.xq, T, E);
+	if (vk_mamba_ok(il) && !getenv("Q2K_NO_GPU_MIX")) {
+		/* the whole mixer on the GPU, every head; the gated RMS norm
+		 * is folded through ssm_out: out = ssm_out(y*w) / rms(y) */
+		const int nb = DI / 256;
+		double t0 = now();
+		vk_mamba_submit(m, il, B.xq, T, NH, B.og, B.ss);
+		vk_wait();
+		vk_prof_collect();
+		pf_t[6] += now() - t0;
+		for (t = 0; t < T; t++) {
+			float ss = 0, r;
+			for (i = 0; i < nb; i++)
+				ss += B.ss[(size_t)t * nb + i];
+			r = 1.0f / sqrtf(ss / (float)DI + h->eps);
+			for (i = 0; i < E; i++)
+				B.tmp[(size_t)t * E + i] = B.og[(size_t)t * E + i] * r;
+		}
+		return;
+	}
 	it[0] = mmi(&L->ssm_in, 0, B.xq, E / 256, T, B.zx, DP);
 	mm_run(it, 1);
 
@@ -504,7 +524,7 @@ moe_batch(const model *m, const layer *L, int T)
 	const hparams *h = &m->hp;
 	const int E = h->n_embd, K = h->n_expert_used, FF = h->n_ff, FS = h->n_ff_sh;
 	const int NE = h->n_expert, eb = E / 256, fb = FF / 256;
-	int cnt[256], base[257], fill[256], slot_t[PB * 16], slot_k[PB * 16];
+	int cnt[256], base[257], fill[256], slot_t[PB * 16], slot_k[PB * 16], gpu[256], gsh;
 	mm_item it[MM_MAX];
 	int t, k, e, i, n;
 
@@ -540,12 +560,29 @@ moe_batch(const model *m, const layer *L, int T)
 		}
 
 	pf_t[4] += now() - t0;
+	/* experts resident on the GPU run there (async), the rest here */
+	memset(gpu, 0, sizeof(gpu));
+	gsh = 0;
+	if (vk_ready() && !getenv("Q2K_NO_GPU_MOE")) {
+		int any;
+		vk_moe_begin();
+		any = gsh = vk_moe_add(&L->gate_s, &L->up_s, &L->down_s, 0, B.xq, T, B.so) == 0;
+		for (e = 0; e < NE; e++)
+			if (cnt[e])
+				any |= gpu[e] = vk_moe_add(&L->gate_e, &L->up_e, &L->down_e, e,
+				    B.gq + (size_t)base[e] * eb, cnt[e], B.eo + (size_t)base[e] * E) == 0;
+		if (any)
+			vk_moe_submit(E);
+	}
+
 	/* gate/up: shared expert over all tokens, routed experts over theirs */
 	n = 0;
-	it[n++] = mmi(&L->gate_s, 0, B.xq, eb, T, B.sg, FS);
-	it[n++] = mmi(&L->up_s, 0, B.xq, eb, T, B.su, FS);
+	if (!gsh) {
+		it[n++] = mmi(&L->gate_s, 0, B.xq, eb, T, B.sg, FS);
+		it[n++] = mmi(&L->up_s, 0, B.xq, eb, T, B.su, FS);
+	}
 	for (e = 0; e < NE; e++)
-		if (cnt[e]) {
+		if (cnt[e] && !gpu[e]) {
 			it[n++] = mmi(&L->gate_e, e, B.gq + (size_t)base[e] * eb, eb, cnt[e],
 			    B.hg + (size_t)base[e] * FF, FF);
 			it[n++] = mmi(&L->up_e, e, B.gq + (size_t)base[e] * eb, eb, cnt[e],
@@ -553,18 +590,30 @@ moe_batch(const model *m, const layer *L, int T)
 		}
 	mm_run(it, n);
 
-	v_swiglu(B.sg, B.su, (size_t)T * FS);
-	v_swiglu(B.hg, B.hu, (size_t)T * K * FF);
-	quant_rows(B.sg, B.sq, T, FS);
-	quant_rows(B.hg, B.hq, T * K, FF);
+	if (!gsh) {
+		v_swiglu(B.sg, B.su, (size_t)T * FS);
+		quant_rows(B.sg, B.sq, T, FS);
+	}
+	for (e = 0; e < NE; e++)
+		if (cnt[e] && !gpu[e]) {
+			v_swiglu(B.hg + (size_t)base[e] * FF, B.hu + (size_t)base[e] * FF,
+			    (size_t)cnt[e] * FF);
+			quant_rows(B.hg + (size_t)base[e] * FF, B.hq + (size_t)base[e] * fb, cnt[e], FF);
+		}
 
 	n = 0;
-	it[n++] = mmi(&L->down_s, 0, B.sq, FS / 256, T, B.so, E);
+	if (!gsh)
+		it[n++] = mmi(&L->down_s, 0, B.sq, FS / 256, T, B.so, E);
 	for (e = 0; e < NE; e++)
-		if (cnt[e])
+		if (cnt[e] && !gpu[e])
 			it[n++] = mmi(&L->down_e, e, B.hq + (size_t)base[e] * fb, fb, cnt[e],
 			    B.eo + (size_t)base[e] * E, E);
 	mm_run(it, n);
+	if (vk_ready()) {
+		double t0 = now();
+		vk_wait();
+		pf_t[7] += now() - t0;
+	}
 
 	memcpy(B.tmp, B.so, sizeof(float) * (size_t)T * E);
 	for (i = 0; i < T * K; i++)
@@ -616,9 +665,10 @@ model_prefill(const model *m, state *s, const int *tok, int n)
 			lg = model_forward(m, s, tok[i], i == n - 1);
 		return lg;
 	}
-	/* the GPU's heads' state comes back to the CPU for the batch */
+	/* resident mixers run every head on the GPU in a batch: it needs
+	 * the state of the heads the CPU decodes */
 	for (il = 0; il < h->n_layer; il++)
-		vk_state_sync(m, s, il, 0, 0, vk_mamba_heads(il));
+		vk_state_sync(m, s, il, 1, vk_mamba_heads(il), h->ssm_heads);
 	/* all but the last token in chunks; the last one through the
 	 * regular path, which also produces the logits */
 	{
@@ -631,11 +681,14 @@ model_prefill(const model *m, state *s, const int *tok, int n)
 	}
 	pf_t[5] += now() - t0;
 	if (getenv("Q2K_PREFILL_PROF"))
-		fprintf(stderr, "prefill %d tok: total %.3f s: matmul %.3f (%.1f GB/s of row x token work), "
-		    "conv %.3f, scan %.3f, attn %.3f, routing %.3f\n", n - 1, pf_t[5], pf_t[0],
-		    pf_rows / pf_t[0] / 1e9, pf_t[1], pf_t[2], pf_t[3], pf_t[4]);
+		fprintf(stderr, "prefill %d tok: total %.3f s: cpu matmul %.3f (%.1f GB/s of row x token work), "
+		    "conv %.3f, scan %.3f, attn %.3f, routing %.3f, gpu mixer %.3f, gpu moe wait %.3f\n",
+		    n - 1, pf_t[5], pf_t[0], pf_rows / (pf_t[0] + 1e-9) / 1e9, pf_t[1], pf_t[2], pf_t[3],
+		    pf_t[4], pf_t[6], pf_t[7]);
+	if (getenv("Q2K_PREFILL_PROF"))
+		vk_prof_report();
 	}
 	for (il = 0; il < h->n_layer; il++)
-		vk_state_sync(m, s, il, 1, 0, vk_mamba_heads(il));
+		vk_state_sync(m, s, il, 0, vk_mamba_heads(il), h->ssm_heads);
 	return model_forward(m, s, tok[n - 1], 1);
 }

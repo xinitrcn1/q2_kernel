@@ -826,15 +826,14 @@ moe(const model *m, const layer *L, state *s)
 	if (vk_ready()) {
 		int any;
 		vk_moe_begin();
-		gsh = vk_moe_add(&L->gate_s, &L->up_s, &L->down_s, 0, s->so) == 0;
+		q8k_quantize(s->xn, s->xq, (size_t)E);
+		gsh = vk_moe_add(&L->gate_s, &L->up_s, &L->down_s, 0, s->xq, 1, s->so) == 0;
 		any = gsh;
 		for (k = 0; k < K; k++)
-			any |= gk[k] = vk_moe_add(&L->gate_e, &L->up_e, &L->down_e, sel[k],
+			any |= gk[k] = vk_moe_add(&L->gate_e, &L->up_e, &L->down_e, sel[k], s->xq, 1,
 			    s->eo + k * E) == 0;
-		if (any) {
-			q8k_quantize(s->xn, s->xq, (size_t)E);
-			vk_moe_submit(s->xq, E);
-		}
+		if (any)
+			vk_moe_submit(E);
 	}
 
 	n = 0;
