@@ -3,8 +3,8 @@
  * with integer arithmetic.  Every K-quant weight w = a*u - b with u an
  * unsigned small integer, so
  *     sum(w*x) = dx * (a * sum(u*xq) - b * sum(xq))
- * and sum(xq) per 16-group is precomputed (bsums).  AVX2 when built
- * with it, a scalar integer path otherwise. */
+ * and sum(xq) per 16-group is precomputed (bsums).  The kernels are
+ * AVX2 (+ FMA, F16C); kq_dot_scalar is the integer reference. */
 #ifndef Q2K_KQ_H
 #define Q2K_KQ_H
 
@@ -17,6 +17,15 @@ typedef struct q8k_s {
 	int16_t bsums[16];
 } q8k;
 
+/* prompts' CPU copy of the activations (kq_q8k_xu): qs ^ 0x80, each
+ * block on its own 64-byte lines (qs first: no load splits a line) */
+typedef struct q8ku_s {
+	int8_t qs[256];
+	int16_t bsums[16];
+	float d;
+} __attribute__((aligned(64))) q8ku;
+typedef char q8ku_is_320[sizeof(q8ku) == 320 ? 1 : -1];
+
 /* n % 256 == 0 */
 void q8k_quantize(const float *x, q8k *y, size_t n);
 
@@ -27,6 +36,12 @@ float kq_dot(uint32_t t, const void *row, const q8k *x, size_t n);
  * returns 0 if t has no multi-token kernel */
 int kq_dotT(uint32_t t, const void *row, const q8k *x, size_t xs, int T, size_t n,
     float *out, size_t ostride);
+/* the same with x in the xu form (qs ^ 0x80, d and bsums unchanged),
+ * block-major: token t of block i at xu[i*bs + t] */
+int kq_dotTu(uint32_t t, const void *row, const q8ku *xu, size_t bs, int T, size_t n,
+    float *out, size_t ostride);
+/* x (token t at x + t*xs, nb blocks) -> xu[i*T + t] (64-byte aligned) */
+void kq_q8k_xu(const q8k *x, size_t xs, int T, size_t nb, q8ku *xu);
 
 /* scalar integer path, always built (for self-tests) */
 float kq_dot_scalar(uint32_t t, const void *row, const q8k *x, size_t n);

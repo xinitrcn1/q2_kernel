@@ -1,15 +1,14 @@
 #include "kq.h"
 
 #include <math.h>
+#include <stddef.h>
 #include <string.h>
 
 #include "gguf.h"
 #include "quant.h"
 #include "iqtab.h"
 
-#if defined(__AVX2__)
 #include <immintrin.h>
-#endif
 
 static float
 h16(const uint8_t *p)
@@ -25,7 +24,6 @@ q8k_quantize(const float *x, q8k *y, size_t n)
 
 	for (b = 0; b < n / 256; b++, x += 256, y++) {
 		float amax = 0, mx = 0, is;
-#if defined(__AVX2__)
 		/* same result as the scalar loop below: lrintf and cvtps both
 		 * round to nearest even, and |is*x| <= 127 */
 		__m256 vmax = _mm256_loadu_ps(x), vmin = vmax;
@@ -75,7 +73,6 @@ q8k_quantize(const float *x, q8k *y, size_t n)
 			y->bsums[j] = (int16_t)s;
 		}
 		continue;
-#endif
 		/* same rounding as ggml's quantize_row_q8_K: scale by the
 		 * signed extreme, round to nearest even */
 		for (i = 0; i < 256; i++) {
@@ -273,7 +270,6 @@ kq_dot_scalar(uint32_t t, const void *row, const q8k *x, size_t n)
 /* ---------------------------------------------------------------- */
 /* AVX2                                                             */
 
-#if defined(__AVX2__)
 
 /*
  * Each kernel accumulates per-block integer sums, converts them once
@@ -283,7 +279,6 @@ kq_dot_scalar(uint32_t t, const void *row, const q8k *x, size_t n)
  * the byte-wise definition (kept in kq_dot_scalar) by SAT with ucas.
  */
 
-#if defined(__F16C__)
 static float
 h16f(const uint8_t *p)
 {
@@ -291,9 +286,6 @@ h16f(const uint8_t *p)
 	memcpy(&v, p, 2);
 	return _cvtsh_ss(v);
 }
-#else
-#define h16f h16
-#endif
 
 static uint32_t
 rd32(const uint8_t *p)
@@ -936,9 +928,32 @@ kq_dot(uint32_t t, const void *row, const q8k *x, size_t n)
 typedef struct {
 	__m256i u[8], s[8], m;
 	__m256i sg[8];          /* i-quants: +-1 per weight, applied to x */
-	int sgn;
+	__m256i kc;             /* xu: sum_j madd(maddubs(128, u_j), s_j) */
+	int sgn, xu;
 	float A, C;
 } kblk;
+
+/* xu form (X2, X3, X3S): u_j holds the signed weights w and x enters as
+ * x ^ 0x80 = x + 128 (unsigned), so
+ *     maddubs(x + 128, w) - maddubs(128, w) = sum x w
+ * with no vpsignb per token (vpxor runs on any of p015, vpsignb only
+ * on p01 beside the two multiplies).  Exact: |w| <= 62, so a maddubs
+ * pair is within (127 + 128) * 62 * 2 = 31620 (ucas: proved bound) and
+ * never saturates; madd is exact in i32. */
+static void
+to_xu(kblk *k, int sgn_applied)
+{
+	const __m256i h = _mm256_set1_epi8((char)0x80);
+	int j;
+	k->kc = _mm256_setzero_si256();
+	for (j = 0; j < 8; j++) {
+		if (!sgn_applied)
+			k->u[j] = _mm256_sign_epi8(k->u[j], k->sg[j]);
+		k->kc = _mm256_add_epi32(k->kc, _mm256_madd_epi16(_mm256_maddubs_epi16(h, k->u[j]), k->s[j]));
+	}
+	k->sgn = 0;
+	k->xu = 1;
+}
 
 static __m256i
 s16pair(int lo, int hi)
@@ -953,6 +968,7 @@ dec_block_iq(uint32_t t, const uint8_t *b, kblk *k)
 {
 	int ib, l;
 	k->sgn = 1;
+	k->xu = 0;
 	k->m = _mm256_setzero_si256();
 	k->C = 0;
 	switch (t) {
@@ -1063,6 +1079,7 @@ dec_block_iq(uint32_t t, const uint8_t *b, kblk *k)
 	case GT_X2:
 		dec_x2(b, k->u, k->sg, k->s);
 		k->A = h16f(b) * 0.125f;
+		to_xu(k, 0);
 		return 1;
 	case GT_X3:
 	case GT_X3S: {
@@ -1073,11 +1090,11 @@ dec_block_iq(uint32_t t, const uint8_t *b, kblk *k)
 			__m128i q = _mm_loadu_si128((const __m128i *)qs);
 			__m256i w = _mm256_shuffle_epi8(tbl, _mm256_and_si256(_mm256_setr_m128i(q,
 			    _mm_srli_epi16(q, 4)), _mm256_set1_epi8(15)));
-			k->u[ib] = _mm256_sign_epi8(w, w);
-			k->sg[ib] = w;
+			k->u[ib] = w;
 			k->s[ib] = s16pair(b[2 + ib], b[2 + ib]);
 		}
 		k->A = h16f(b) * (t == GT_X3S ? 1.0f : 0.25f);
+		to_xu(k, 1);
 		return 1;
 	}
 	case GT_X1: {
@@ -1206,14 +1223,22 @@ dec_block(uint32_t t, const uint8_t *b, kblk *k)
 	}
 }
 
-int
-kq_dotT(uint32_t t, const void *row, const q8k *x, size_t xs, int T, size_t n,
-    float *out, size_t ostride)
+/* x_u: the activations' qs hold x ^ 0x80 (kq_q8k_xu); every type then
+ * runs maddubs(x + 128, w) - kc with w signed (|w| <= 63: a pair is at
+ * most 255 * 63 * 2 = 32130, proved bound, no saturation); the i-quants
+ * that keep a sign vector (IQ4_XS, |w| up to 127) undo the xor first */
+/* xb: the activation block of token tt, block i: esz bytes per element,
+ * qs / d / bsums at offsets oq / od / ob (q8k, or the aligned q8ku) */
+#define XB(f, ty) ((const ty *)((const char *)x + ((size_t)tt * ts + i * bs) * esz + (f)))
+static inline __attribute__((always_inline)) int
+dotT(uint32_t t, const void *row, const void *x, size_t esz, size_t oq, size_t od, size_t ob,
+    size_t ts, size_t bs, int T, size_t n, float *out, size_t ostride, int x_u)
 {
 	__m256 acc[64];
 	kblk k;
 	size_t bb = ggml_type_bytes(t), i;
 	const uint8_t *b = row;
+	const __m256i h = _mm256_set1_epi8((char)0x80);
 	int tt, j;
 
 	const int iq = t == GT_IQ2_XXS || t == GT_IQ2_XS || t == GT_IQ2_S || t == GT_IQ3_XXS ||
@@ -1224,24 +1249,56 @@ kq_dotT(uint32_t t, const void *row, const q8k *x, size_t xs, int T, size_t n,
 	    t != GT_Q6_K))
 		return 0;
 	k.sgn = 0;
+	k.xu = 0;
 	for (tt = 0; tt < T; tt++)
 		acc[tt] = _mm256_setzero_ps();
 	for (i = 0; i < n / 256; i++, b += bb) {
+		k.xu = 0;
 		if (iq)
 			dec_block_iq(t, b, &k);
 		else
 			dec_block(t, b, &k);
+		if (x_u && !k.xu && !k.sgn)
+			to_xu(&k, 1);
+		if (k.xu) {
+			/* signed weights against x + 128, minus the constant kc */
+			for (tt = 0; tt < T; tt++) {
+				const int8_t *xq = XB(oq, int8_t);
+				const float xd = *XB(od, float);
+				const int16_t *xbs = XB(ob, int16_t);
+				__m256i isum = _mm256_sub_epi32(_mm256_setzero_si256(), k.kc);
+				for (j = 0; j < 8; j++) {
+					__m256i xv = _mm256_loadu_si256((const __m256i *)(xq + 32 * j));
+					if (!x_u)
+						xv = _mm256_xor_si256(xv, h);
+					isum = _mm256_add_epi32(isum, _mm256_madd_epi16(_mm256_maddubs_epi16(xv, k.u[j]), k.s[j]));
+				}
+				acc[tt] = _mm256_fmadd_ps(_mm256_set1_ps(k.A * xd), _mm256_cvtepi32_ps(isum), acc[tt]);
+				if (k.C != 0) {
+					__m256i msum = _mm256_madd_epi16(k.m, _mm256_loadu_si256((const __m256i *)xbs));
+					acc[tt] = _mm256_fmadd_ps(_mm256_set1_ps(k.C * xd), _mm256_cvtepi32_ps(msum), acc[tt]);
+				}
+			}
+			continue;
+		}
 		for (tt = 0; tt < T; tt++) {
-			const q8k *xb = x + (size_t)tt * xs + i;
+			const int8_t *xq = XB(oq, int8_t);
+			const float xd = *XB(od, float);
+			const int16_t *xbs = XB(ob, int16_t);
 			__m256i isum = _mm256_setzero_si256();
-			__m256i msum = _mm256_madd_epi16(k.m, _mm256_loadu_si256((const __m256i *)xb->bsums));
 			for (j = 0; j < 8; j++) {
-				__m256i xv = _mm256_loadu_si256((const __m256i *)(xb->qs + 32 * j));
-				__m256i p = _mm256_maddubs_epi16(k.u[j], k.sgn ? _mm256_sign_epi8(xv, k.sg[j]) : xv);
+				__m256i xv = _mm256_loadu_si256((const __m256i *)(xq + 32 * j));
+				__m256i p;
+				if (x_u)
+					xv = _mm256_xor_si256(xv, h);
+				p = _mm256_maddubs_epi16(k.u[j], k.sgn ? _mm256_sign_epi8(xv, k.sg[j]) : xv);
 				isum = _mm256_add_epi32(isum, _mm256_madd_epi16(p, k.s[j]));
 			}
-			acc[tt] = _mm256_fmadd_ps(_mm256_set1_ps(k.A * xb->d), _mm256_cvtepi32_ps(isum), acc[tt]);
-			acc[tt] = _mm256_fmadd_ps(_mm256_set1_ps(k.C * xb->d), _mm256_cvtepi32_ps(msum), acc[tt]);
+			acc[tt] = _mm256_fmadd_ps(_mm256_set1_ps(k.A * xd), _mm256_cvtepi32_ps(isum), acc[tt]);
+			if (k.C != 0) {
+				__m256i msum = _mm256_madd_epi16(k.m, _mm256_loadu_si256((const __m256i *)xbs));
+				acc[tt] = _mm256_fmadd_ps(_mm256_set1_ps(k.C * xd), _mm256_cvtepi32_ps(msum), acc[tt]);
+			}
 		}
 	}
 	for (tt = 0; tt < T; tt++)
@@ -1249,28 +1306,45 @@ kq_dotT(uint32_t t, const void *row, const q8k *x, size_t xs, int T, size_t n,
 	return 1;
 }
 
+int
+kq_dotT(uint32_t t, const void *row, const q8k *x, size_t xs, int T, size_t n,
+    float *out, size_t ostride)
+{
+	return dotT(t, row, x, sizeof(q8k), offsetof(q8k, qs), offsetof(q8k, d), offsetof(q8k, bsums),
+	    xs, 1, T, n, out, ostride, 0);
+}
+
+int
+kq_dotTu(uint32_t t, const void *row, const q8ku *xu, size_t bs, int T, size_t n,
+    float *out, size_t ostride)
+{
+	return dotT(t, row, xu, sizeof(q8ku), offsetof(q8ku, qs), offsetof(q8ku, d), offsetof(q8ku, bsums),
+	    1, bs, T, n, out, ostride, 1);
+}
+
+/* T token vectors of nb blocks (token t at x + t*xs) into the xu form,
+ * block-major: xu[i*T + t], so one block's tokens are contiguous */
+void
+kq_q8k_xu(const q8k *x, size_t xs, int T, size_t nb, q8ku *xu)
+{
+	const __m256i h = _mm256_set1_epi8((char)0x80);
+	size_t i;
+	int j, t;
+	for (t = 0; t < T; t++)
+		for (i = 0; i < nb; i++) {
+			const q8k *a = x + (size_t)t * xs + i;
+			q8ku *o = xu + i * (size_t)T + (size_t)t;
+			o->d = a->d;
+			memcpy(o->bsums, a->bsums, sizeof(o->bsums));
+			for (j = 0; j < 8; j++)
+				_mm256_store_si256((__m256i *)(o->qs + 32 * j), _mm256_xor_si256(
+				    _mm256_loadu_si256((const __m256i *)(a->qs + 32 * j)), h));
+		}
+}
+
 const char *
 kq_isa(void)
 {
-#if defined(__F16C__)
-	return "avx2+f16c";
-#else
-	return "avx2";
-#endif
+	return "avx2+fma+f16c";
 }
 
-#else
-
-float
-kq_dot(uint32_t t, const void *row, const q8k *x, size_t n)
-{
-	return kq_dot_scalar(t, row, x, n);
-}
-
-const char *
-kq_isa(void)
-{
-	return "scalar";
-}
-
-#endif

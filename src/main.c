@@ -56,7 +56,7 @@ usage(void)
 	    "  --split F      GPU share of Mamba2 heads and output rows (0.5)\n"
 	    "  --vram MIB     cap on all of our GPU memory (default 1280)\n"
 	    "  --stream F     prompts: GPU share of each matrix's rows, streaming\n"
-	    "                 what is not resident over PCIe (qwen35; 0.6, 0 = off)\n"
+	    "                 what is not resident over PCIe (qwen35; 0.5, 0 = off)\n"
 	    "  --stream-mib M VRAM for streamed weights (default 64)\n"
 	    "  --temp F       temperature (default 0 = greedy)\n"
 	    "  --top-k N      (default 40)  --top-p F (default 0.95)  --seed N\n"
@@ -446,8 +446,26 @@ check(void)
 						mr = fabsf(ref);
 				}
 			}
-			if (rr)
-				printf("[dotT max|diff| %.2e of %.2e] ", md, mr);
+			if (rr) {
+				/* and the xu form (prompts) */
+				q8ku *x5u = NULL;
+				if (posix_memalign((void **)&x5u, 64, sizeof(q8ku) * (size_t)(w->K / 256) * 5))
+					x5u = NULL;
+				float mu = 0;
+				kq_q8k_xu(x5, (size_t)(w->K / 256), 5, (size_t)(w->K / 256), x5u);
+				for (rr = 0; rr < 64 && rr < w->N; rr++) {
+					const uint8_t *row = w->data + ((size_t)e * w->N + rr) * w->row_bytes;
+					if (!kq_dotTu(w->type, row, x5u, 5, 5, (size_t)w->K, o5, 1))
+						break;
+					for (t5 = 0; t5 < 5; t5++) {
+						float ref = kq_dot(w->type, row, x5 + t5 * (w->K / 256), (size_t)w->K);
+						if (fabsf(o5[t5] - ref) > mu)
+							mu = fabsf(o5[t5] - ref);
+					}
+				}
+				free(x5u);
+				printf("[dotT max|diff| %.2e, xu %.2e of %.2e] ", md, mu, mr);
+			}
 			if (w->gpu_n) {
 				/* GPU tiled GEMM (5 tokens) vs kq_dot */
 				float *g5 = malloc(sizeof(float) * 5 * (size_t)w->N);
@@ -525,20 +543,23 @@ kbench(void)
 		th = now() - t0;
 		{
 			/* multi-token kernel, T = 64, cache-hot rows */
-			static q8k x64[64 * 80];
+			static q8ku x64[64 * 80];
 			static float o64[64];
 			int tt, KT = getenv("KB_T") ? atoi(getenv("KB_T")) : 64;
 			double td;
-			for (tt = 0; tt < 64; tt++)
-				memcpy(x64 + tt * (w->K / 256), xq, sizeof(q8k) * (size_t)(w->K / 256));
+			static q8k x64t[64 * 80];
+			for (tt = 0; tt < 64 && w->K <= 80 * 256; tt++)
+				memcpy(x64t + tt * (w->K / 256), xq, sizeof(q8k) * (size_t)(w->K / 256));
+			if (w->K <= 80 * 256)
+				kq_q8k_xu(x64t, (size_t)(w->K / 256), 64, (size_t)(w->K / 256), x64);
 			if (w->K <= 80 * 256 &&
-			    kq_dotT(w->type, w->data, x64, (size_t)(w->K / 256), 64, (size_t)w->K, o64, 1)) {
+			    kq_dotTu(w->type, w->data, x64, 64, 64, (size_t)w->K, o64, 1)) {
 				int rr = hot_rows < 64 ? hot_rows : 64;
 				t0 = now();
 				for (it = 0; it < 20; it++)
 					for (r = 0; r < rr; r++)
-						kq_dotT(w->type, w->data + r * w->row_bytes, x64,
-						    (size_t)(w->K / 256), KT, (size_t)w->K, o64, 1);
+						kq_dotTu(w->type, w->data + r * w->row_bytes, x64,
+						    64, KT, (size_t)w->K, o64, 1);
 				td = now() - t0;
 				printf("  %s dotT(%d): %.2f ns per 256 weights x token\n", ggml_type_name(w->type),
 				    KT, td / (20.0 * rr * KT * (w->K / 256)) * 1e9);
@@ -651,7 +672,7 @@ main(int argc, char **argv)
 	kq_init();
 	pool_init(O.threads);
 	if (g_stream < 0)
-		g_stream = M.arch == ARCH_QWEN35 && O.gpu_mib > 0 ? 0.6 : 0;
+		g_stream = M.arch == ARCH_QWEN35 && O.gpu_mib > 0 ? 0.5 : 0;
 	if (g_stream > 0 && !vk_stream_bytes)
 		vk_stream_bytes = (size_t)64 << 20;
 	if (O.gpu_mib > 0 && !O.tokens && M.arch == ARCH_QWEN35) {

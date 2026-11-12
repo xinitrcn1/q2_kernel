@@ -21,9 +21,7 @@
 #include "vk.h"
 #include "vmath.h"
 
-#if defined(__AVX2__)
 #include <immintrin.h>
-#endif
 
 #define PB 128
 #define MM_MAX 160
@@ -46,10 +44,13 @@ long pf_rows;
 
 typedef struct {
 	const mm_item *it;
+	const q8ku *xu[MM_MAX]; /* T > 1: x in the xu form (kq_dotTu) */
 	int n;
 	size_t cum[MM_MAX + 1];
 	long next, chunk;
 } mm_job;
+
+static int g_tg = 64;
 
 static void
 mm_worker(void *arg, int ith, int nth)
@@ -81,9 +82,9 @@ mm_worker(void *arg, int ith, int nth)
 				const uint8_t *row = base + r * w->row_bytes;
 				if (m->T > 1) {
 					int t0, ok = 1;
-					for (t0 = 0; t0 < m->T && ok; t0 += 64)
-						ok = kq_dotT(w->type, row, m->xq + (size_t)t0 * (size_t)m->xs,
-						    (size_t)m->xs, m->T - t0 > 64 ? 64 : m->T - t0, (size_t)w->K,
+					for (t0 = 0; t0 < m->T && ok; t0 += g_tg)
+						ok = kq_dotTu(w->type, row, j->xu[i] + (size_t)t0,
+						    (size_t)m->T, m->T - t0 > g_tg ? g_tg : m->T - t0, (size_t)w->K,
 						    m->y + (size_t)t0 * (size_t)m->ldy + r, (size_t)m->ldy);
 					if (ok)
 						continue;
@@ -138,6 +139,53 @@ mm_run(const mm_item *in, int n)
 	}
 	j.it = it;
 	j.n = n;
+	if (getenv("Q2K_TG"))
+		g_tg = atoi(getenv("Q2K_TG"));
+	/* the CPU's batches read x as x ^ 0x80 (kq_dotTu): one copy per
+	 * distinct input, shared by the items that read it */
+	{
+		static q8ku *xbuf;
+		static size_t xcap;
+		size_t need = 0, at = 0;
+		int k;
+		for (i = 0; i < n; i++) {
+			j.xu[i] = NULL;
+			if (it[i].T <= 1 || it[i].r0 >= it[i].r1)
+				continue;
+			for (k = 0; k < i; k++)
+				if (it[k].xq == it[i].xq && it[k].T == it[i].T && it[k].xs == it[i].xs && j.xu[k])
+					break;
+			if (k == i)
+				need += (size_t)it[i].T * (size_t)it[i].xs;
+			j.xu[i] = (const q8ku *)1;  /* marked; filled below */
+		}
+		if (need > xcap) {
+			void *p = NULL;
+			free(xbuf);
+			xcap = need;
+			if (posix_memalign(&p, 64, sizeof(q8ku) * xcap))
+				p = NULL;
+			xbuf = p;
+			if (!xbuf) {
+				fprintf(stderr, "q2k: out of memory\n");
+				exit(1);
+			}
+		}
+		for (i = 0; i < n; i++) {
+			if (!j.xu[i])
+				continue;
+			for (k = 0; k < i; k++)
+				if (it[k].xq == it[i].xq && it[k].T == it[i].T && it[k].xs == it[i].xs && j.xu[k])
+					break;
+			if (k < i) {
+				j.xu[i] = j.xu[k];
+				continue;
+			}
+			kq_q8k_xu((const q8k *)it[i].xq, (size_t)it[i].xs, it[i].T, (size_t)it[i].xs, xbuf + at);
+			j.xu[i] = xbuf + at;
+			at += (size_t)it[i].T * (size_t)it[i].xs;
+		}
+	}
 	j.cum[0] = 0;
 	for (i = 0; i < n; i++) {
 		j.cum[i + 1] = j.cum[i] + (size_t)(it[i].r1 - it[i].r0);
@@ -327,7 +375,6 @@ scan_worker(void *arg, int ith, int nth)
 			for (t = 0; t < T; t++)
 				B.y[(size_t)t * DI + ii] = Dh * B.xbc[(size_t)t * CH + ii];
 			for (half = 0; half < NS; half += 64) {
-#if defined(__AVX2__) && defined(__FMA__)
 				__m256 s0 = _mm256_loadu_ps(sv + half), s1 = _mm256_loadu_ps(sv + half + 8);
 				__m256 s2 = _mm256_loadu_ps(sv + half + 16), s3 = _mm256_loadu_ps(sv + half + 24);
 				__m256 s4 = _mm256_loadu_ps(sv + half + 32), s5 = _mm256_loadu_ps(sv + half + 40);
@@ -358,19 +405,6 @@ scan_worker(void *arg, int ith, int nth)
 				_mm256_storeu_ps(sv + half + 16, s2); _mm256_storeu_ps(sv + half + 24, s3);
 				_mm256_storeu_ps(sv + half + 32, s4); _mm256_storeu_ps(sv + half + 40, s5);
 				_mm256_storeu_ps(sv + half + 48, s6); _mm256_storeu_ps(sv + half + 56, s7);
-#else
-				int n;
-				for (t = 0; t < T; t++) {
-					const float *x = B.xbc + (size_t)t * CH;
-					const float *Bv = x + DI, *C = x + DI + NS;
-					float acc = 0, xd = x[ii] * dt[t];
-					for (n = half; n < half + 64 && n < NS; n++) {
-						sv[n] = sv[n] * dA[t] + Bv[n] * xd;
-						acc += sv[n] * C[n];
-					}
-					B.y[(size_t)t * DI + ii] += acc;
-				}
-#endif
 			}
 		}
 	}

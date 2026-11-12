@@ -2,7 +2,6 @@
 
 #include <math.h>
 
-#if defined(__AVX2__) && defined(__FMA__)
 #include <immintrin.h>
 
 /*
@@ -59,10 +58,6 @@ hsum(__m256 v)
 	return _mm_cvtss_f32(s);
 }
 
-#define V8 1
-#else
-#define V8 0
-#endif
 
 static float
 silu1(float x)
@@ -74,7 +69,6 @@ void
 v_exp(float *y, const float *x, size_t n)
 {
 	size_t i = 0;
-#if V8
 	for (; i + 8 <= n; i += 8)
 		_mm256_storeu_ps(y + i, vexp8(_mm256_loadu_ps(x + i)));
 	if (i < n) {
@@ -87,7 +81,6 @@ v_exp(float *y, const float *x, size_t n)
 			y[i + k] = b[k];
 		return;
 	}
-#endif
 	for (; i < n; i++)
 		y[i] = expf(x[i]);
 }
@@ -96,10 +89,8 @@ void
 v_silu(float *x, size_t n)
 {
 	size_t i = 0;
-#if V8
 	for (; i + 8 <= n; i += 8)
 		_mm256_storeu_ps(x + i, vsilu8(_mm256_loadu_ps(x + i)));
-#endif
 	for (; i < n; i++)
 		x[i] = silu1(x[i]);
 }
@@ -108,11 +99,9 @@ void
 v_swiglu(float *g, const float *u, size_t n)
 {
 	size_t i = 0;
-#if V8
 	for (; i + 8 <= n; i += 8)
 		_mm256_storeu_ps(g + i, _mm256_mul_ps(vsilu8(_mm256_loadu_ps(g + i)),
 		    _mm256_loadu_ps(u + i)));
-#endif
 	for (; i < n; i++)
 		g[i] = silu1(g[i]) * u[i];
 }
@@ -121,11 +110,9 @@ void
 v_mul_silu(float *y, const float *z, size_t n)
 {
 	size_t i = 0;
-#if V8
 	for (; i + 8 <= n; i += 8)
 		_mm256_storeu_ps(y + i, _mm256_mul_ps(_mm256_loadu_ps(y + i),
 		    vsilu8(_mm256_loadu_ps(z + i))));
-#endif
 	for (; i < n; i++)
 		y[i] *= silu1(z[i]);
 }
@@ -135,7 +122,6 @@ v_dot(const float *a, const float *b, size_t n)
 {
 	size_t i = 0;
 	float s = 0;
-#if V8
 	__m256 a0 = _mm256_setzero_ps(), a1 = a0, a2 = a0, a3 = a0;
 	for (; i + 32 <= n; i += 32) {
 		a0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i), a0);
@@ -146,7 +132,6 @@ v_dot(const float *a, const float *b, size_t n)
 	for (; i + 8 <= n; i += 8)
 		a0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i), a0);
 	s = hsum(_mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3)));
-#endif
 	for (; i < n; i++)
 		s += a[i] * b[i];
 	return s;
@@ -157,12 +142,10 @@ v_rmsnorm(float *o, const float *x, const float *w, size_t n, float eps)
 {
 	float sc = 1.0f / sqrtf(v_dot(x, x, n) / (float)n + eps);
 	size_t i = 0;
-#if V8
 	__m256 s = _mm256_set1_ps(sc);
 	for (; i + 8 <= n; i += 8)
 		_mm256_storeu_ps(o + i, _mm256_mul_ps(_mm256_mul_ps(_mm256_loadu_ps(x + i), s),
 		    _mm256_loadu_ps(w + i)));
-#endif
 	for (; i < n; i++)
 		o[i] = x[i] * sc * w[i];
 }
@@ -171,12 +154,10 @@ void
 v_axpy(float *y, float a, const float *x, size_t n)
 {
 	size_t i = 0;
-#if V8
 	__m256 av = _mm256_set1_ps(a);
 	for (; i + 8 <= n; i += 8)
 		_mm256_storeu_ps(y + i, _mm256_fmadd_ps(av, _mm256_loadu_ps(x + i),
 		    _mm256_loadu_ps(y + i)));
-#endif
 	for (; i < n; i++)
 		y[i] += a * x[i];
 }

@@ -4,6 +4,9 @@ A small C99 inference kernel and CLI for GGUF models, built with BSD
 make: Granite 4.0-H (`granitehybrid`) and Qwen3.5-style hybrids
 (`qwen35`, e.g. Qwen3.8-27B).  The model file is
 mmapped read-only; nothing is copied at load except what goes to the GPU.
+Requires clang 23 or newer (`CC=clang23`) and an x86-64 with AVX2, FMA
+and F16C; `src/req.h` (included first in every file) rejects anything
+else at compile time.
 
     make
     ./q2k -p "The capital of France is" -n 32        # completion
@@ -21,7 +24,7 @@ headers, and glslangValidator at build time.
 |---|---|
 | `src/gguf.c` | bounds-checked GGUF v2/v3 reader over the mmap |
 | `src/quant.c` | reference dequantization (Q2_K..Q6_K, Q8_0), bit-exact with ggml; f32 reference dot (`--ref`) |
-| `src/kq.c` | optimized CPU dots: activations quantized to 8-bit blocks of 256 (`q8k`), integer dots with AVX2 (scalar twin kept for checking) |
+| `src/kq.c` | optimized CPU dots: activations quantized to 8-bit blocks of 256 (`q8k`), integer dots with AVX2 (scalar integer twin kept for checking); prompts use a block-major, 64-byte aligned `x ^ 0x80` copy of the activations (`q8ku`) so every type is `maddubs(x + 128, w) - kc` with no per-token sign op |
 | `src/vmath.c` | AVX2 exp/SiLU/norm/dot helpers |
 | `src/model.c` | forward pass: Mamba2 mixer (head split), NoPE GQA attention, top-6-of-64 MoE + shared expert; matvec batches over the CPU pool and the GPU |
 | `src/prefill.c` | batched prompt processing |
@@ -108,18 +111,18 @@ with shifts and table shuffles (and have GPU kernels):
 (Every converted tensor dequantizes identically; the 27B file grows
 from 9.5 to 13.1 GB.)  Every matrix keeps the same leading fraction of
 its rows on the GPU.  Prompts also stream the rest of each matrix's
-leading rows (`--stream 0.6`, default with a GPU) through a 64 MiB VRAM
+leading rows (`--stream 0.5`, default with a GPU) through a 64 MiB VRAM
 window, repacked by all threads into host staging and copied over PCIe
-per 128-token chunk; the CPU computes the remaining 40%.  On this host
+per 128-token chunk; the CPU computes the remaining half.  On this host
 (CPU-bound, 6 threads):
 
 | Qwen3.8-27B | decode | prompt |
 |---|---|---|
 | llama.cpp CPU | 1.04 | |
 | original GGUF, CPU | 1.55 | 5.7 |
-| transcoded, CPU | 1.9-2.0 | 5.9 |
+| transcoded, CPU | 1.9-2.0 | 7.0 |
 | transcoded, `-g 1600 --vram 1800 --stream 0` | 2.2 | 6.3 |
-| transcoded, `-g 1600 --vram 1800` (streaming) | 2.2 | 10.2 |
+| transcoded, `-g 1600 --vram 1800` (streaming) | 2.2 | 13.1 |
 
 ## Checking
 

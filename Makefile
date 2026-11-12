@@ -16,9 +16,10 @@ QT.x3=		101
 QT.x3s=		102
 QT.x1=		103
 
-CC?=		cc
-OPT?=		-O2 -march=native
-CFLAGS+=	-std=c99 ${OPT} -Wall -Wextra -pedantic -Isrc -Igen -I/usr/local/include
+# clang 23 or newer and AVX2 + FMA + F16C are required (src/req.h)
+CC=		clang23
+OPT?=		-O3 -march=native
+CFLAGS+=	-std=c99 ${OPT} -Wall -Wextra -pedantic -include src/req.h -Isrc -Igen -I/usr/local/include
 LDFLAGS+=	-L/usr/local/lib
 LDLIBS+=	-lvulkan -lpthread -lm
 GLSLANG?=	glslangValidator
@@ -33,7 +34,7 @@ ${PROG}: ${OBJS}
 	${CC} ${LDFLAGS} -o ${.TARGET} ${OBJS} ${LDLIBS}
 
 .for s in ${SRCS}
-build/${s:R}.o: src/${s} ${HDRS:%=src/%}
+build/${s:R}.o: src/${s} ${HDRS:%=src/%} src/req.h
 	@mkdir -p build
 	${CC} ${CFLAGS} -c -o ${.TARGET} src/${s}
 .endfor
