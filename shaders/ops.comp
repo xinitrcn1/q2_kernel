@@ -1,12 +1,12 @@
 #version 450
 /*
  * Non-matvec ops of the fused GPU layer path, one per build (OP):
- *   1 NORM  v = a [+ s*b | silu(a)*b], optional residual write-back,
- *           optional RMS norm with weights, outputs f32 and/or q8k
  *   2 CONV  Mamba2 causal depthwise conv + SiLU with resident state;
  *           dt = softplus(dt + bias)
  *   3 SCAN  Mamba2 selective scan, one subgroup per (head, channel):
  *           s = s*exp(dt*A) + dt*x*B; y = s.C + D*x; y *= silu(z)
+ *   4 QBLK  per 256-block: [silu(a)*b | a], its sum of squares, times
+ *           weights, as q8k
  * Buffers: W weights (f32 vectors stored as raw words), A activations
  * (as float and as uint words), S recurrent state.
  */
@@ -27,12 +27,7 @@ layout(push_constant) uniform PC { uint p[16]; } pc;
 float wf(uint i) { return uintBitsToFloat(W[i]); }
 float silu(float v) { return v / (1.0 + exp(-v)); }
 
-#if OP == 1
-/* p: 0 a, 1 b, 2 scale bits, 3 n, 4 x_out, 5 w (W words), 6 eps bits,
- *    7 f_out, 8 q_out (words), 9 mode (0 add, 1 swiglu), 10 ss_out
- *    (sum of squares before the weights), 11 flags (1: weights only,
- *    no 1/rms) */
-#define MAXK 12
+#if OP == 4
 shared float red[16];
 shared int sq[256];
 
@@ -62,81 +57,62 @@ float wg_max(float v)
 	return t;
 }
 
+/* this workgroup's value v (thread t of the block) as q8k block at qo:
+ * scale by the signed extreme, round to nearest even, as the CPU */
+void q8k_block(float v, uint qo)
+{
+	uint t = gl_LocalInvocationID.x;
+	float hi = wg_max(v), lo = -wg_max(-v);
+	float mx = hi >= -lo ? hi : lo;
+	int q = 0;
+	if (mx != 0.0) {
+		float is = -127.0 / mx;
+		q = min(int(roundEven(is * v)), 127);
+		if (t == 0u)
+			X[qo] = floatBitsToUint(1.0 / is);
+	} else if (t == 0u)
+		X[qo] = 0u;
+	sq[t] = q;
+	barrier();
+	if (t < 64u) {
+		uint w = 0u;
+		for (uint j = 0u; j < 4u; j++)
+			w |= (uint(sq[4u * t + j]) & 255u) << (8u * j);
+		X[qo + 1u + t] = w;
+	} else if (t < 72u) {
+		uint g = 2u * (t - 64u);
+		int b0 = 0, b1 = 0;
+		for (uint j = 0u; j < 16u; j++) {
+			b0 += sq[16u * g + j];
+			b1 += sq[16u * g + 16u + j];
+		}
+		X[qo + 65u + (t - 64u)] = (uint(b0) & 0xffffu) | (uint(b1) << 16);
+	}
+	barrier();
+}
+#elif OP == 4
+/* one workgroup per 256-block: v = a | silu(a)*b; ss_out[k] = sum v^2
+ * (before weights); v *= w; q8k block k.
+ * p: 0 a, 1 b (NONE: plain), 2 w (W words, NONE: none), 3 q_out (words),
+ *    4 ss_out (A, per block; NONE: none) */
 void main()
 {
-	uint t = gl_LocalInvocationID.x, n = pc.p[3], nk = (n + 255u) / 256u;
-	float s = uintBitsToFloat(pc.p[2]);
-	float v[MAXK];
-	float ss = 0.0;
-
-	for (uint k = 0u; k < nk; k++) {
-		uint i = 256u * k + t;
-		float a = 0.0;
-		if (i < n) {
-			a = A[pc.p[0] + i];
-			if (pc.p[1] != NONE)
-				a = pc.p[9] == 1u ? silu(a) * A[pc.p[1] + i] : a + s * A[pc.p[1] + i];
-			if (pc.p[4] != NONE)
-				A[pc.p[4] + i] = a;
-		}
-		v[k] = a;
-		ss += a * a;
+	uint k = gl_WorkGroupID.x, i = 256u * k + gl_LocalInvocationID.x;
+	float v = A[pc.p[0] + i];
+	if (pc.p[1] != NONE)
+		v = silu(v) * A[pc.p[1] + i];
+	if (pc.p[4] != NONE) {
+		float t = wg_sum(v * v);
+		if (gl_LocalInvocationID.x == 0u)
+			A[pc.p[4] + k] = t;
 	}
-	if (pc.p[5] != NONE || pc.p[10] != NONE) {
-		float tot = wg_sum(ss);
-		if (pc.p[10] != NONE && t == 0u)
-			A[pc.p[10]] = tot;
-		ss = tot;
-	}
-	if (pc.p[5] != NONE) {
-		float r = (pc.p[11] & 1u) != 0u ? 1.0 :
-		    inversesqrt(ss / float(n) + uintBitsToFloat(pc.p[6]));
-		for (uint k = 0u; k < nk; k++) {
-			uint i = 256u * k + t;
-			v[k] = i < n ? v[k] * r * wf(pc.p[5] + i) : 0.0;
-		}
-	}
-	if (pc.p[7] != NONE)
-		for (uint k = 0u; k < nk; k++)
-			if (256u * k + t < n)
-				A[pc.p[7] + 256u * k + t] = v[k];
-	if (pc.p[8] == NONE)
-		return;
-	/* q8k, as the CPU's q8k_quantize: scale by the signed extreme,
-	 * round to nearest even; n is a multiple of 256 here */
-	for (uint k = 0u; k < nk; k++) {
-		uint qo = pc.p[8] + 73u * k;
-		float hi = wg_max(v[k]), lo = -wg_max(-v[k]);
-		float mx = hi >= -lo ? hi : lo;
-		int q = 0;
-		if (mx != 0.0) {
-			float is = -127.0 / mx;
-			q = min(int(roundEven(is * v[k])), 127);
-			if (t == 0u)
-				X[qo] = floatBitsToUint(1.0 / is);
-		} else if (t == 0u)
-			X[qo] = 0u;
-		sq[t] = q;
-		barrier();
-		if (t < 64u) {
-			uint w = 0u;
-			for (uint j = 0u; j < 4u; j++)
-				w |= (uint(sq[4u * t + j]) & 255u) << (8u * j);
-			X[qo + 1u + t] = w;
-		} else if (t < 72u) {
-			uint g = 2u * (t - 64u);
-			int b0 = 0, b1 = 0;
-			for (uint j = 0u; j < 16u; j++) {
-				b0 += sq[16u * g + j];
-				b1 += sq[16u * g + 16u + j];
-			}
-			X[qo + 65u + (t - 64u)] = (uint(b0) & 0xffffu) | (uint(b1) << 16);
-		}
-		barrier();
-	}
+	if (pc.p[2] != NONE)
+		v *= wf(pc.p[2] + i);
+	q8k_block(v, pc.p[3] + 73u * k);
 }
+#endif
 
-#elif OP == 2
+#if OP == 2
 /* p: 0 xbc in, 1 dt in, 2 xbc out, 3 dt out, 4 state (S), 5 conv w
  *    (W, [ch][4]), 6 conv b, 7 dt bias, 8 channels, 9 heads */
 void main()
@@ -182,5 +158,25 @@ void main()
 	acc = subgroupAdd(acc);
 	if (lane == 0u)
 		A[pc.p[3] + r] = (acc + wf(pc.p[6] + h) * x) * silu(A[pc.p[2] + r]);
+}
+#elif OP == 4
+/* one workgroup per 256-block: v = a | silu(a)*b; ss_out[k] = sum v^2
+ * (before weights); v *= w; q8k block k.
+ * p: 0 a, 1 b (NONE: plain), 2 w (W words, NONE: none), 3 q_out (words),
+ *    4 ss_out (A, per block; NONE: none) */
+void main()
+{
+	uint k = gl_WorkGroupID.x, i = 256u * k + gl_LocalInvocationID.x;
+	float v = A[pc.p[0] + i];
+	if (pc.p[1] != NONE)
+		v = silu(v) * A[pc.p[1] + i];
+	if (pc.p[4] != NONE) {
+		float t = wg_sum(v * v);
+		if (gl_LocalInvocationID.x == 0u)
+			A[pc.p[4] + k] = t;
+	}
+	if (pc.p[2] != NONE)
+		v *= wf(pc.p[2] + i);
+	q8k_block(v, pc.p[3] + 73u * k);
 }
 #endif

@@ -40,7 +40,9 @@ void vk_wait(void);
  * sum of squares */
 int vk_mamba_ok(int il);
 int vk_mamba_heads(int il);
-void vk_mamba_submit(const model *m, int il, const float *x, float *out, float *ss);
+/* xq: q8k of attn_norm(x); ss receives one sum of squares per 256 of
+ * the GPU's channels */
+void vk_mamba_submit(const model *m, int il, const q8k *xq, float *out, float *ss);
 void vk_prof_collect(void);
 void vk_prof_report(void);
 void vk_state_reset(void);

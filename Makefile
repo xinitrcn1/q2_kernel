@@ -46,7 +46,7 @@ gen/spv_${t}_nd.h: shaders/matvec.comp
 	    -o ${.TARGET} shaders/matvec.comp >/dev/null
 .endfor
 
-OPS=		norm:1 conv:2 scan:3
+OPS=		conv:2 scan:3 qblk:4
 .for o in ${OPS}
 gen/spv_op_${o:C/:.*//}.h: shaders/ops.comp
 	@mkdir -p gen

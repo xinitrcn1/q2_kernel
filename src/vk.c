@@ -16,9 +16,9 @@
 #define Q8W ((uint32_t)(sizeof(q8k) / 4))
 #define BMAX 64
 #define NONE 0xffffffffu
-#define PIPE_NORM 20
 #define PIPE_CONV 21
 #define PIPE_SCAN 22
+#define PIPE_QBLK 23
 #define UPCHUNK (32u << 20)
 
 static double
@@ -444,9 +444,9 @@ vk_init(size_t budget, size_t state_bytes, int devidx, int verbose)
 	    PIPE(GT_Q6_K, spv_q6_k) || PIPE(GT_Q8_0, spv_q8_0))
 		return -1;
 #undef PIPE
-	if (mkpipe(PIPE_NORM, spv_op_norm, sizeof(spv_op_norm)) ||
-	    mkpipe(PIPE_CONV, spv_op_conv, sizeof(spv_op_conv)) ||
-	    mkpipe(PIPE_SCAN, spv_op_scan, sizeof(spv_op_scan)))
+	if (mkpipe(PIPE_CONV, spv_op_conv, sizeof(spv_op_conv)) ||
+	    mkpipe(PIPE_SCAN, spv_op_scan, sizeof(spv_op_scan)) ||
+	    mkpipe(PIPE_QBLK, spv_op_qblk, sizeof(spv_op_qblk)))
 		return -1;
 
 	memset(&cpci, 0, sizeof(cpci));
@@ -1029,26 +1029,15 @@ seq_op(uint32_t pipe, const uint32_t *p, uint32_t groups)
 	vkCmdDispatch(V.cb, groups, 1, 1);
 }
 
-static uint32_t
-fbits(float f)
-{
-	uint32_t u;
-	memcpy(&u, &f, 4);
-	return u;
-}
-
-/* v = a [+ s*b | silu(a)*b]; x_out <- v; v = rmsnorm(v)*w; f_out <- v;
- * q_out <- q8k(v).  Unused offsets are NONE. */
+/* n/256 workgroups: [silu(a)*b | a] -> per-block sum of squares, *w,
+ * q8k */
 static void
-seq_norm(uint32_t a, uint32_t b, float s, uint32_t n, uint32_t x_out, uint32_t w,
-    float eps, uint32_t f_out, uint32_t q_out, uint32_t mode)
+seq_qblk(uint32_t a, uint32_t b, uint32_t w, uint32_t q_out, uint32_t ss_out, uint32_t n)
 {
 	uint32_t p[16];
 	memset(p, 0, sizeof(p));
-	p[0] = a; p[1] = b; p[2] = fbits(s); p[3] = n; p[4] = x_out; p[5] = w;
-	p[6] = fbits(eps); p[7] = f_out; p[8] = q_out; p[9] = mode;
-	p[10] = NONE; p[11] = 0;
-	seq_op(PIPE_NORM, p, 1);
+	p[0] = a; p[1] = b; p[2] = w; p[3] = q_out; p[4] = ss_out;
+	seq_op(PIPE_QBLK, p, n / 256);
 }
 
 static void
@@ -1198,26 +1187,24 @@ vk_mamba_heads(int il)
 /* GPU half of a split Mamba2 mixer (async; vk_wait delivers out[E],
  * the partial ssm_out of the GPU heads, and *ss, their sum of y^2) */
 void
-vk_mamba_submit(const model *m, int il, const float *x, float *out, float *ss)
+vk_mamba_submit(const model *m, int il, const q8k *xq, float *out, float *ss)
 {
 	const hparams *h = &m->hp;
 	const struct lay *ly = &V.lay[il];
 	const uint32_t E = (uint32_t)h->n_embd, DS = (uint32_t)h->d_state;
 	const uint32_t gdi = (uint32_t)(ly->hg * h->ssm_head_dim), gch = gdi + 2 * DS;
 	const uint32_t hg = (uint32_t)ly->hg;
-	uint32_t ax, q1, zx, xbc, dt, y, q2, o, sso, p[16];
+	uint32_t q1, zx, xbc, dt, y, q2, o, sso, p[16];
 
 	seq_begin();
 	if (V.prof) {
 		vkCmdResetQueryPool(V.cb, V.qp, 0, 16);
 		V.nts = 0;
 	}
-	ax = seq_put(x, E);
+	q1 = seq_put(xq, E / 256 * Q8W);
 	seq_flush_up();
 	ts();
-	q1 = seq_alloc(E / 256 * Q8W);
-	seq_norm(ax, NONE, 0, E, NONE, ly->an, h->eps, NONE, q1, 0);
-	cbar();
+	ts();
 	zx = seq_alloc((uint32_t)ly->gin.N);
 	seq_matvec(&ly->gin, 0, q1, zx);
 	cbar();
@@ -1235,17 +1222,14 @@ vk_mamba_submit(const model *m, int il, const float *x, float *out, float *ss)
 	seq_op(PIPE_SCAN, p, (gdi + V.sg_per_wg - 1) / V.sg_per_wg);
 	cbar();
 	q2 = seq_alloc(gdi / 256 * Q8W);
-	sso = seq_alloc(1);
-	memset(p, 0, sizeof(p));
-	p[0] = y; p[1] = NONE; p[3] = gdi; p[4] = NONE; p[5] = ly->sn; p[7] = NONE;
-	p[8] = q2; p[10] = sso; p[11] = 1;
-	seq_op(PIPE_NORM, p, 1);
+	sso = seq_alloc(gdi / 256);
+	seq_qblk(y, NONE, ly->sn, q2, sso, gdi);
 	cbar();
 	o = seq_alloc(E);
 	seq_matvec(&ly->gout, 0, q2, o);
 	ts();
 	seq_get(o, E, out);
-	seq_get(sso, 1, ss);
+	seq_get(sso, gdi / 256, ss);
 	seq_submit();
 }
 
@@ -1348,7 +1332,7 @@ vk_moe_submit(const q8k *xq, int K)
 	for (i = 0; i < V.nmoe; i++) {
 		uint32_t ff = (uint32_t)V.moe[i].g->N;
 		hq[i] = seq_alloc(ff / 256 * Q8W);
-		seq_norm(g[i], u[i], 0, ff, NONE, NONE, 0, NONE, hq[i], 1);
+		seq_qblk(g[i], u[i], NONE, hq[i], NONE, ff);
 	}
 	cbar();
 	for (i = 0; i < V.nmoe; i++) {

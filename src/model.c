@@ -12,11 +12,11 @@
 #include "vmath.h"
 
 int g_ref;
-double g_split = 0.6;
+double g_split = 0.5;
 
 #include <time.h>
 /* --bench breakdown: see PROF_* in model.h */
-double prof_t[PROF_N];
+double prof_t[PROF_N], prof_b[PROF_N];
 static double
 pnow(void)
 {
@@ -196,6 +196,39 @@ model_load(model *m, const char *path, char *err, size_t errlen)
 	return 0;
 }
 
+int
+model_prepare_split(model *m)
+{
+	const hparams *h = &m->hp;
+	int il;
+
+	for (il = 0; il < h->n_layer; il++) {
+		layer *L = &m->L[il];
+		const wt *o = &L->ssm_out;
+		int gdi = vk_mamba_heads(il) * h->ssm_head_dim, r;
+		size_t bb, rb, off;
+		uint8_t *d;
+
+		if (L->attn || gdi == 0 || gdi >= h->d_inner)
+			continue;
+		bb = ggml_type_bytes(o->type);
+		off = (size_t)gdi / ggml_type_block(o->type) * bb;
+		rb = o->row_bytes - off;
+		if (!(d = malloc(rb * (size_t)o->N)))
+			return -1;
+		for (r = 0; r < o->N; r++)
+			memcpy(d + (size_t)r * rb, o->data + (size_t)r * o->row_bytes + off, rb);
+		L->ssm_out_cpu = *o;
+		L->ssm_out_cpu.data = d;
+		L->ssm_out_cpu.K = o->K - gdi;
+		L->ssm_out_cpu.row_bytes = rb;
+		L->ssm_out_cpu.nbytes = rb * (size_t)o->N;
+		L->ssm_out_cpu.gslot = NULL;
+		L->ssm_out_cpu.gpu_n = 0;
+	}
+	return 0;
+}
+
 size_t
 model_gpu_state_bytes(const model *m)
 {
@@ -214,6 +247,9 @@ model_free(model *m)
 	int i;
 	for (i = 0; i < m->n_all; i++)
 		free(m->all[i]->gslot);
+	for (i = 0; m->L && i < m->hp.n_layer; i++)
+		if (m->L[i].ssm_out_cpu.data)
+			free((void *)m->L[i].ssm_out_cpu.data);
 	free(m->L);
 	gguf_close(&m->g);
 }
@@ -403,6 +439,19 @@ void
 mv_cpu(const mv_item *it, int n)
 {
 	mv_run_ex(it, n, 0);
+}
+
+static void
+mv_cpu_prof(const mv_item *it, int n, int slot)
+{
+	double t0 = pnow(), b = 0;
+	int i;
+	for (i = 0; i < n; i++)
+		b += (double)(it[i].r1 - it[i].r0) * it[i].w->row_bytes *
+		    (it[i].w->K - it[i].k0) / it[i].w->K;
+	mv_cpu(it, n);
+	prof_t[slot] += pnow() - t0;
+	prof_b[slot] += b;
 }
 
 void
@@ -596,21 +645,23 @@ mamba2(const model *m, const layer *L, state *s, int il)
 	const int hg = vk_mamba_heads(il), gdi = hg * h->ssm_head_dim;
 	float *z = s->zxbcdt, *xbc_in = s->zxbcdt + DI, *dtr = xbc_in + CH;
 	float *cs = s->conv[il];
-	float dt[256], ss_g = 0, ss_c = 0, r;
+	float dt[256], ssg[64], ss_g = 0, ss_c = 0, r;
 	mv_item it[4];
 	scan_job sj;
 	int c, i, n = 0;
 
-	if (hg)
-		vk_mamba_submit(m, il, s->x, s->og, &ss_g);
+	rmsnorm(s->xn, s->x, L->attn_norm, h->n_embd, h->eps);
+	if (hg) {
+		q8k_quantize(s->xn, s->xq, (size_t)h->n_embd);
+		vk_mamba_submit(m, il, s->xq, s->og, ssg);
+	}
 	if (hg < NH) {
-		rmsnorm(s->xn, s->x, L->attn_norm, h->n_embd, h->eps);
 		/* our rows of ssm_in: z, x for our heads; all of B, C; our dt */
 		it[n++] = mv_rows(&L->ssm_in, 0, s->xn, s->zxbcdt, gdi, DI, 0);
 		it[n++] = mv_rows(&L->ssm_in, 0, s->xn, s->zxbcdt, DI + gdi, 2 * DI + 2 * DS, 0);
 		it[n++] = mv_rows(&L->ssm_in, 0, s->xn, s->zxbcdt, 2 * DI + 2 * DS + hg,
 		    2 * DI + 2 * DS + NH, 0);
-		mv_cpu(it, n);
+		mv_cpu_prof(it, n, PROF_MIX_IN);
 
 		/* causal depthwise conv over [cs0, cs1, cs2, new], then shift;
 		 * channels [gdi, CH) = our x channels, then B and C */
@@ -643,8 +694,11 @@ mamba2(const model *m, const layer *L, state *s, int il)
 		ss_c = v_dot(s->y + gdi, s->y + gdi, (size_t)(DI - gdi));
 		for (i = gdi; i < DI; i++)
 			s->y[i] *= L->ssm_norm[i];
-		it[0] = mv_rows(&L->ssm_out, 0, s->y, s->tmp, 0, 0, gdi);
-		mv_cpu(it, 1);
+		if (L->ssm_out_cpu.data)
+			it[0] = mv(&L->ssm_out_cpu, 0, s->y + gdi, s->tmp);
+		else
+			it[0] = mv_rows(&L->ssm_out, 0, s->y, s->tmp, 0, 0, gdi);
+		mv_cpu_prof(it, 1, PROF_MIX_OUT);
 	} else
 		memset(s->tmp, 0, sizeof(float) * (size_t)h->n_embd);
 	if (hg) {
@@ -654,6 +708,8 @@ mamba2(const model *m, const layer *L, state *s, int il)
 		vk_prof_collect();
 		for (i = 0; i < h->n_embd; i++)
 			s->tmp[i] += s->og[i];
+		for (i = 0; i < gdi / 256; i++)
+			ss_g += ssg[i];
 	}
 	r = 1.0f / sqrtf((ss_g + ss_c) / (float)DI + h->eps);
 	for (i = 0; i < h->n_embd; i++)
@@ -792,7 +848,7 @@ moe(const model *m, const layer *L, state *s)
 			it[n++] = mv(&L->up_e, sel[k], s->xn, s->he_u + k * FF);
 		}
 	if (n) {
-		mv_run_ex(it, n, 0);
+		mv_cpu_prof(it, n, PROF_MOE_GU);
 		if (!gsh)
 			v_swiglu(s->hs_g, s->hs_u, (size_t)h->n_ff_sh);
 		for (k = 0; k < K; k++)
@@ -806,7 +862,7 @@ moe(const model *m, const layer *L, state *s)
 			if (!gk[k]) {
 				it[n++] = mv(&L->down_e, sel[k], s->he_g + k * FF, s->eo + k * E);
 			}
-		mv_run_ex(it, n, 0);
+		mv_cpu_prof(it, n, PROF_MOE_D);
 	}
 	if (vk_ready()) {
 		double t0 = pnow();

@@ -52,7 +52,7 @@ usage(void)
 	    "  -c N           context size (default 4096)\n"
 	    "  -g MIB         GPU weight split in MiB (default 512, 0 = CPU only)\n"
 	    "  -d N           Vulkan device index\n"
-	    "  --split F      GPU share of Mamba2 heads and output rows (0.6)\n"
+	    "  --split F      GPU share of Mamba2 heads and output rows (0.5)\n"
 	    "  --temp F       temperature (default 0 = greedy)\n"
 	    "  --top-k N      (default 40)  --top-p F (default 0.95)  --seed N\n"
 	    "  --ref          reference float kernels on the CPU\n"
@@ -527,7 +527,13 @@ main(int argc, char **argv)
 	if (O.gpu_mib > 0 && !O.tokens) {
 		if (vk_init((size_t)O.gpu_mib << 20, model_gpu_state_bytes(&M), O.device,
 		    O.verbose) == 0)
+		{
 			vk_plan_and_upload(&M, O.verbose);
+			if (model_prepare_split(&M) != 0) {
+				fprintf(stderr, "q2k: out of memory\n");
+				return 1;
+			}
+		}
 		else
 			fprintf(stderr, "q2k: Vulkan unavailable, running on the CPU\n");
 	}
@@ -599,6 +605,15 @@ main(int argc, char **argv)
 			    prof_t[PROF_CPU_MV], prof_t[PROF_CPU_MV_OVERLAP],
 			    prof_t[PROF_GPU_WAIT], prof_t[PROF_GPU_MIXER], prof_t[PROF_SCAN],
 			    prof_t[PROF_ATTN]);
+			{
+				static const char *nm[] = { "mixer in", "mixer out", "moe gate/up", "moe down" };
+				int q;
+				fprintf(stderr, "cpu matvec:");
+				for (q = 0; q < 4; q++)
+					fprintf(stderr, " %s %.3f s %.1f GB/s;", nm[q], prof_t[PROF_MIX_IN + q],
+					    prof_b[PROF_MIX_IN + q] / (prof_t[PROF_MIX_IN + q] + 1e-12) / 1e9);
+				fprintf(stderr, "\n");
+			}
 			vk_prof_report();
 			if (vk_n_sub)
 				fprintf(stderr, "vulkan: %ld batches, %.3f s recording\n",

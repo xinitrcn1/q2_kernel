@@ -27,6 +27,7 @@ typedef struct {
 	const float *attn_norm, *ffn_norm;
 	/* mamba2 */
 	wt ssm_in, ssm_out;
+	wt ssm_out_cpu;         /* the CPU's column slice of ssm_out, contiguous */
 	const float *conv_w, *conv_b, *dt_b, *A, *D, *ssm_norm;
 	/* attention */
 	wt q, k, v, o;
@@ -70,6 +71,8 @@ typedef struct {
 } state;
 
 int model_load(model *m, const char *path, char *err, size_t errlen);
+/* after GPU placement: private copies for the CPU's share of split work */
+int model_prepare_split(model *m);
 void model_free(model *m);
 
 int state_init(state *s, const model *m, int ctx);
@@ -100,7 +103,8 @@ void mv_cpu(const mv_item *it, int n);
 
 /* time spent per phase, seconds */
 enum { PROF_CPU_MV, PROF_CPU_MV_OVERLAP, PROF_GPU_WAIT, PROF_SCAN, PROF_ATTN,
-	PROF_GPU_MIXER, PROF_N };
+	PROF_GPU_MIXER, PROF_MIX_IN, PROF_MIX_OUT, PROF_MOE_GU, PROF_MOE_D, PROF_N };
+extern double prof_b[PROF_N];   /* weight bytes per phase */
 extern double prof_t[PROF_N];
 
 /* compute settings */
