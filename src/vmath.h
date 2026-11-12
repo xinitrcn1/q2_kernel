@@ -17,5 +17,8 @@ float v_dot(const float *a, const float *b, size_t n);
 void v_rmsnorm(float *o, const float *x, const float *w, size_t n, float eps);
 /* y[i] += a * x[i] */
 void v_axpy(float *y, float a, const float *x, size_t n);
+/* dst = src with streaming stores (dst 32-byte aligned, n % 8 == 0):
+ * no read-for-ownership of dst; ends with a store fence */
+void v_copy_nt(float *dst, const float *src, size_t n);
 
 #endif

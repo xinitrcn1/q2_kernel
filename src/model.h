@@ -68,6 +68,11 @@ typedef struct {
 	const float *out_norm;
 	wt *all[1024];          /* every quantized matrix, for planning */
 	int n_all;
+	/* qwen35 next-token prediction (MTP) block: L[n_layer], an attention
+	 * layer fed eh_proj(enorm(embed(tok)) | hnorm(h)) */
+	layer *mtp;
+	wt eh_proj;
+	const float *enorm, *hnorm, *mtp_norm;
 } model;
 
 typedef struct {
@@ -86,6 +91,11 @@ typedef struct {
 	float *og;              /* GPU half of the mixer output */
 	/* qwen35 */
 	float *qkv, *z, *beta, *alpha, *ffg, *ffu;
+	/* qwen35 MTP: hl = output-normed hidden of position pos - 1; the MTP
+	 * layer's KV holds positions [0, mtp_n); verify checkpoints */
+	float *hl, *hnew, *cat, *lgd, *lg2, *h2, *hch;
+	float **ssm_bak, **conv_bak;
+	int mtp_n;
 } state;
 
 int model_load(model *m, const char *path, char *err, size_t errlen);
@@ -105,6 +115,20 @@ int qwen35_load(model *m, char *err, size_t errlen);
 int qwen35_state_init(state *s, const model *m, int ctx);
 void qwen35_state_reset(state *s, const model *m);
 const float *qwen35_forward(const model *m, state *s, int tok, int want_logits);
+/* greedy MTP speculation (qwen35_mtp_ok: the model has the block and the
+ * state is in step).  draft: up to kmax tokens after tok (tok is next at
+ * s->pos), chaining the MTP layer on its own output while its top
+ * probability stays >= g_draft_pmin; verify [tok, d...] (pos += k + 1,
+ * logits of every row); settle: c of the k drafts were right, back to
+ * the state after tok, d[0..c-1] */
+#define MTP_KMAX 3
+extern int g_mtp;      /* run the MTP layer alongside (set before the prompt) */
+extern int g_draft_vocab;
+extern float g_draft_pmin;
+int qwen35_mtp_ok(const model *m, const state *s);
+int qwen35_mtp_draft(const model *m, state *s, int tok, int kmax, int *d);
+const float *qwen35_verify(const model *m, state *s, int tok, const int *d, int k);
+void qwen35_settle(const model *m, state *s, const int *d, int k, int c);
 /* shared helpers from model.c */
 int model_get_wt(model *m, wt *w, const char *name, int need, char *err, size_t errlen);
 const float *model_get_f32(model *m, const char *name, uint64_t n, char *err, size_t errlen);

@@ -123,6 +123,24 @@ per 128-token chunk; the CPU computes the remaining half.  On this host
 | transcoded, CPU | 1.9-2.0 | 7.0 |
 | transcoded, `-g 1600 --vram 1800 --stream 0` | 2.2 | 6.3 |
 | transcoded, `-g 1600 --vram 1800` (streaming) | 2.2 | 13.1 |
+| transcoded, `-g 1600 --vram 1800`, MTP drafts (greedy default) | 2.7-4.0 | 13.1 |
+
+### MTP speculation (greedy decoding)
+
+The 27B file carries one next-token-prediction block (`blk.64`, a gated
+attention layer fed `eh_proj(enorm(embed(tok)) | hnorm(h))`).  With
+`--temp 0` (the default) every pass drafts up to `--draft 3` tokens by
+chaining the block on its own output while its top probability stays
+above `--draft-p 0.5` (draft head over the first 65536 token ids), and
+the main model verifies `[tok, drafts...]` in one batched pass: the
+weights are read once for up to 4 tokens.  The DeltaNet and conv states
+are checkpointed after each verified token (streaming stores) and the
+longest agreeing prefix is kept, so the output is the plain greedy
+sequence (identical to `--no-mtp` on the CPU; on the GPU the batched and
+single-token paths round differently, so near-ties can flip).  The MTP
+layer's own KV is filled for every confirmed position, prompts included.
+Decode is memory bound (~21 of ~28 GB/s on this host), so the gain is
+the tokens per pass: 1.8-3.5 depending on the text.
 
 ## Checking
 

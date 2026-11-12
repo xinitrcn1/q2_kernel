@@ -124,7 +124,7 @@ mm_run(const mm_item *in, int n)
 				it[i].r0 = ((const wt *)w->gsplit)->N;
 				ngpu++;
 			}
-			if (whole && g_stream > 0 && it[i].T > 1 && vk_can_stream(w->type)) {
+			if (whole && g_stream > 0 && it[i].T >= 16 && vk_can_stream(w->type)) {
 				int to = (int)(g_stream * w->N);
 				to -= to % 32;
 				if (to > it[i].r0 && vk_mm_add_stream(w, it[i].r0, to, (const q8k *)it[i].xq,

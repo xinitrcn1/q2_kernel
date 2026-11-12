@@ -161,3 +161,12 @@ v_axpy(float *y, float a, const float *x, size_t n)
 	for (; i < n; i++)
 		y[i] += a * x[i];
 }
+
+void
+v_copy_nt(float *dst, const float *src, size_t n)
+{
+	size_t i;
+	for (i = 0; i < n; i += 8)
+		_mm256_stream_ps(dst + i, _mm256_loadu_ps(src + i));
+	_mm_sfence();
+}

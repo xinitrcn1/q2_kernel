@@ -30,70 +30,19 @@
 
 #define KEY(s) "qwen35." s
 
-int
-qwen35_load(model *m, char *err, size_t errlen)
+static int
+load_layer(model *m, int i, int attn, char *err, size_t errlen)
 {
 	hparams *h = &m->hp;
 	char nm[96];
-	uint32_t u, interval = 4, kv = 0;
-	int i;
-
-#define U32(k, dst) do { if (gguf_get_u32(&m->g, KEY(k), &u)) { \
-	snprintf(err, errlen, "missing key %s", KEY(k)); return -1; } (dst) = (int)u; } while (0)
-	U32("embedding_length", h->n_embd);
-	U32("block_count", h->n_layer);
-	U32("attention.head_count", h->n_head);
-	U32("feed_forward_length", h->n_ff);
-	U32("attention.key_length", h->head_dim);
-	U32("rope.dimension_count", h->rope_dim);
-	U32("ssm.conv_kernel", h->d_conv);
-	U32("ssm.state_size", h->dn_dim);
-	U32("ssm.group_count", h->dn_kh);
-	U32("ssm.time_step_rank", h->dn_vh);
-	U32("ssm.inner_size", h->d_inner);
-#undef U32
-	gguf_get_arr_u32(&m->g, KEY("attention.head_count_kv"), 0, &kv);
-	h->n_head_kv = (int)kv;
-	gguf_get_u32(&m->g, KEY("full_attention_interval"), &interval);
-	/* the trailing next-token-prediction block(s) are not run */
-	if (gguf_get_u32(&m->g, KEY("nextn_predict_layers"), &u) == 0)
-		h->n_layer -= (int)u;
-	h->eps = 1e-6f;
-	h->rope_base = 10000.0f;
-	gguf_get_f32(&m->g, KEY("attention.layer_norm_rms_epsilon"), &h->eps);
-	gguf_get_f32(&m->g, KEY("rope.freq_base"), &h->rope_base);
-	h->attn_scale = 1.0f / sqrtf((float)h->head_dim);
-	h->dn_qkv = 2 * h->dn_kh * h->dn_dim + h->dn_vh * h->dn_dim;
-	if (h->d_inner != h->dn_vh * h->dn_dim || h->dn_vh % h->dn_kh || h->d_conv != 4 ||
-	    h->n_head % h->n_head_kv || h->rope_dim > h->head_dim || h->dn_dim % 8) {
-		snprintf(err, errlen, "unsupported qwen35 shape");
-		return -1;
-	}
-
-	if (model_get_wt(m, &m->tok_embd, "token_embd.weight", 1, err, errlen))
-		return -1;
-	h->n_vocab = m->tok_embd.N;
-	if (!(m->out_norm = model_get_f32(m, "output_norm.weight", (uint64_t)h->n_embd, err, errlen)))
-		return -1;
-	if (model_get_wt(m, &m->output, "output.weight", 0, err, errlen))
-		return -1;
-	if (!m->output.data)
-		m->output = m->tok_embd;
-	m->output.heat = 1;
-
-	m->L = calloc((size_t)h->n_layer, sizeof(*m->L));
-	if (!m->L) {
-		snprintf(err, errlen, "out of memory");
-		return -1;
-	}
-	for (i = 0; i < h->n_layer; i++) {
+	{
 		layer *L = &m->L[i];
 		const int E = h->n_embd;
 #define T(field, s) (snprintf(nm, sizeof(nm), "blk.%d." s, i), \
 	model_get_wt(m, &L->field, nm, 1, err, errlen))
 #define F(field, s, n) do { snprintf(nm, sizeof(nm), "blk.%d." s, i); \
 	if (!(L->field = model_get_f32(m, nm, (uint64_t)(n), err, errlen))) return -1; } while (0)
-		L->attn = (i + 1) % (int)interval == 0;
+		L->attn = attn;
 		F(attn_norm, "attn_norm.weight", E);
 		F(post_norm, "post_attention_norm.weight", E);
 		if (L->attn) {
@@ -130,6 +79,91 @@ qwen35_load(model *m, char *err, size_t errlen)
 #undef T
 #undef F
 	}
+	return 0;
+}
+
+int
+qwen35_load(model *m, char *err, size_t errlen)
+{
+	hparams *h = &m->hp;
+	char nm[96];
+	uint32_t u, interval = 4, kv = 0, nextn = 0;
+	int i;
+
+#define U32(k, dst) do { if (gguf_get_u32(&m->g, KEY(k), &u)) { \
+	snprintf(err, errlen, "missing key %s", KEY(k)); return -1; } (dst) = (int)u; } while (0)
+	U32("embedding_length", h->n_embd);
+	U32("block_count", h->n_layer);
+	U32("attention.head_count", h->n_head);
+	U32("feed_forward_length", h->n_ff);
+	U32("attention.key_length", h->head_dim);
+	U32("rope.dimension_count", h->rope_dim);
+	U32("ssm.conv_kernel", h->d_conv);
+	U32("ssm.state_size", h->dn_dim);
+	U32("ssm.group_count", h->dn_kh);
+	U32("ssm.time_step_rank", h->dn_vh);
+	U32("ssm.inner_size", h->d_inner);
+#undef U32
+	gguf_get_arr_u32(&m->g, KEY("attention.head_count_kv"), 0, &kv);
+	h->n_head_kv = (int)kv;
+	gguf_get_u32(&m->g, KEY("full_attention_interval"), &interval);
+	/* the trailing next-token-prediction block(s) are not main layers */
+	if (gguf_get_u32(&m->g, KEY("nextn_predict_layers"), &u) == 0) {
+		h->n_layer -= (int)u;
+		nextn = u;
+	}
+	h->eps = 1e-6f;
+	h->rope_base = 10000.0f;
+	gguf_get_f32(&m->g, KEY("attention.layer_norm_rms_epsilon"), &h->eps);
+	gguf_get_f32(&m->g, KEY("rope.freq_base"), &h->rope_base);
+	h->attn_scale = 1.0f / sqrtf((float)h->head_dim);
+	h->dn_qkv = 2 * h->dn_kh * h->dn_dim + h->dn_vh * h->dn_dim;
+	if (h->d_inner != h->dn_vh * h->dn_dim || h->dn_vh % h->dn_kh || h->d_conv != 4 ||
+	    h->n_head % h->n_head_kv || h->rope_dim > h->head_dim || h->dn_dim % 8) {
+		snprintf(err, errlen, "unsupported qwen35 shape");
+		return -1;
+	}
+
+	if (model_get_wt(m, &m->tok_embd, "token_embd.weight", 1, err, errlen))
+		return -1;
+	h->n_vocab = m->tok_embd.N;
+	if (!(m->out_norm = model_get_f32(m, "output_norm.weight", (uint64_t)h->n_embd, err, errlen)))
+		return -1;
+	if (model_get_wt(m, &m->output, "output.weight", 0, err, errlen))
+		return -1;
+	if (!m->output.data)
+		m->output = m->tok_embd;
+	m->output.heat = 1;
+
+	m->L = calloc((size_t)h->n_layer + 1, sizeof(*m->L));
+	if (!m->L) {
+		snprintf(err, errlen, "out of memory");
+		return -1;
+	}
+	for (i = 0; i < h->n_layer; i++)
+		if (load_layer(m, i, (i + 1) % (int)interval == 0, err, errlen))
+			return -1;
+	/* the MTP block: blk.<n_layer>, gated attention + FFN (optional) */
+	if (nextn == 1 && !getenv("Q2K_NO_MTP")) {
+		snprintf(nm, sizeof(nm), "blk.%d.nextn.eh_proj.weight", h->n_layer);
+		if (model_get_wt(m, &m->eh_proj, nm, 0, err, errlen) == 0 && m->eh_proj.data &&
+		    m->eh_proj.K == 2 * h->n_embd && m->eh_proj.N == h->n_embd &&
+		    load_layer(m, h->n_layer, 1, err, errlen) == 0) {
+			snprintf(nm, sizeof(nm), "blk.%d.nextn.enorm.weight", h->n_layer);
+			m->enorm = model_get_f32(m, nm, (uint64_t)h->n_embd, err, errlen);
+			snprintf(nm, sizeof(nm), "blk.%d.nextn.hnorm.weight", h->n_layer);
+			m->hnorm = model_get_f32(m, nm, (uint64_t)h->n_embd, err, errlen);
+			snprintf(nm, sizeof(nm), "blk.%d.nextn.shared_head_norm.weight", h->n_layer);
+			m->mtp_norm = model_get_f32(m, nm, (uint64_t)h->n_embd, err, errlen);
+			if (!m->mtp_norm)
+				m->mtp_norm = m->out_norm;
+			if (m->enorm && m->hnorm) {
+				m->mtp = &m->L[h->n_layer];
+				m->eh_proj.heat = 1;
+			}
+		}
+		err[0] = 0;
+	}
 	if (m->n_all < (int)(sizeof(m->all) / sizeof(m->all[0])) && m->output.data != m->tok_embd.data)
 		m->all[m->n_all++] = &m->output;
 	return 0;
@@ -164,12 +198,29 @@ qwen35_state_init(state *s, const model *m, int ctx)
 	s->ffg = model_falloc((size_t)h->n_ff);
 	s->ffu = model_falloc((size_t)h->n_ff);
 	s->logits = model_falloc((size_t)h->n_vocab);
-	s->conv = calloc((size_t)h->n_layer, sizeof(float *));
-	s->ssm = calloc((size_t)h->n_layer, sizeof(float *));
-	s->kc = calloc((size_t)h->n_layer, sizeof(float *));
-	s->vc = calloc((size_t)h->n_layer, sizeof(float *));
-	if (!s->conv || !s->ssm || !s->kc || !s->vc || !s->logits || !s->att)
+	s->conv = calloc((size_t)h->n_layer + 1, sizeof(float *));
+	s->ssm = calloc((size_t)h->n_layer + 1, sizeof(float *));
+	s->kc = calloc((size_t)h->n_layer + 1, sizeof(float *));
+	s->vc = calloc((size_t)h->n_layer + 1, sizeof(float *));
+	s->ssm_bak = calloc((size_t)h->n_layer + 1, sizeof(float *));
+	s->conv_bak = calloc((size_t)h->n_layer + 1, sizeof(float *));
+	if (!s->conv || !s->ssm || !s->kc || !s->vc || !s->logits || !s->att || !s->ssm_bak ||
+	    !s->conv_bak)
 		return -1;
+	if (m->mtp) {
+		s->hl = model_falloc((size_t)h->n_embd);
+		s->hnew = model_falloc((size_t)h->n_embd);
+		s->cat = model_falloc((size_t)(2 * h->n_embd));
+		s->lgd = model_falloc((size_t)h->n_vocab);
+		s->lg2 = model_falloc((size_t)(MTP_KMAX + 1) * (size_t)h->n_vocab);
+		s->h2 = model_falloc((size_t)(MTP_KMAX + 1) * (size_t)h->n_embd);
+		s->hch = model_falloc((size_t)h->n_embd);
+		s->kc[h->n_layer] = model_falloc((size_t)ctx * kvd);
+		s->vc[h->n_layer] = model_falloc((size_t)ctx * kvd);
+		if (!s->hl || !s->hnew || !s->cat || !s->lgd || !s->lg2 || !s->h2 || !s->hch ||
+		    !s->kc[h->n_layer] || !s->vc[h->n_layer])
+			return -1;
+	}
 	for (i = 0; i < h->n_layer; i++) {
 		if (m->L[i].attn) {
 			s->kc[i] = model_falloc((size_t)ctx * kvd);
@@ -181,6 +232,14 @@ qwen35_state_init(state *s, const model *m, int ctx)
 			s->ssm[i] = model_falloc((size_t)h->dn_vh * (size_t)h->dn_dim * (size_t)h->dn_dim);
 			if (!s->conv[i] || !s->ssm[i])
 				return -1;
+			if (m->mtp) {
+				s->conv_bak[i] = model_falloc((size_t)MTP_KMAX * (size_t)(h->d_conv - 1) *
+				    (size_t)h->dn_qkv);
+				s->ssm_bak[i] = model_falloc((size_t)MTP_KMAX * (size_t)h->dn_vh *
+				    (size_t)h->dn_dim * (size_t)h->dn_dim);
+				if (!s->conv_bak[i] || !s->ssm_bak[i])
+					return -1;
+			}
 		}
 	}
 	return 0;
@@ -192,6 +251,9 @@ qwen35_state_reset(state *s, const model *m)
 	const hparams *h = &m->hp;
 	int i;
 	s->pos = 0;
+	s->mtp_n = 0;
+	if (s->hl)
+		memset(s->hl, 0, sizeof(float) * (size_t)h->n_embd);
 	for (i = 0; i < h->n_layer; i++) {
 		if (s->conv[i])
 			memset(s->conv[i], 0, sizeof(float) * (size_t)(h->d_conv - 1) * (size_t)h->dn_qkv);
@@ -423,6 +485,75 @@ ffn(const model *m, const layer *L, state *s)
 	mv_run(it, 1);
 }
 
+/* ---------------------------------------------------------------- */
+/* MTP (next-token prediction) block, one token                      */
+
+int g_mtp;
+int g_draft_vocab = 65536; /* draft head over token ids [0, n): 0 = all */
+float g_draft_pmin = 0.5f;
+
+static int
+argmax(const float *x, int n)
+{
+	int i, b = 0;
+	for (i = 1; i < n; i++)
+		if (x[i] > x[b])
+			b = i;
+	return b;
+}
+
+/* the MTP layer at position p for token tok and the main model's
+ * output-normed hidden of position p - 1; with head, the argmax of its
+ * logits (the draft for position p + 1) */
+static int
+mtp_step(const model *m, state *s, int tok, const float *hprev, int p, int head)
+{
+	const hparams *h = &m->hp;
+	const int E = h->n_embd;
+	const layer *L = m->mtp;
+	mv_item it;
+	int saved = s->pos;
+
+	if (tok < 0 || tok >= h->n_vocab)
+		tok = 0;
+	dequant_row(m->tok_embd.type, m->tok_embd.data + (size_t)tok * m->tok_embd.row_bytes,
+	    s->tmp, (size_t)E);
+	v_rmsnorm(s->cat, s->tmp, m->enorm, (size_t)E, h->eps);
+	v_rmsnorm(s->cat + E, hprev, m->hnorm, (size_t)E, h->eps);
+	it = mv(&m->eh_proj, 0, s->cat, s->x);
+	mv_run(&it, 1);
+	s->pos = p;
+	v_rmsnorm(s->xn, s->x, L->attn_norm, (size_t)E, h->eps);
+	attention(m, L, s, h->n_layer);
+	v_axpy(s->x, 1.0f, s->tmp, (size_t)E);
+	v_rmsnorm(s->xn, s->x, L->post_norm, (size_t)E, h->eps);
+	ffn(m, L, s);
+	v_axpy(s->x, 1.0f, s->tmp, (size_t)E);
+	s->pos = saved;
+	if (p + 1 > s->mtp_n)
+		s->mtp_n = p + 1;
+	if (!head)
+		return -1;
+	v_rmsnorm(s->hch, s->x, m->mtp_norm, (size_t)E, h->eps);
+	{
+		int nv = g_draft_vocab > 0 && g_draft_vocab < h->n_vocab ? g_draft_vocab : h->n_vocab;
+		it = mv_rows(&m->output, 0, s->hch, s->lgd, 0, nv, 0);
+		mv_run(&it, 1);
+		return argmax(s->lgd, nv);
+	}
+}
+
+/* softmax probability of the top logit among the first nv */
+static float
+top_prob(const float *lg, int nv, int top)
+{
+	double sum = 0;
+	int i;
+	for (i = 0; i < nv; i++)
+		sum += exp((double)(lg[i] - lg[top]));
+	return (float)(1.0 / sum);
+}
+
 const float *
 qwen35_forward(const model *m, state *s, int tok, int want_logits)
 {
@@ -448,6 +579,18 @@ qwen35_forward(const model *m, state *s, int tok, int want_logits)
 		v_axpy(s->x, 1.0f, s->tmp, (size_t)E);
 	}
 	s->pos++;
+	if (m->mtp && g_mtp && s->mtp_n == s->pos - 1) {
+		/* keep the MTP layer in step: its position pos - 1 pairs tok
+		 * with the previous position's hidden */
+		v_rmsnorm(s->hnew, s->x, m->out_norm, (size_t)E, h->eps);
+		if (want_logits) {
+			it = mv(&m->output, 0, s->hnew, s->logits);
+			mv_run(&it, 1);
+		}
+		mtp_step(m, s, tok, s->hl, s->pos - 1, 0);
+		memcpy(s->hl, s->hnew, sizeof(float) * (size_t)E);
+		return want_logits ? s->logits : NULL;
+	}
 	if (!want_logits)
 		return NULL;
 	v_rmsnorm(s->xn, s->x, m->out_norm, (size_t)E, h->eps);
@@ -467,7 +610,9 @@ qwen35_forward(const model *m, state *s, int tok, int want_logits)
 static struct {
 	int ok;
 	float *x, *xn, *qkv, *z, *beta, *alpha, *y, *tmp, *fg, *fu, *q, *ao;
-	q8k *xq, *yq, *fq;
+	float *h, *cat;         /* output-normed hiddens; MTP input pairs */
+	q8k *xq, *yq, *fq, *cq;
+	int ckpt;               /* verify: checkpoint the recurrent state after token 0 */
 } P;
 
 static int
@@ -486,6 +631,7 @@ pbufs(const hparams *h)
 	A(P.xq, T * E / 256); A(P.yq, T * (size_t)(h->d_inner > h->n_head * h->head_dim ?
 	    h->d_inner : h->n_head * h->head_dim) / 256);
 	A(P.fq, T * (size_t)h->n_ff / 256);
+	A(P.h, T * E); A(P.cat, 2 * T * E); A(P.cq, 2 * T * E / 256);
 #undef A
 	P.ok = 1;
 	return 0;
@@ -528,6 +674,12 @@ pconv(void *arg, int ith, int nth)
 				s0 = s1;
 				s1 = s2;
 				s2 = in;
+				if (t < j->T - 1 && P.ckpt) {
+					float *cb = j->s->conv_bak[j->il] + (size_t)t * 3 * CH;
+					cb[c] = s0;
+					cb[CH + c] = s1;
+					cb[2 * CH + c] = s2;
+				}
 			}
 			cs[c] = s0;
 			cs[CH + c] = s1;
@@ -571,6 +723,9 @@ pdelta(void *arg, int ith, int nth)
 				v_axpy(row, delta[r], k, (size_t)D);
 				o[r] = v_dot(row, q, (size_t)D) * scale;
 			}
+			if (t < j->T - 1 && P.ckpt)
+				v_copy_nt(j->s->ssm_bak[j->il] + ((size_t)t * h->dn_vh + (size_t)hv) * D * D, M,
+				    (size_t)D * D);
 		}
 	}
 }
@@ -713,11 +868,50 @@ pffn(const model *m, const layer *L, int T)
 	mm_run(it, 1);
 }
 
+/* the MTP layer over positions pos0 .. pos0 + T - 1 (no head): token t
+ * pairs with hidden row t (h0 for t = 0, then hrest[t - 1]) */
 static void
-pchunk(const model *m, state *s, const int *tok, int T)
+pmtp(const model *m, state *s, const int *tok, const float *h0, const float *hrest, int pos0, int T)
 {
 	const hparams *h = &m->hp;
 	const int E = h->n_embd;
+	const layer *L = m->mtp;
+	mm_item it;
+	int t, saved = s->pos;
+
+	for (t = 0; t < T; t++) {
+		int id = tok[t] < 0 || tok[t] >= h->n_vocab ? 0 : tok[t];
+		dequant_row(m->tok_embd.type, m->tok_embd.data + (size_t)id * m->tok_embd.row_bytes,
+		    P.tmp + (size_t)t * E, (size_t)E);
+		v_rmsnorm(P.cat + (size_t)t * 2 * E, P.tmp + (size_t)t * E, m->enorm, (size_t)E, h->eps);
+		v_rmsnorm(P.cat + (size_t)t * 2 * E + E, t ? hrest + (size_t)(t - 1) * E : h0,
+		    m->hnorm, (size_t)E, h->eps);
+	}
+	quant_rows(P.cat, P.cq, T, 2 * E);
+	it = mmi(&m->eh_proj, 0, P.cq, 2 * E / 256, T, P.x, E);
+	mm_run(&it, 1);
+	for (t = 0; t < T; t++)
+		v_rmsnorm(P.xn + (size_t)t * E, P.x + (size_t)t * E, L->attn_norm, (size_t)E, h->eps);
+	quant_rows(P.xn, P.xq, T, E);
+	s->pos = pos0;
+	pattention(m, L, s, h->n_layer, T);
+	s->pos = saved;
+	v_axpy(P.x, 1.0f, P.tmp, (size_t)T * E);
+	for (t = 0; t < T; t++)
+		v_rmsnorm(P.xn + (size_t)t * E, P.x + (size_t)t * E, L->post_norm, (size_t)E, h->eps);
+	quant_rows(P.xn, P.xq, T, E);
+	pffn(m, L, T);
+	s->mtp_n = pos0 + T;
+}
+
+enum { PC_PROMPT, PC_VERIFY };
+
+static void
+pchunk(const model *m, state *s, const int *tok, int T, int mode)
+{
+	const hparams *h = &m->hp;
+	const int E = h->n_embd;
+	const int inline_mtp = mode == PC_PROMPT && m->mtp && g_mtp && s->mtp_n == s->pos;
 	int il, t;
 
 	for (t = 0; t < T; t++) {
@@ -741,7 +935,92 @@ pchunk(const model *m, state *s, const int *tok, int T)
 		pffn(m, L, T);
 		v_axpy(P.x, 1.0f, P.tmp, (size_t)T * E);
 	}
+	if (mode == PC_VERIFY || inline_mtp)
+		for (t = 0; t < T; t++)
+			v_rmsnorm(P.h + (size_t)t * E, P.x + (size_t)t * E, m->out_norm, (size_t)E, h->eps);
+	if (mode == PC_VERIFY) {
+		mm_item it;
+		quant_rows(P.h, P.xq, T, E);
+		it = mmi(&m->output, 0, P.xq, E / 256, T, s->lg2, h->n_vocab);
+		mm_run(&it, 1);
+		memcpy(s->h2, P.h, sizeof(float) * (size_t)T * E);
+	}
+	if (inline_mtp) {
+		pmtp(m, s, tok, s->hl, P.h, s->pos, T);
+		memcpy(s->hl, P.h + (size_t)(T - 1) * E, sizeof(float) * (size_t)E);
+	}
 	s->pos += T;
+}
+
+/* ---------------------------------------------------------------- */
+/* greedy MTP speculation                                            */
+
+int
+qwen35_mtp_ok(const model *m, const state *s)
+{
+	return m->mtp && g_mtp && s->mtp_n == s->pos && pbufs(&m->hp) == 0;
+}
+
+int
+qwen35_mtp_draft(const model *m, state *s, int tok, int kmax, int *d)
+{
+	const int n = s->pos, nv = g_draft_vocab > 0 && g_draft_vocab < m->hp.n_vocab ?
+	    g_draft_vocab : m->hp.n_vocab;
+	int k = 0;
+	const float *hp = s->hl;
+
+	if (kmax > MTP_KMAX)
+		kmax = MTP_KMAX;
+	while (k < kmax) {
+		d[k] = mtp_step(m, s, k ? d[k - 1] : tok, hp, n + k, 1);
+		k++;
+		/* chain on the MTP layer's own output while it is confident */
+		if (k < kmax && top_prob(s->lgd, nv, d[k - 1]) < g_draft_pmin)
+			break;
+		memcpy(s->hnew, s->hch, sizeof(float) * (size_t)m->hp.n_embd);
+		hp = s->hnew;
+	}
+	/* positions past n hold speculative pairs: only n is settled */
+	s->mtp_n = n + 1;
+	return k;
+}
+
+const float *
+qwen35_verify(const model *m, state *s, int tok, const int *d, int k)
+{
+	int tk[MTP_KMAX + 1], i;
+	tk[0] = tok;
+	for (i = 0; i < k; i++)
+		tk[i + 1] = d[i];
+	P.ckpt = 1;
+	pchunk(m, s, tk, k + 1, PC_VERIFY);
+	P.ckpt = 0;
+	return s->lg2;
+}
+
+void
+qwen35_settle(const model *m, state *s, const int *d, int k, int c)
+{
+	const hparams *h = &m->hp;
+	const int E = h->n_embd;
+	int il;
+
+	if (c < k) {
+		/* back to the state after token c of the verify */
+		const size_t ss = (size_t)h->dn_vh * h->dn_dim * h->dn_dim;
+		const size_t cs = (size_t)(h->d_conv - 1) * h->dn_qkv;
+		for (il = 0; il < h->n_layer; il++)
+			if (!m->L[il].attn) {
+				memcpy(s->ssm[il], s->ssm_bak[il] + (size_t)c * ss, sizeof(float) * ss);
+				memcpy(s->conv[il], s->conv_bak[il] + (size_t)c * cs, sizeof(float) * cs);
+			}
+		s->pos -= k - c;
+	}
+	/* the accepted drafts into the MTP layer, paired with the verify's
+	 * hiddens of the positions before them */
+	if (c > 0)
+		pmtp(m, s, d, s->h2, s->h2 + E, s->pos - c, c);
+	memcpy(s->hl, s->h2 + (size_t)c * E, sizeof(float) * (size_t)E);
 }
 
 const float *
@@ -763,7 +1042,7 @@ qwen35_prefill(const model *m, state *s, const int *tok, int n)
 		clock_gettime(CLOCK_MONOTONIC, &a);
 		while (done < n - 1) {
 			int T = n - 1 - done > QB ? QB : n - 1 - done;
-			pchunk(m, s, tok + done, T);
+			pchunk(m, s, tok + done, T, PC_PROMPT);
 			done += T;
 		}
 		clock_gettime(CLOCK_MONOTONIC, &b);

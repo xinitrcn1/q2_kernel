@@ -264,10 +264,16 @@ model_free(model *m)
 /* ---------------------------------------------------------------- */
 /* state                                                            */
 
+/* zeroed, 64-byte aligned (whole lines; v_copy_nt needs 32) */
 static float *
 fa(size_t n)
 {
-	return calloc(n ? n : 1, sizeof(float));
+	void *p = NULL;
+	size_t b = (n ? n : 1) * sizeof(float);
+	if (posix_memalign(&p, 64, b))
+		return NULL;
+	memset(p, 0, b);
+	return p;
 }
 
 float *
@@ -353,13 +359,18 @@ void
 state_free(state *s, const model *m)
 {
 	int i;
-	for (i = 0; i < m->hp.n_layer; i++) {
+	for (i = 0; i < m->hp.n_layer + (m->mtp != NULL); i++) {
 		free(s->conv[i]);
 		free(s->ssm[i]);
 		free(s->kc[i]);
 		free(s->vc[i]);
+		if (s->ssm_bak)
+			free(s->ssm_bak[i]);
+		if (s->conv_bak)
+			free(s->conv_bak[i]);
 	}
-	free(s->conv); free(s->ssm); free(s->kc); free(s->vc);
+	free(s->conv); free(s->ssm); free(s->kc); free(s->vc); free(s->ssm_bak); free(s->conv_bak);
+	free(s->hl); free(s->hnew); free(s->cat); free(s->lgd); free(s->lg2); free(s->h2); free(s->hch);
 	free(s->x); free(s->xn); free(s->tmp); free(s->zxbcdt); free(s->xbc);
 	free(s->y); free(s->q); free(s->k); free(s->v); free(s->att); free(s->ao);
 	free(s->rl); free(s->hs_g); free(s->hs_u); free(s->he_g); free(s->he_u);

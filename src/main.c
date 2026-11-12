@@ -20,7 +20,7 @@
 typedef struct {
 	const char *model, *prompt, *system, *dump, *transcode;
 	int n_predict, threads, ctx, gpu_mib, device, chat, raw, info, tokens;
-	int bench, check, kbench, top_k, verbose, show_special, logits, noprefill, think, sys_given;
+	int bench, check, kbench, top_k, verbose, show_special, logits, noprefill, think, sys_given, nomtp, ndraft;
 	float temp, top_p;
 	unsigned long seed;
 } opts;
@@ -71,6 +71,9 @@ usage(void)
 	    "  --check        compare CPU/GPU kernels against the reference\n"
 	    "  --kbench       single-thread CPU kernel throughput per type\n"
 	    "  --no-batch     feed prompts token by token (no batched prefill)\n"
+	    "  --no-mtp       greedy decoding without the MTP draft block (qwen35)\n"
+	    "  --draft K      MTP drafts per step, 1..3 (default 3; 0 = --no-mtp)\n"
+	    "  --draft-p P    chain another draft while its probability >= P (0.5)\n"
 	    "  --transcode F  write the model to F with the codebook i-quants in\n"
 	    "                 q2k's faster lossless layouts (X2/X3/X1), then exit\n"
 	    "  -v             verbose\n");
@@ -97,6 +100,7 @@ parse(int argc, char **argv)
 
 	O.model = getenv("Q2K_MODEL") ? getenv("Q2K_MODEL") : DEFAULT_MODEL;
 	O.n_predict = 256;
+	O.ndraft = 3;
 	/* one core left for the GPU driver, the fence polling and the
 	 * rest of the system: measured faster than all of them */
 	O.threads = nc > 1 ? (int)nc - 1 : 1;
@@ -140,6 +144,9 @@ parse(int argc, char **argv)
 		else if (!strcmp(a, "--kbench")) O.kbench = 1;
 		else if (!strcmp(a, "--transcode")) O.transcode = ARG();
 		else if (!strcmp(a, "--no-batch")) O.noprefill = 1;
+		else if (!strcmp(a, "--no-mtp")) O.nomtp = 1;
+		else if (!strcmp(a, "--draft")) O.ndraft = atoi(ARG());
+		else if (!strcmp(a, "--draft-p")) g_draft_pmin = (float)atof(ARG());
 		else if (!strcmp(a, "-v")) O.verbose = 1;
 		else if (a[0] == '-') usage();
 		else O.prompt = a;
@@ -269,12 +276,77 @@ is_stop(int id)
 	return id == T.eos || (T.type[id] == 3 && id != T.bos);
 }
 
+static long mtp_steps, mtp_acc, mtp_drafted;
+static double mtp_t[4];  /* draft, verify, accept, reject */
+
+/* greedy with the MTP block (qwen35): per step one draft and a 2-token
+ * verify; the output is the greedy sequence (the verify's row 0 is the
+ * model's own prediction, the draft only decides whether row 1 is
+ * usable) */
+static int
+generate_mtp(const float *lg, int n, double *secs)
+{
+	const int V = M.hp.n_vocab;
+	double t0 = now();
+	int i = 0, x = sample(lg, V);
+
+	while (i < n) {
+		const float *l2;
+		int d[MTP_KMAX], a, k, c, j;
+		if (is_stop(x))
+			break;
+		emit(x);
+		i++;
+		if (i >= n || S.pos + 2 >= S.ctx || !qwen35_mtp_ok(&M, &S)) {
+			if (S.pos >= S.ctx)
+				break;
+			lg = model_forward(&M, &S, x, 1);
+			if (i >= n || !lg)
+				break;
+			x = sample(lg, V);
+			continue;
+		}
+		{
+			double ta = now();
+			k = qwen35_mtp_draft(&M, &S, x, O.ndraft, d);
+			mtp_t[0] += now() - ta;
+			ta = now();
+			l2 = qwen35_verify(&M, &S, x, d, k);
+			mtp_t[1] += now() - ta;
+		}
+		/* the longest run of drafts the model agrees with */
+		for (c = 0; c < k; c++) {
+			a = sample(l2 + (size_t)c * V, V);
+			if (a != d[c] || is_stop(d[c]))
+				break;
+		}
+		mtp_steps++;
+		mtp_drafted += k;
+		mtp_acc += c;
+		{
+			double ta = now();
+			qwen35_settle(&M, &S, d, k, c);
+			mtp_t[2] += now() - ta;
+		}
+		for (j = 0; j < c && i < n; j++) {
+			emit(d[j]);
+			i++;
+		}
+		x = sample(l2 + (size_t)c * V, V);
+	}
+	if (secs)
+		*secs = now() - t0;
+	return i;
+}
+
 /* generate up to n tokens after logits lg; returns count */
 static int
 generate(const float *lg, int n, double *secs)
 {
 	double t0 = now();
 	int i;
+	if (lg && M.arch == ARCH_QWEN35 && O.temp <= 0 && qwen35_mtp_ok(&M, &S))
+		return generate_mtp(lg, n, secs);
 	for (i = 0; i < n && lg; i++) {
 		int id = sample(lg, M.hp.n_vocab);
 		if (is_stop(id))
@@ -671,6 +743,11 @@ main(int argc, char **argv)
 	}
 	kq_init();
 	pool_init(O.threads);
+	/* greedy runs keep the MTP block in step from the prompt on */
+	if (getenv("Q2K_DRAFT_V"))
+		g_draft_vocab = atoi(getenv("Q2K_DRAFT_V"));
+	g_mtp = M.arch == ARCH_QWEN35 && M.mtp && O.temp <= 0 && !O.nomtp && O.ndraft > 0 &&
+	    !O.check && !O.kbench;
 	if (g_stream < 0)
 		g_stream = M.arch == ARCH_QWEN35 && O.gpu_mib > 0 ? 0.5 : 0;
 	if (g_stream > 0 && !vk_stream_bytes)
@@ -757,6 +834,22 @@ main(int argc, char **argv)
 			fwrite(O.prompt, 1, strlen(O.prompt), stdout);
 			fflush(stdout);
 		}
+		if (getenv("Q2K_VBENCH") && lg && qwen35_mtp_ok(&M, &S)) {
+			/* verify of T = 1..4 tokens (settled back to nothing accepted) */
+			int k, r, nb = atoi(getenv("Q2K_VBENCH")), x0 = sample(lg, M.hp.n_vocab), dd[MTP_KMAX];
+			for (k = 0; k < MTP_KMAX; k++)
+				dd[k] = x0;
+			for (k = 0; k <= MTP_KMAX; k++) {
+				double ta = now();
+				for (r = 0; r < nb; r++) {
+					qwen35_verify(&M, &S, x0, dd, k);
+					qwen35_settle(&M, &S, dd, k, 0);
+					S.pos--;
+					S.mtp_n = S.pos;
+				}
+				fprintf(stderr, "vbench: verify T=%d %.0f ms\n", k + 1, 1e3 * (now() - ta) / nb);
+			}
+		}
 		gen = generate(lg, O.n_predict, &tg);
 		printf("\n");
 		if (O.bench) {
@@ -781,6 +874,14 @@ main(int argc, char **argv)
 				fprintf(stderr, "vulkan: %ld batches, %.3f s recording\n",
 				    vk_n_sub, vk_t_sub);
 		}
+		if ((O.bench || O.verbose) && mtp_steps)
+			fprintf(stderr, "mtp: %ld passes, %ld of %ld drafts accepted (%.0f%%), %.2f tokens per pass\n",
+			    mtp_steps, mtp_acc, mtp_drafted, 100.0 * mtp_acc / (mtp_drafted ? mtp_drafted : 1),
+			    (mtp_steps + mtp_acc) / (double)mtp_steps);
+		if ((O.bench || O.verbose) && mtp_steps)
+			fprintf(stderr, "mtp time: draft %.3f s, verify %.3f s, settle %.3f s"
+			    " (%.0f ms per pass)\n", mtp_t[0], mtp_t[1], mtp_t[2],
+			    1e3 * (mtp_t[0] + mtp_t[1] + mtp_t[2] + mtp_t[3]) / mtp_steps);
 		if (O.bench || O.verbose)
 			fprintf(stderr, "prompt: %d tok in %.2f s (%.2f tok/s); "
 			    "gen: %d tok in %.2f s (%.2f tok/s)\n",
