@@ -599,6 +599,12 @@ main(int argc, char **argv)
 		check();
 		goto out;
 	}
+	if (O.kbench && vk_ready()) {
+		uint32_t g;
+		for (g = 6; g <= 768; g *= 2)
+			printf("gpu read %u workgroups: %.1f GB/s (300 MB), %.1f GB/s (3 MB)\n", g,
+			    vk_bandwidth(300u << 20, g), vk_bandwidth(3u << 20, g));
+	}
 	if (O.kbench) {
 		kbench();
 		goto out;

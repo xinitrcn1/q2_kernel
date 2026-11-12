@@ -618,7 +618,7 @@ model_prefill(const model *m, state *s, const int *tok, int n)
 	}
 	/* the GPU's heads' state comes back to the CPU for the batch */
 	for (il = 0; il < h->n_layer; il++)
-		vk_state_sync(m, s, il, 0);
+		vk_state_sync(m, s, il, 0, 0, vk_mamba_heads(il));
 	/* all but the last token in chunks; the last one through the
 	 * regular path, which also produces the logits */
 	{
@@ -636,6 +636,6 @@ model_prefill(const model *m, state *s, const int *tok, int n)
 		    pf_rows / pf_t[0] / 1e9, pf_t[1], pf_t[2], pf_t[3], pf_t[4]);
 	}
 	for (il = 0; il < h->n_layer; il++)
-		vk_state_sync(m, s, il, 1);
+		vk_state_sync(m, s, il, 1, 0, vk_mamba_heads(il));
 	return model_forward(m, s, tok[n - 1], 1);
 }

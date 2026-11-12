@@ -653,7 +653,7 @@ mamba2(const model *m, const layer *L, state *s, int il)
 	rmsnorm(s->xn, s->x, L->attn_norm, h->n_embd, h->eps);
 	if (hg) {
 		q8k_quantize(s->xn, s->xq, (size_t)h->n_embd);
-		vk_mamba_submit(m, il, s->xq, s->og, ssg);
+		vk_mamba_submit(m, il, s->xq, 1, hg, s->og, ssg);
 	}
 	if (hg < NH) {
 		/* our rows of ssm_in: z, x for our heads; all of B, C; our dt */

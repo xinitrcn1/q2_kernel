@@ -42,12 +42,14 @@ int vk_mamba_ok(int il);
 int vk_mamba_heads(int il);
 /* xq: q8k of attn_norm(x); ss receives one sum of squares per 256 of
  * the GPU's channels */
-void vk_mamba_submit(const model *m, int il, const q8k *xq, float *out, float *ss);
+void vk_mamba_submit(const model *m, int il, const q8k *xq, int T, int hg, float *out, float *ss);
 void vk_prof_collect(void);
 void vk_prof_report(void);
+double vk_bandwidth(size_t bytes, uint32_t groups);
 void vk_state_reset(void);
-/* GPU heads' state of layer il to (to_gpu=1) or from (0) the CPU arrays */
-void vk_state_sync(const model *m, state *s, int il, int to_gpu);
+/* state of heads [h0, h1) (+ B/C conv) of layer il to (to_gpu=1) or
+ * from (0) the CPU arrays */
+void vk_state_sync(const model *m, state *s, int il, int to_gpu, int h0, int h1);
 /* GPU rows [0, N) of the output projection, or NULL */
 const wt *vk_lm(void);
 

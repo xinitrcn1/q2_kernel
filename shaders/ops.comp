@@ -90,93 +90,117 @@ void q8k_block(float v, uint qo)
 	}
 	barrier();
 }
-#elif OP == 4
-/* one workgroup per 256-block: v = a | silu(a)*b; ss_out[k] = sum v^2
- * (before weights); v *= w; q8k block k.
- * p: 0 a, 1 b (NONE: plain), 2 w (W words, NONE: none), 3 q_out (words),
- *    4 ss_out (A, per block; NONE: none) */
-void main()
-{
-	uint k = gl_WorkGroupID.x, i = 256u * k + gl_LocalInvocationID.x;
-	float v = A[pc.p[0] + i];
-	if (pc.p[1] != NONE)
-		v = silu(v) * A[pc.p[1] + i];
-	if (pc.p[4] != NONE) {
-		float t = wg_sum(v * v);
-		if (gl_LocalInvocationID.x == 0u)
-			A[pc.p[4] + k] = t;
-	}
-	if (pc.p[2] != NONE)
-		v *= wf(pc.p[2] + i);
-	q8k_block(v, pc.p[3] + 73u * k);
-}
 #endif
 
 #if OP == 2
-/* p: 0 xbc in, 1 dt in, 2 xbc out, 3 dt out, 4 state (S), 5 conv w
- *    (W, [ch][4]), 6 conv b, 7 dt bias, 8 channels, 9 heads */
+/* Mamba2 conv + SiLU over T tokens with resident state; the GPU's
+ * channels c' < gch map to full-layout channel c = c' (< gdi: its x
+ * channels) or DI + c' - gdi (B, C).  Also dt = softplus(dt + bias).
+ * p: 0 zx (token 0), 1 zx stride, 2 xbc out, 3 xbc stride, 4 dt out,
+ *    5 dt stride, 6 state, 7 conv w (W, [CH][4]), 8 conv b, 9 dt bias,
+ *    10 gch, 11 heads, 12 gdi, 13 DI, 14 CH, 15 T */
 void main()
 {
-	uint c = gl_GlobalInvocationID.x, ch = pc.p[8];
-	if (c < pc.p[9]) {
-		float d = A[pc.p[1] + c] + wf(pc.p[7] + c);
-		A[pc.p[3] + c] = d > 20.0 ? d : log(1.0 + exp(d));
+	uint cp = gl_GlobalInvocationID.x, gch = pc.p[10], gdi = pc.p[12], T = pc.p[15];
+	uint zs = pc.p[1];
+	if (cp < pc.p[11]) {
+		float bias = wf(pc.p[9] + cp);
+		for (uint t = 0u; t < T; t++) {
+			float d = A[pc.p[0] + t * zs + gdi + gch + cp] + bias;
+			A[pc.p[4] + t * pc.p[5] + cp] = d > 20.0 ? d : log(1.0 + exp(d));
+		}
 	}
-	if (c >= ch)
+	if (cp >= gch)
 		return;
-	uint st = pc.p[4], w = pc.p[5] + 4u * c;
-	float s0 = S[st + c], s1 = S[st + ch + c], s2 = S[st + 2u * ch + c];
-	float x = A[pc.p[0] + c];
-	float v = s0 * wf(w) + s1 * wf(w + 1u) + s2 * wf(w + 2u) + x * wf(w + 3u) + wf(pc.p[6] + c);
-	S[st + c] = s1;
-	S[st + ch + c] = s2;
-	S[st + 2u * ch + c] = x;
-	A[pc.p[2] + c] = silu(v);
+	uint c = cp < gdi ? cp : pc.p[13] + cp - gdi, CH = pc.p[14];
+	uint st = pc.p[6], w = pc.p[7] + 4u * c;
+	float w0 = wf(w), w1 = wf(w + 1u), w2 = wf(w + 2u), w3 = wf(w + 3u), bc = wf(pc.p[8] + c);
+	float s0 = S[st + c], s1 = S[st + CH + c], s2 = S[st + 2u * CH + c];
+	for (uint t = 0u; t < T; t++) {
+		float x = A[pc.p[0] + t * zs + gdi + cp];
+		float v = s0 * w0 + s1 * w1 + s2 * w2 + x * w3 + bc;
+		s0 = s1;
+		s1 = s2;
+		s2 = x;
+		A[pc.p[2] + t * pc.p[3] + cp] = silu(v);
+	}
+	S[st + c] = s0;
+	S[st + CH + c] = s1;
+	S[st + 2u * CH + c] = s2;
 }
 
 #elif OP == 3
-/* p: 0 xbc (x | B | C), 1 dt, 2 z, 3 y out, 4 state, 5 A (W), 6 D (W),
- *    7 d_inner, 8 d_state, 9 head_dim */
+/* Mamba2 selective scan over T tokens, one subgroup per channel r of
+ * the GPU's heads, its d_state values held in the lanes' registers.
+ * p: 0 xbc (x | B | C, token 0), 1 xbc stride, 2 dt, 3 dt stride,
+ *    4 z (token 0), 5 z stride, 6 y out, 7 y stride, 8 state, 9 A (W),
+ *    10 D (W), 11 channels (gdi), 12 d_state, 13 head_dim, 14 T */
+#define SMAX 8u
 void main()
 {
 	uint r = gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID;
-	uint di = pc.p[7], ds = pc.p[8];
-	if (r >= di)
+	uint gdi = pc.p[11], ds = pc.p[12], T = pc.p[14];
+	if (r >= gdi)
 		return;
-	uint h = r / pc.p[9], lane = gl_SubgroupInvocationID;
-	float dt = A[pc.p[1] + h];
-	float dA = exp(dt * wf(pc.p[5] + h));
-	float x = A[pc.p[0] + r];
-	float xdt = x * dt;
-	uint B = pc.p[0] + di, C = B + ds, st = pc.p[4] + r * ds;
-	float acc = 0.0;
-	for (uint n = lane; n < ds; n += gl_SubgroupSize) {
-		float sv = S[st + n] * dA + A[B + n] * xdt;
-		S[st + n] = sv;
-		acc += sv * A[C + n];
+	uint h = r / pc.p[13], lane = gl_SubgroupInvocationID, sg = gl_SubgroupSize;
+	uint st = pc.p[8] + r * ds, nk = (ds + sg - 1u) / sg;
+	float Ah = wf(pc.p[9] + h), Dh = wf(pc.p[10] + h);
+	float sv[SMAX];
+	for (uint k = 0u; k < SMAX; k++)
+		sv[k] = k < nk && lane + k * sg < ds ? S[st + lane + k * sg] : 0.0;
+	for (uint t = 0u; t < T; t++) {
+		uint xb = pc.p[0] + t * pc.p[1];
+		float dt = A[pc.p[2] + t * pc.p[3] + h];
+		float dA = exp(dt * Ah);
+		float x = A[xb + r];
+		float xdt = x * dt, acc = 0.0;
+		for (uint k = 0u; k < SMAX; k++) {
+			uint n = lane + k * sg;
+			if (k < nk && n < ds) {
+				sv[k] = sv[k] * dA + A[xb + gdi + n] * xdt;
+				acc += sv[k] * A[xb + gdi + ds + n];
+			}
+		}
+		acc = subgroupAdd(acc);
+		if (lane == 0u)
+			A[pc.p[6] + t * pc.p[7] + r] = (acc + Dh * x) * silu(A[pc.p[4] + t * pc.p[5] + r]);
 	}
-	acc = subgroupAdd(acc);
-	if (lane == 0u)
-		A[pc.p[3] + r] = (acc + wf(pc.p[6] + h) * x) * silu(A[pc.p[2] + r]);
+	for (uint k = 0u; k < SMAX; k++)
+		if (k < nk && lane + k * sg < ds)
+			S[st + lane + k * sg] = sv[k];
 }
-#elif OP == 4
-/* one workgroup per 256-block: v = a | silu(a)*b; ss_out[k] = sum v^2
- * (before weights); v *= w; q8k block k.
- * p: 0 a, 1 b (NONE: plain), 2 w (W words, NONE: none), 3 q_out (words),
- *    4 ss_out (A, per block; NONE: none) */
+#elif OP == 5
+/* bandwidth probe: p0 words to read (uvec4 units), p1 out (A) */
 void main()
 {
-	uint k = gl_WorkGroupID.x, i = 256u * k + gl_LocalInvocationID.x;
-	float v = A[pc.p[0] + i];
+	uint n = pc.p[0], i = gl_GlobalInvocationID.x, st = gl_NumWorkGroups.x * 256u;
+	uvec4 a = uvec4(0u);
+	for (; i < n; i += st)
+		a ^= uvec4(W[4u * i], W[4u * i + 1u], W[4u * i + 2u], W[4u * i + 3u]);
+	if ((a.x ^ a.y ^ a.z ^ a.w) == 0x12345678u)
+		A[pc.p[1]] = 1.0;
+}
+
+#elif OP == 4
+/* one workgroup per (256-block, token): v = a | silu(a)*b; ss_out[k] =
+ * sum v^2 (before weights); v *= w; q8k block k.
+ * p: 0 a, 1 b (NONE: plain), 2 w (W words, NONE: none), 3 q_out (words),
+ *    4 ss_out (A, per block; NONE: none), 5 a/b stride (floats),
+ *    6 q stride (words), 7 ss stride */
+void main()
+{
+	uint k = gl_WorkGroupID.x, t = gl_WorkGroupID.y;
+	uint i = 256u * k + gl_LocalInvocationID.x;
+	float v = A[pc.p[0] + t * pc.p[5] + i];
 	if (pc.p[1] != NONE)
-		v = silu(v) * A[pc.p[1] + i];
+		v = silu(v) * A[pc.p[1] + t * pc.p[5] + i];
 	if (pc.p[4] != NONE) {
-		float t = wg_sum(v * v);
+		float s = wg_sum(v * v);
 		if (gl_LocalInvocationID.x == 0u)
-			A[pc.p[4] + k] = t;
+			A[pc.p[4] + t * pc.p[7] + k] = s;
 	}
 	if (pc.p[2] != NONE)
 		v *= wf(pc.p[2] + i);
-	q8k_block(v, pc.p[3] + 73u * k);
+	q8k_block(v, pc.p[3] + t * pc.p[6] + 73u * k);
 }
 #endif

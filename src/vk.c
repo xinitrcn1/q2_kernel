@@ -10,7 +10,7 @@
 #include "gguf.h"
 #include "shaders.h"
 
-#define ACAP (320u * 1024u)      /* activation words per sequence */
+#define ACAP (3u << 20)          /* activation words per sequence */
 #define XQ_RES ACAP              /* reserved: q8k of the MoE input */
 #define ABUF (ACAP + 2048u)
 #define Q8W ((uint32_t)(sizeof(q8k) / 4))
@@ -19,6 +19,7 @@
 #define PIPE_CONV 21
 #define PIPE_SCAN 22
 #define PIPE_QBLK 23
+#define PIPE_BW 24
 #define UPCHUNK (32u << 20)
 
 static double
@@ -32,7 +33,7 @@ double vk_t_wait, vk_t_sub;
 long vk_n_sub;
 
 typedef struct {
-	uint32_t w_off, row_words, K, N, x_off, y_off;
+	uint32_t w_off, row_words, K, N, x_off, y_off, rps, T, x_stride, y_stride;
 } pushc;
 
 static struct {
@@ -56,7 +57,7 @@ static struct {
 	VkPipelineLayout pl;
 	VkDescriptorPool dp;
 	VkDescriptorSet ds;
-	VkPipeline pipe[32];
+	VkPipeline pipe[64];        /* type: 1-token tile; 32 + type: 8-token */
 	VkCommandPool cp;
 	VkCommandBuffer cb;
 	VkFence fence;
@@ -73,7 +74,8 @@ static struct {
 	struct { uint32_t off, n; float *dst; } dl[BMAX];
 	int inflight;
 	/* fused paths */
-	struct lay { int ok, hg; uint32_t an, cw, cb, dtb, a, d, sn, sconv, sssm; wt gin, gout; } *lay;
+	struct lay { int ok; uint32_t an, cw, cb, dtb, a, d, sn, sconv, sssm; } *lay;
+	int hg;                 /* decode: the GPU's heads per mixer */
 	int nlay;
 	wt lm;                  /* leading rows of the output projection */
 	int has_lm;
@@ -272,7 +274,7 @@ vk_init(size_t budget, size_t state_bytes, int devidx, int verbose)
 		fprintf(stderr, "vulkan: %s lacks subgroup arithmetic\n", V.name);
 		return -1;
 	}
-	V.rows_per_wg = 256 / sp.subgroupSize * 4;  /* RPS in matvec.comp */
+	V.rows_per_wg = 256 / sp.subgroupSize * 4;  /* at rps 4 */
 	V.sg_per_wg = 256 / sp.subgroupSize;
 
 	vkGetPhysicalDeviceQueueFamilyProperties(V.pd, &nqf, NULL);
@@ -438,7 +440,8 @@ vk_init(size_t budget, size_t state_bytes, int devidx, int verbose)
 	}
 	vkUpdateDescriptorSets(V.dev, 4, wr, 0, NULL);
 
-#define PIPE(t, a) (V.dot ? mkpipe(t, a, sizeof(a)) : mkpipe(t, a##_nd, sizeof(a##_nd)))
+#define PIPE(t, a) ((V.dot ? mkpipe(t, a, sizeof(a)) : mkpipe(t, a##_nd, sizeof(a##_nd))) || \
+	(V.dot ? mkpipe(32 + t, a##_b, sizeof(a##_b)) : mkpipe(32 + t, a##_ndb, sizeof(a##_ndb))))
 	if (PIPE(GT_Q2_K, spv_q2_k) || PIPE(GT_Q3_K, spv_q3_k) ||
 	    PIPE(GT_Q4_K, spv_q4_k) || PIPE(GT_Q5_K, spv_q5_k) ||
 	    PIPE(GT_Q6_K, spv_q6_k) || PIPE(GT_Q8_0, spv_q8_0))
@@ -446,7 +449,8 @@ vk_init(size_t budget, size_t state_bytes, int devidx, int verbose)
 #undef PIPE
 	if (mkpipe(PIPE_CONV, spv_op_conv, sizeof(spv_op_conv)) ||
 	    mkpipe(PIPE_SCAN, spv_op_scan, sizeof(spv_op_scan)) ||
-	    mkpipe(PIPE_QBLK, spv_op_qblk, sizeof(spv_op_qblk)))
+	    mkpipe(PIPE_QBLK, spv_op_qblk, sizeof(spv_op_qblk)) ||
+	    mkpipe(PIPE_BW, spv_op_bw, sizeof(spv_op_bw)))
 		return -1;
 
 	memset(&cpci, 0, sizeof(cpci));
@@ -489,7 +493,7 @@ vk_shutdown(void)
 	if (!V.dev)
 		return;
 	vkDeviceWaitIdle(V.dev);
-	for (i = 0; i < 32; i++)
+	for (i = 0; i < 64; i++)
 		if (V.pipe[i])
 			vkDestroyPipeline(V.dev, V.pipe[i], NULL);
 	if (V.fence) vkDestroyFence(V.dev, V.fence, NULL);
@@ -711,65 +715,47 @@ upload_rows(const wt *src, const int (*rg)[2], int nr, int kel, const char *name
 }
 
 /*
- * Mamba2 mixer split by SSM heads: the GPU owns heads [0, hg) -- its
- * rows of ssm_in (z, x, dt) plus the shared B/C rows, those conv
- * channels, those heads' scan and state, and the matching column slice
- * of ssm_out -- and the CPU the rest.  The gated RMS norm only scales
- * ssm_out's input, so each side returns a partial ssm_out(y*w) and its
- * sum of squares; out = (part_gpu + part_cpu) / rms.
+ * Mamba2 mixer resident in full: ssm_in, ssm_out, conv, norms and the
+ * conv/SSM state of every head.  Which heads the GPU computes is chosen
+ * per call: while decoding it takes heads [0, hg) and the CPU the rest
+ * concurrently (the gated RMS norm only rescales ssm_out's input, so
+ * each side returns ssm_out(y*w) over its columns and a sum of squares,
+ * out = (gpu + cpu) / rms); a batch of prompt tokens takes them all.
  */
 static void
-setup_mamba(const model *m, int il, int hg)
+setup_mamba(const model *m, int il)
 {
 	const hparams *h = &m->hp;
-	const layer *L = &m->L[il];
+	layer *L = (layer *)&m->L[il];
 	struct lay *ly = &V.lay[il];
-	const int P = h->ssm_head_dim, DI = h->d_inner, DS = h->d_state, E = h->n_embd;
-	const int gdi = hg * P, gch = gdi + 2 * DS;
-	int rin[4][2], rout[1][2], c;
-	size_t need = 3 * (size_t)gch + (size_t)gdi * (size_t)DS;
-	float *cw, *cb;
+	const size_t E = (size_t)h->n_embd, CH = (size_t)h->conv_ch, DI = (size_t)h->d_inner;
+	const size_t need = 3 * CH + DI * (size_t)h->d_state;
+	const size_t mark = V.wused;
+	int zero = 0;
 
-	if (L->attn || hg <= 0 || gdi % 256 || V.sused + need > V.scap)
+	if (L->attn || V.sused + need > V.scap)
 		return;
-	rin[0][0] = 0;                rin[0][1] = gdi;              /* z */
-	rin[1][0] = DI;               rin[1][1] = DI + gdi;         /* x */
-	rin[2][0] = 2 * DI;           rin[2][1] = 2 * DI + 2 * DS;  /* B, C */
-	rin[3][0] = 2 * DI + 2 * DS;  rin[3][1] = 2 * DI + 2 * DS + hg; /* dt */
-	rout[0][0] = 0;
-	rout[0][1] = E;
-	if (upload_rows(&L->ssm_in, (const int (*)[2])rin, 4, h->n_embd, "ssm_in[gpu heads]", &ly->gin) ||
-	    upload_rows(&L->ssm_out, (const int (*)[2])rout, 1, gdi, "ssm_out[gpu cols]", &ly->gout))
-		return;
-	cw = malloc(sizeof(float) * 4 * (size_t)gch);
-	cb = malloc(sizeof(float) * (size_t)gch);
-	if (!cw || !cb) {
-		free(cw);
-		free(cb);
-		return;
-	}
-	for (c = 0; c < gch; c++) {
-		int src = c < gdi ? c : DI + (c - gdi);
-		memcpy(cw + 4 * c, L->conv_w + 4 * src, 4 * sizeof(float));
-		cb[c] = L->conv_b[src];
-	}
-	ly->an = upload_raw(L->attn_norm, (size_t)E * 4);
-	ly->cw = upload_raw(cw, 4 * (size_t)gch * 4);
-	ly->cb = upload_raw(cb, (size_t)gch * 4);
-	free(cw);
-	free(cb);
-	ly->dtb = upload_raw(L->dt_b, (size_t)hg * 4);
-	ly->a = upload_raw(L->A, (size_t)hg * 4);
-	ly->d = upload_raw(L->D, (size_t)hg * 4);
-	ly->sn = upload_raw(L->ssm_norm, (size_t)gdi * 4);
+	if (vk_upload(&L->ssm_in, &zero, 1) || vk_upload(&L->ssm_out, &zero, 1))
+		goto undo;
+	ly->an = upload_raw(L->attn_norm, E * 4);
+	ly->cw = upload_raw(L->conv_w, 4 * CH * 4);
+	ly->cb = upload_raw(L->conv_b, CH * 4);
+	ly->dtb = upload_raw(L->dt_b, (size_t)h->ssm_heads * 4);
+	ly->a = upload_raw(L->A, (size_t)h->ssm_heads * 4);
+	ly->d = upload_raw(L->D, (size_t)h->ssm_heads * 4);
+	ly->sn = upload_raw(L->ssm_norm, DI * 4);
 	if (ly->an == NONE || ly->cw == NONE || ly->cb == NONE || ly->dtb == NONE ||
 	    ly->a == NONE || ly->d == NONE || ly->sn == NONE)
-		return;
+		goto undo;
 	ly->sconv = (uint32_t)V.sused;
-	ly->sssm = (uint32_t)(V.sused + 3 * (size_t)gch);
+	ly->sssm = (uint32_t)(V.sused + 3 * CH);
 	V.sused += need;
-	ly->hg = hg;
 	ly->ok = 1;
+	return;
+undo:
+	/* all or nothing: give the space back */
+	L->ssm_in.gpu_n = L->ssm_out.gpu_n = 0;
+	V.wused = mark;
 }
 
 /*
@@ -795,17 +781,18 @@ vk_plan_and_upload(model *m, int verbose)
 	hg = (int)(g_split * hp->ssm_heads / 4 + 0.5) * 4;
 	if (hg > hp->ssm_heads)
 		hg = hp->ssm_heads;
+	V.hg = hg;
 	V.nlay = nl;
 	V.lay = calloc((size_t)nl, sizeof(*V.lay));
 	b0 = V.wused;
 	for (l = 0; V.lay && l < nl; l++) {
-		setup_mamba(m, l, hg);
+		setup_mamba(m, l);
 		nmix += V.lay[l].ok;
 	}
 	if (V.lay)
 		vk_state_reset();
 	if (verbose)
-		fprintf(stderr, "vulkan: mixers: %d layers with %d/%d heads on the gpu (%.1f MiB)\n",
+		fprintf(stderr, "vulkan: mixers: %d layers resident, decoding %d/%d heads on the gpu (%.1f MiB)\n",
 		    nmix, hg, hp->ssm_heads, (V.wused - b0) / 1048576.0);
 
 	b0 = V.wused;
@@ -884,10 +871,6 @@ out:
 		hot += w->heat * (double)w->nbytes;
 		hot_gpu += w->heat * (double)w->nbytes * w->gpu_n / w->E;
 	}
-	for (l = 0; V.lay && l < nl; l++)
-		if (V.lay[l].ok)
-			hot_gpu += (double)(V.lay[l].gin.N * V.lay[l].gin.row_bytes +
-			    V.lay[l].gout.N * V.lay[l].gout.row_bytes);
 	if (V.has_lm)
 		hot_gpu += (double)V.lm.N * V.lm.row_bytes;
 	if (verbose)
@@ -1005,20 +988,36 @@ seq_pipe(uint32_t id)
 	}
 }
 
+/* rows [r0, r0+n) of expert e, first kel columns, for T tokens:
+ * Y[y + t*ys + (row - r0)] from q8k inputs at xq + t*xs (words) */
+static void
+seq_matmul(const wt *w, int e, uint32_t r0, uint32_t n, uint32_t kel, uint32_t xq,
+    uint32_t xs, uint32_t T, uint32_t y, uint32_t ys)
+{
+	pushc pc;
+	uint32_t per;
+	pc.w_off = (uint32_t)((w->gpu_off + ((uint64_t)w->gslot[e] * (uint64_t)w->N + r0) *
+	    w->gpu_row_bytes) / 4);
+	pc.row_words = (uint32_t)(w->gpu_row_bytes / 4);
+	pc.K = kel;
+	pc.N = n;
+	pc.x_off = xq;
+	pc.y_off = y;
+	pc.T = T;
+	pc.x_stride = xs;
+	pc.y_stride = ys;
+	/* big single-token matrices: 4 rows per subgroup amortize staging */
+	pc.rps = T == 1 ? 4 : 1;
+	per = V.sg_per_wg * pc.rps;
+	seq_pipe(T > 1 ? 32 + w->type : w->type);
+	vkCmdPushConstants(V.cb, V.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+	vkCmdDispatch(V.cb, (n + per - 1) / per, (T + 7) / 8, 1);
+}
+
 static void
 seq_matvec(const wt *w, int e, uint32_t xq, uint32_t y)
 {
-	pushc pc;
-	pc.w_off = (uint32_t)((w->gpu_off + (uint64_t)w->gslot[e] * (uint64_t)w->N *
-	    w->gpu_row_bytes) / 4);
-	pc.row_words = (uint32_t)(w->gpu_row_bytes / 4);
-	pc.K = (uint32_t)w->K;
-	pc.N = (uint32_t)w->N;
-	pc.x_off = xq;
-	pc.y_off = y;
-	seq_pipe(w->type);
-	vkCmdPushConstants(V.cb, V.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-	vkCmdDispatch(V.cb, (pc.N + V.rows_per_wg - 1) / V.rows_per_wg, 1, 1);
+	seq_matmul(w, e, 0, (uint32_t)w->N, (uint32_t)w->K, xq, 0, 1, y, 0);
 }
 
 static void
@@ -1038,6 +1037,21 @@ seq_qblk(uint32_t a, uint32_t b, uint32_t w, uint32_t q_out, uint32_t ss_out, ui
 	memset(p, 0, sizeof(p));
 	p[0] = a; p[1] = b; p[2] = w; p[3] = q_out; p[4] = ss_out;
 	seq_op(PIPE_QBLK, p, n / 256);
+}
+
+/* the same over T tokens: a/b at stride as (floats), q at qs (words),
+ * ss at sss */
+static void
+seq_qblk_t(uint32_t a, uint32_t b, uint32_t w, uint32_t q_out, uint32_t ss_out, uint32_t n,
+    uint32_t T, uint32_t as, uint32_t qs, uint32_t sss)
+{
+	uint32_t p[16];
+	memset(p, 0, sizeof(p));
+	p[0] = a; p[1] = b; p[2] = w; p[3] = q_out; p[4] = ss_out;
+	p[5] = as; p[6] = qs; p[7] = sss;
+	seq_pipe(PIPE_QBLK);
+	vkCmdPushConstants(V.cb, V.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, 64, p);
+	vkCmdDispatch(V.cb, n / 256, T, 1);
 }
 
 static void
@@ -1178,86 +1192,93 @@ vk_state_reset(void)
 	}
 }
 
-/* move the GPU heads' conv/SSM state of layer il between the GPU and
- * the CPU state arrays (to_gpu = 0: fetch, 1: store) */
+/* move the conv/SSM state of heads [h0, h1) of layer il, plus the
+ * shared B/C conv channels, between the GPU and the CPU arrays
+ * (to_gpu = 0: fetch, 1: store); the full state uses the CPU layout */
 void
-vk_state_sync(const model *m, state *st, int il, int to_gpu)
+vk_state_sync(const model *m, state *st, int il, int to_gpu, int h0, int h1)
 {
 	const hparams *h = &m->hp;
 	const struct lay *ly;
-	size_t CH, DI, gdi, gch, nconv, nssm, k, c;
-	float *cs, *ss, *hp;
+	size_t CH, DI, P, DS, c0, c1, k, nseg = 0, used = 0;
 	VkCommandBufferBeginInfo bi;
-	VkBufferCopy rg[2];
+	VkBufferCopy rg[8];
+	struct { float *cpu; size_t off, n; } seg[8];
 
-	if (!vk_mamba_ok(il))
+	if (!vk_mamba_ok(il) || h0 >= h1)
 		return;
 	ly = &V.lay[il];
 	CH = (size_t)h->conv_ch;
 	DI = (size_t)h->d_inner;
-	gdi = (size_t)ly->hg * (size_t)h->ssm_head_dim;
-	gch = gdi + 2 * (size_t)h->d_state;
-	nconv = 3 * gch;
-	nssm = gdi * (size_t)h->d_state;
-	if ((nconv + nssm) > ABUF)
-		return;
-	cs = st->conv[il];
-	ss = st->ssm[il];
-	hp = V.hmap;
-	vk_wait();
-	if (to_gpu) {
-		for (k = 0; k < 3; k++)
-			for (c = 0; c < gch; c++)
-				hp[k * gch + c] = cs[k * CH + (c < gdi ? c : DI + (c - gdi))];
-		memcpy(hp + nconv, ss, nssm * sizeof(float));
+	P = (size_t)h->ssm_head_dim;
+	DS = (size_t)h->d_state;
+	c0 = (size_t)h0 * P;
+	c1 = (size_t)h1 * P;
+	/* conv rows k: x channels [c0, c1) and B/C channels [DI, CH) */
+	for (k = 0; k < 3; k++) {
+		seg[nseg].cpu = st->conv[il] + k * CH + c0;
+		seg[nseg].off = ly->sconv + k * CH + c0;
+		seg[nseg++].n = c1 - c0;
+		seg[nseg].cpu = st->conv[il] + k * CH + DI;
+		seg[nseg].off = ly->sconv + k * CH + DI;
+		seg[nseg++].n = CH - DI;
 	}
+	seg[nseg].cpu = st->ssm[il] + c0 * DS;
+	seg[nseg].off = ly->sssm + c0 * DS;
+	seg[nseg++].n = (c1 - c0) * DS;
+	vk_wait();
+	for (k = 0; k < nseg; k++) {
+		if (to_gpu)
+			memcpy(V.hmap + used, seg[k].cpu, seg[k].n * sizeof(float));
+		rg[k].srcOffset = to_gpu ? used * 4 : (VkDeviceSize)seg[k].off * 4;
+		rg[k].dstOffset = to_gpu ? (VkDeviceSize)seg[k].off * 4 : used * 4;
+		rg[k].size = seg[k].n * 4;
+		used += seg[k].n;
+	}
+	if (used > ABUF)
+		return;
 	memset(&bi, 0, sizeof(bi));
 	bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
 	bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 	vkBeginCommandBuffer(V.cb, &bi);
-	rg[0].size = nconv * 4;
-	rg[1].size = nssm * 4;
-	if (to_gpu) {
-		rg[0].srcOffset = 0;
-		rg[0].dstOffset = (VkDeviceSize)ly->sconv * 4;
-		rg[1].srcOffset = nconv * 4;
-		rg[1].dstOffset = (VkDeviceSize)ly->sssm * 4;
-		vkCmdCopyBuffer(V.cb, V.hbuf, V.sbuf, 2, rg);
-	} else {
-		rg[0].srcOffset = (VkDeviceSize)ly->sconv * 4;
-		rg[0].dstOffset = 0;
-		rg[1].srcOffset = (VkDeviceSize)ly->sssm * 4;
-		rg[1].dstOffset = nconv * 4;
-		vkCmdCopyBuffer(V.cb, V.sbuf, V.hbuf, 2, rg);
+	if (to_gpu)
+		vkCmdCopyBuffer(V.cb, V.hbuf, V.sbuf, (uint32_t)nseg, rg);
+	else {
+		vkCmdCopyBuffer(V.cb, V.sbuf, V.hbuf, (uint32_t)nseg, rg);
 		barrier(VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT,
 		    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT);
 	}
 	vkEndCommandBuffer(V.cb);
 	submit_wait();
-	if (!to_gpu) {
-		for (k = 0; k < 3; k++)
-			for (c = 0; c < gch; c++)
-				cs[k * CH + (c < gdi ? c : DI + (c - gdi))] = hp[k * gch + c];
-		memcpy(ss, hp + nconv, nssm * sizeof(float));
-	}
+	if (!to_gpu)
+		for (k = 0, used = 0; k < nseg; k++) {
+			memcpy(seg[k].cpu, V.hmap + used, seg[k].n * sizeof(float));
+			used += seg[k].n;
+		}
 }
 
 int
 vk_mamba_heads(int il)
 {
-	return vk_mamba_ok(il) ? V.lay[il].hg : 0;
+	return vk_mamba_ok(il) ? V.hg : 0;
 }
 
-/* GPU half of a split Mamba2 mixer (async; vk_wait delivers out[E],
- * the partial ssm_out of the GPU heads, and *ss, their sum of y^2) */
+/*
+ * GPU part of a Mamba2 mixer for heads [0, hg) and T tokens (async;
+ * vk_wait delivers): xq holds T q8k vectors of attn_norm(x); out[t*E]
+ * gets ssm_out(y*w) over those heads' columns, ss[t*nb] the per-256
+ * sums of y^2 (nb = hg*head_dim/256).
+ */
 void
-vk_mamba_submit(const model *m, int il, const q8k *xq, float *out, float *ss)
+vk_mamba_submit(const model *m, int il, const q8k *xq, int T, int hg, float *out, float *ss)
 {
 	const hparams *h = &m->hp;
+	const layer *L = &m->L[il];
 	const struct lay *ly = &V.lay[il];
-	const uint32_t E = (uint32_t)h->n_embd, DS = (uint32_t)h->d_state;
-	const uint32_t gdi = (uint32_t)(ly->hg * h->ssm_head_dim), gch = gdi + 2 * DS;
-	const uint32_t hg = (uint32_t)ly->hg;
+	const uint32_t E = (uint32_t)h->n_embd, DS = (uint32_t)h->d_state, DI = (uint32_t)h->d_inner;
+	const uint32_t gdi = (uint32_t)hg * (uint32_t)h->ssm_head_dim, gch = gdi + 2 * DS;
+	const uint32_t zs = 2 * gdi + 2 * DS + (uint32_t)hg, eb = E / 256 * Q8W, nb = gdi / 256;
+	const uint32_t t = (uint32_t)T;
 	uint32_t q1, zx, xbc, dt, y, q2, o, sso, p[16];
 
 	seq_begin();
@@ -1265,35 +1286,41 @@ vk_mamba_submit(const model *m, int il, const q8k *xq, float *out, float *ss)
 		vkCmdResetQueryPool(V.cb, V.qp, 0, 16);
 		V.nts = 0;
 	}
-	q1 = seq_put(xq, E / 256 * Q8W);
+	q1 = seq_put(xq, t * eb);
 	seq_flush_up();
 	ts();
 	ts();
-	zx = seq_alloc((uint32_t)ly->gin.N);
-	seq_matvec(&ly->gin, 0, q1, zx);
+	/* zx per token: [z (gdi) | x (gdi) | B, C | dt (hg)] */
+	zx = seq_alloc(t * zs);
+	seq_matmul(&L->ssm_in, 0, 0, gdi, E, q1, eb, t, zx, zs);
+	seq_matmul(&L->ssm_in, 0, DI, gdi, E, q1, eb, t, zx + gdi, zs);
+	seq_matmul(&L->ssm_in, 0, 2 * DI, 2 * DS + (uint32_t)hg, E, q1, eb, t, zx + 2 * gdi, zs);
 	cbar();
-	xbc = seq_alloc(gch);
-	dt = seq_alloc(hg);
+	xbc = seq_alloc(t * gch);
+	dt = seq_alloc(t * (uint32_t)hg);
 	memset(p, 0, sizeof(p));
-	p[0] = zx + gdi; p[1] = zx + gdi + gch; p[2] = xbc; p[3] = dt; p[4] = ly->sconv;
-	p[5] = ly->cw; p[6] = ly->cb; p[7] = ly->dtb; p[8] = gch; p[9] = hg;
+	p[0] = zx; p[1] = zs; p[2] = xbc; p[3] = gch; p[4] = dt; p[5] = (uint32_t)hg;
+	p[6] = ly->sconv; p[7] = ly->cw; p[8] = ly->cb; p[9] = ly->dtb;
+	p[10] = gch; p[11] = (uint32_t)hg; p[12] = gdi; p[13] = DI; p[14] = (uint32_t)h->conv_ch;
+	p[15] = t;
 	seq_op(PIPE_CONV, p, (gch + 255) / 256);
 	cbar();
-	y = seq_alloc(gdi);
+	y = seq_alloc(t * gdi);
 	memset(p, 0, sizeof(p));
-	p[0] = xbc; p[1] = dt; p[2] = zx; p[3] = y; p[4] = ly->sssm; p[5] = ly->a; p[6] = ly->d;
-	p[7] = gdi; p[8] = DS; p[9] = (uint32_t)h->ssm_head_dim;
+	p[0] = xbc; p[1] = gch; p[2] = dt; p[3] = (uint32_t)hg; p[4] = zx; p[5] = zs;
+	p[6] = y; p[7] = gdi; p[8] = ly->sssm; p[9] = ly->a; p[10] = ly->d;
+	p[11] = gdi; p[12] = DS; p[13] = (uint32_t)h->ssm_head_dim; p[14] = t;
 	seq_op(PIPE_SCAN, p, (gdi + V.sg_per_wg - 1) / V.sg_per_wg);
 	cbar();
-	q2 = seq_alloc(gdi / 256 * Q8W);
-	sso = seq_alloc(gdi / 256);
-	seq_qblk(y, NONE, ly->sn, q2, sso, gdi);
+	q2 = seq_alloc(t * nb * Q8W);
+	sso = seq_alloc(t * nb);
+	seq_qblk_t(y, NONE, ly->sn, q2, sso, gdi, t, gdi, nb * Q8W, nb);
 	cbar();
-	o = seq_alloc(E);
-	seq_matvec(&ly->gout, 0, q2, o);
+	o = seq_alloc(t * E);
+	seq_matmul(&L->ssm_out, 0, 0, E, gdi, q2, nb * Q8W, t, o, E);
 	ts();
-	seq_get(o, E, out);
-	seq_get(sso, gdi / 256, ss);
+	seq_get(o, t * E, out);
+	seq_get(sso, t * nb, ss);
 	seq_submit();
 }
 
@@ -1319,6 +1346,33 @@ vk_prof_collect(void)
 		V.nts = 0;
 		V.moe_prof = 0;
 	}
+}
+
+/* read the first `bytes` of the weight arena with a trivial shader;
+ * returns GB/s (best of a few runs) */
+double
+vk_bandwidth(size_t bytes, uint32_t groups)
+{
+	double best = 0;
+	int r;
+	if (!V.ok || bytes > V.wused)
+		bytes = V.wused;
+	for (r = 0; r < 5; r++) {
+		uint32_t p[16];
+		double t0;
+		memset(p, 0, sizeof(p));
+		p[0] = (uint32_t)(bytes / 16);
+		p[1] = 0;
+		seq_begin();
+		seq_op(PIPE_BW, p, groups);
+		t0 = vnow();
+		seq_submit();
+		vk_wait();
+		t0 = vnow() - t0;
+		if (bytes / t0 / 1e9 > best)
+			best = bytes / t0 / 1e9;
+	}
+	return best;
 }
 
 void

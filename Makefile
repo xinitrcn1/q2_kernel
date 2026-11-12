@@ -19,7 +19,8 @@ LDLIBS+=	-lvulkan -lpthread -lm
 GLSLANG?=	glslangValidator
 
 OBJS=		${SRCS:%.c=build/%.o}
-SPVH=		${QTYPES:%=gen/spv_%.h} ${QTYPES:%=gen/spv_%_nd.h}
+SPVH=		${QTYPES:%=gen/spv_%.h} ${QTYPES:%=gen/spv_%_nd.h} \
+		${QTYPES:%=gen/spv_%_b.h} ${QTYPES:%=gen/spv_%_ndb.h}
 
 all: ${PROG}
 
@@ -34,7 +35,8 @@ build/${s:R}.o: src/${s} ${HDRS:%=src/%}
 
 build/vk.o: gen/shaders.h
 
-# per type: a DP4A variant and one with an emulated dot (_nd)
+# per type: DP4A and emulated-dot (_nd) variants, each with a 1-token
+# (decode) and an 8-token (_b, batched) tile
 .for t in ${QTYPES}
 gen/spv_${t}.h: shaders/matvec.comp
 	@mkdir -p gen
@@ -44,9 +46,17 @@ gen/spv_${t}_nd.h: shaders/matvec.comp
 	@mkdir -p gen
 	${GLSLANG} -V --target-env vulkan1.1 -DQT=${QT.${t}} -DNO_DOT --vn spv_${t}_nd \
 	    -o ${.TARGET} shaders/matvec.comp >/dev/null
+gen/spv_${t}_b.h: shaders/matvec.comp
+	@mkdir -p gen
+	${GLSLANG} -V --target-env vulkan1.1 -DQT=${QT.${t}} -DTT=8u --vn spv_${t}_b \
+	    -o ${.TARGET} shaders/matvec.comp >/dev/null
+gen/spv_${t}_ndb.h: shaders/matvec.comp
+	@mkdir -p gen
+	${GLSLANG} -V --target-env vulkan1.1 -DQT=${QT.${t}} -DNO_DOT -DTT=8u --vn spv_${t}_ndb \
+	    -o ${.TARGET} shaders/matvec.comp >/dev/null
 .endfor
 
-OPS=		conv:2 scan:3 qblk:4
+OPS=		conv:2 scan:3 qblk:4 bw:5
 .for o in ${OPS}
 gen/spv_op_${o:C/:.*//}.h: shaders/ops.comp
 	@mkdir -p gen

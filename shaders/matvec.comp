@@ -1,14 +1,18 @@
 #version 450
 /*
- * y[row] = dot(W[row], x) for one quantized weight type (QT), with x
- * given as q8k blocks (per 256 elements: float d, int8 qs[256],
- * int16 bsums[16] = 73 words) -- the CPU path's activation format.
+ * Y[t][row] = dot(W[row], x_t) for one quantized weight type (QT) and
+ * T tokens (T = 1: a matvec), with x_t given as q8k blocks (per 256
+ * elements: float d, int8 qs[256], int16 bsums[16] = 73 words) -- the
+ * CPU path's activation format.
  *
- * Every K-quant weight is a*u - b with u a small unsigned integer, so
- * each 4 weights times 4 activations is one packed 4x8-bit dot (DP4A):
- *     sum(w*x) = dx * (a * sum(u*xq) - b * sum(xq))
- * One subgroup per row; 16 lanes per 256-weight block, each lane takes
- * one word of quants through all of its bit planes (16 weights).
+ * Every weight is A*u + B with u a small unsigned (Q8_0: signed)
+ * integer, so 4 weights times 4 activations is one packed 4x8-bit dot
+ * (DP4A) plus one against ones for the B term.  Each lane takes 16
+ * weights of a 256-block (16 lanes per block); its unit decodes them
+ * once into four groups (packed weights, x offset, A, B) and then dots
+ * them with every staged token.  One subgroup per row; a workgroup
+ * covers 8 rows (x pc.rps) and a tile of up to TT tokens, staged in
+ * shared memory.
  *
  * Blocks were repacked on upload so each starts on a 4-byte boundary:
  *   Q2_K  84 B: sc[16] qs[64] d dmin
@@ -20,17 +24,19 @@
  */
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : require
 #ifndef NO_DOT
 #extension GL_EXT_integer_dot_product : require
 #endif
 
 layout(local_size_x = 256) in;
-#ifndef RPS
-#define RPS 4u
-#endif
 
-/* the input vector, staged once per workgroup (K <= 4096) */
-#define XMAX (16u * 73u)
+/* token tile: 1 for decode (small shared memory: full occupancy), 8
+ * for batches; staged tokens: TT x (K/256) q8k blocks, K <= 3072 */
+#ifndef TT
+#define TT 1u
+#endif
+#define XMAX (TT * 12u * 73u)
 shared uint xs[XMAX];
 
 layout(std430, binding = 0) readonly buffer Wb { uint W[]; };
@@ -42,8 +48,12 @@ layout(push_constant) uniform PC {
 	uint row_words;
 	uint K;
 	uint N;
-	uint x_off;     /* words: first q8k block */
+	uint x_off;     /* words: first q8k block of token 0 */
 	uint y_off;     /* floats */
+	uint rps;       /* consecutive rows per subgroup */
+	uint T;         /* tokens */
+	uint x_stride;  /* words between tokens */
+	uint y_stride;  /* floats between tokens */
 } pc;
 
 #define ONES 0x01010101u
@@ -60,52 +70,61 @@ int idot(uint a, uint b) { return dotPacked4x8EXT(int(a), int(b)); }
 #endif
 
 uint b8(uint w, uint i) { return (w >> (8u * i)) & 0xffu; }
-/* byte i of the block starting at word bw */
-uint bb(uint bw, uint i) { return b8(W[bw + (i >> 2)], i & 3u); }
-/* activation word holding elements e..e+3 of the q8k block at xb
- * (xb is relative to the staged copy) */
-uint xw(uint xb, uint e) { return xs[xb + 1u + (e >> 2)]; }
 
-#if QT == 10 /* Q2_K */
+/* a lane's 16 weights as four groups of four:
+ *   sum = D * sum_j sa_j*dot(q_j, x) + M * sum_j sb_j*dot(1, x)
+ * (integer scales: two conversions per token, not eight) */
+struct grp {
+	uint q[4];      /* packed weights */
+	uint o[4];      /* element offset in the block */
+	int sa[4], sb[4];
+	float D, M;
+};
+
+#if QT == 10 /* Q2_K: w = d*sc*u - dmin*m */
 #define BW 21u
-float unit(uint bw, uint l, uint xb)
+#define BE 256u
+void dec(uint bw, uint l, out grp g)
 {
 	uint c = l >> 3, o = (4u * l) & 31u, h = o >> 4;
 	uint q = W[bw + 4u + l];
 	uint s0 = W[bw + 2u * c] >> (8u * h), s1 = W[bw + 2u * c + 1u] >> (8u * h);
 	uint sc[4] = uint[4](s0 & 0xffu, (s0 >> 16) & 0xffu, s1 & 0xffu, (s1 >> 16) & 0xffu);
-	int is = 0, ms = 0;
-	for (uint j = 0u; j < 4u; j++) {
-		uint x = xw(xb, 128u * c + 32u * j + o);
-		is += int(sc[j] & 15u) * idot((q >> (2u * j)) & 0x03030303u, x);
-		ms += int(sc[j] >> 4) * idot(ONES, x);
-	}
 	vec2 dm = unpackHalf2x16(W[bw + 20u]);
-	return dm.x * float(is) - dm.y * float(ms);
+	[[unroll]] for (uint j = 0u; j < 4u; j++) {
+		g.q[j] = (q >> (2u * j)) & 0x03030303u;
+		g.o[j] = 128u * c + 32u * j + o;
+		g.sa[j] = int(sc[j] & 15u);
+		g.sb[j] = int(sc[j] >> 4);
+	}
+	g.D = dm.x;
+	g.M = -dm.y;
 }
-#elif QT == 11 /* Q3_K */
+#elif QT == 11 /* Q3_K: w = d*sc*(u - 4) */
 #define BW 28u
-float unit(uint bw, uint l, uint xb)
+#define BE 256u
+void dec(uint bw, uint l, out grp g)
 {
 	uint c = l >> 3, o = (4u * l) & 31u, h = o >> 4;
 	uint q = W[bw + 8u + l];
 	uint hm = W[bw + (o >> 2)];
 	uint lo0 = W[bw + 24u] >> (8u * h), lo1 = W[bw + 25u] >> (8u * h);
 	uint hi = W[bw + 26u] >> (8u * h);
-	int is = 0;
-	for (uint j = 0u; j < 4u; j++) {
+	float d = unpackHalf2x16(W[bw + 27u]).x;
+	[[unroll]] for (uint j = 0u; j < 4u; j++) {
 		uint lw = j < 2u ? lo0 : lo1;
 		uint lo = (lw >> (16u * (j & 1u) + 4u * c)) & 15u;
 		uint hb = (hi >> (16u * (j & 1u) + 2u * (2u * c + (j >> 1)))) & 3u;
 		int sc = int(lo | (hb << 4)) - 32;
-		uint x = xw(xb, 128u * c + 32u * j + o);
-		uint u = ((q >> (2u * j)) & 0x03030303u) |
-		    (((hm >> (4u * c + j)) & ONES) << 2);
-		is += sc * (idot(u, x) - 4 * idot(ONES, x));
+		g.q[j] = ((q >> (2u * j)) & 0x03030303u) | (((hm >> (4u * c + j)) & ONES) << 2);
+		g.o[j] = 128u * c + 32u * j + o;
+		g.sa[j] = sc;
+		g.sb[j] = -4 * sc;
 	}
-	return unpackHalf2x16(W[bw + 27u]).x * float(is);
+	g.D = d;
+	g.M = d;
 }
-#elif QT == 12 || QT == 13 /* Q4_K, Q5_K */
+#elif QT == 12 || QT == 13 /* Q4_K, Q5_K: w = d*sc*u - dmin*mn */
 #if QT == 12
 #define BW 36u
 #define QS 4u
@@ -113,25 +132,21 @@ float unit(uint bw, uint l, uint xb)
 #define BW 44u
 #define QS 12u
 #endif
-/* the 6-bit scales/mins as whole words (four per word); the word forms
- * are the ones proved equal to the byte-wise unpacking (see kq.c) */
-void k4(uint bw, uint c, out int s0, out int m0, out int s1, out int m1)
-{
-	uint a0 = W[bw + 1u], a1 = W[bw + 2u], a2 = W[bw + 3u];
-	uint sc = c < 2u ? a0 & 0x3f3f3f3fu : (a2 & 0x0f0f0f0fu) | (((a0 >> 6) & 0x03030303u) << 4);
-	uint mn = c < 2u ? a1 & 0x3f3f3f3fu : ((a2 >> 4) & 0x0f0f0f0fu) | (((a1 >> 6) & 0x03030303u) << 4);
-	uint sh = 16u * (c & 1u);
-	s0 = int((sc >> sh) & 255u);
-	s1 = int((sc >> (sh + 8u)) & 255u);
-	m0 = int((mn >> sh) & 255u);
-	m1 = int((mn >> (sh + 8u)) & 255u);
-}
-float unit(uint bw, uint l, uint xb)
+#define BE 256u
+void dec(uint bw, uint l, out grp g)
 {
 	uint c = l >> 2, l0 = (8u * l) & 31u;
-	int s0, m0, s1, m1, a0 = 0, a1 = 0, x0 = 0, x1 = 0;
-	k4(bw, c, s0, m0, s1, m1);
-	for (uint k = 0u; k < 2u; k++) {
+	/* 6-bit scales/mins as whole words (the forms proved for kq.c) */
+	uint a0 = W[bw + 1u], a1 = W[bw + 2u], a2 = W[bw + 3u];
+	uint scw = c < 2u ? a0 & 0x3f3f3f3fu : (a2 & 0x0f0f0f0fu) | (((a0 >> 6) & 0x03030303u) << 4);
+	uint mnw = c < 2u ? a1 & 0x3f3f3f3fu : ((a2 >> 4) & 0x0f0f0f0fu) | (((a1 >> 6) & 0x03030303u) << 4);
+	uint sh = 16u * (c & 1u);
+	vec2 dm = unpackHalf2x16(W[bw]);
+	int s0 = int((scw >> sh) & 255u), s1 = int((scw >> (sh + 8u)) & 255u);
+	int m0 = int((mnw >> sh) & 255u), m1 = int((mnw >> (sh + 8u)) & 255u);
+	g.D = dm.x;
+	g.M = -dm.y;
+	[[unroll]] for (uint k = 0u; k < 2u; k++) {
 		uint q = W[bw + QS + 2u * l + k];
 		uint lo = q & 0x0f0f0f0fu, hi = (q >> 4) & 0x0f0f0f0fu;
 #if QT == 13
@@ -139,45 +154,54 @@ float unit(uint bw, uint l, uint xb)
 		lo |= ((qh >> (2u * c)) & ONES) << 4;
 		hi |= ((qh >> (2u * c + 1u)) & ONES) << 4;
 #endif
-		uint xa = xw(xb, 64u * c + l0 + 4u * k);
-		uint xc = xw(xb, 64u * c + 32u + l0 + 4u * k);
-		a0 += idot(lo, xa);
-		a1 += idot(hi, xc);
-		x0 += idot(ONES, xa);
-		x1 += idot(ONES, xc);
+		g.q[2u * k] = lo;
+		g.o[2u * k] = 64u * c + l0 + 4u * k;
+		g.sa[2u * k] = s0;
+		g.sb[2u * k] = m0;
+		g.q[2u * k + 1u] = hi;
+		g.o[2u * k + 1u] = 64u * c + 32u + l0 + 4u * k;
+		g.sa[2u * k + 1u] = s1;
+		g.sb[2u * k + 1u] = m1;
 	}
-	vec2 dm = unpackHalf2x16(W[bw]);
-	return dm.x * float(s0 * a0 + s1 * a1) - dm.y * float(m0 * x0 + m1 * x1);
 }
-#elif QT == 14 /* Q6_K */
+#elif QT == 14 /* Q6_K: w = d*sc*(u - 32) */
 #define BW 53u
-float unit(uint bw, uint l, uint xb)
+#define BE 256u
+void dec(uint bw, uint l, out grp g)
 {
 	uint c = l >> 3, l0 = 4u * (l & 7u);
 	uint la = W[bw + 16u * c + (l0 >> 2)], lb = W[bw + 16u * c + 8u + (l0 >> 2)];
 	uint hh = W[bw + 32u + 8u * c + (l0 >> 2)];
 	uint sw0 = W[bw + 48u + 2u * c], sw1 = W[bw + 49u + 2u * c];
-	int is = 0;
-	for (uint t = 0u; t < 4u; t++) {
+	float d = unpackHalf2x16(W[bw + 52u]).x;
+	[[unroll]] for (uint t = 0u; t < 4u; t++) {
 		uint w = (t & 1u) != 0u ? lb : la;
 		uint u = ((t & 2u) != 0u ? (w >> 4) : w) & 0x0f0f0f0fu;
-		u |= ((hh >> (2u * t)) & 0x03030303u) << 4;
-		uint sb = 2u * t + (l0 >> 4); /* scale byte within the chunk's 8 */
+		uint sb = 2u * t + (l0 >> 4);
 		int sc = int((sb < 4u ? sw0 : sw1) << (24u - 8u * (sb & 3u))) >> 24;
-		uint x = xw(xb, 128u * c + 32u * t + l0);
-		is += sc * (idot(u, x) - 32 * idot(ONES, x));
+		g.q[t] = u | (((hh >> (2u * t)) & 0x03030303u) << 4);
+		g.o[t] = 128u * c + 32u * t + l0;
+		g.sa[t] = sc;
+		g.sb[t] = -32 * sc;
 	}
-	return unpackHalf2x16(W[bw + 52u]).x * float(is);
+	g.D = d;
+	g.M = d;
 }
-#elif QT == 8 /* Q8_0 */
+#elif QT == 8 /* Q8_0: w = d*q (signed) */
 #define BW 72u
-float unit(uint bw, uint l, uint xb)
+#define BE 256u
+void dec(uint bw, uint l, out grp g)
 {
 	uint qb = bw + 9u * (l >> 1), base = 4u * (l & 1u);
-	int is = 0;
-	for (uint k = 0u; k < 4u; k++)
-		is += idot(W[qb + base + k], xw(xb, 16u * l + 4u * k));
-	return unpackHalf2x16(W[qb + 8u]).x * float(is);
+	float d = unpackHalf2x16(W[qb + 8u]).x;
+	[[unroll]] for (uint k = 0u; k < 4u; k++) {
+		g.q[k] = W[qb + base + k];
+		g.o[k] = 16u * l + 4u * k;
+		g.sa[k] = 1;
+		g.sb[k] = 0;
+	}
+	g.D = d;
+	g.M = 0.0;
 }
 #else
 #error "QT"
@@ -185,27 +209,51 @@ float unit(uint bw, uint l, uint xb)
 
 void main()
 {
-	uint nx = (pc.K >> 8) * 73u;
-	for (uint i = gl_LocalInvocationID.x; i < nx; i += gl_WorkGroupSize.x)
-		xs[i] = X[pc.x_off + i];
+	uint nb = pc.K >> 8, xw = nb * 73u;
+	uint t0 = gl_WorkGroupID.y * TT, nt = min(TT, pc.T - t0);
+
+	for (uint i = gl_LocalInvocationID.x; i < nt * xw; i += gl_WorkGroupSize.x) {
+		uint t = i / xw;
+		xs[i] = X[pc.x_off + (t0 + t) * pc.x_stride + (i - t * xw)];
+	}
 	barrier();
 
-	/* RPS consecutive rows per subgroup: the staged x serves more rows */
 	uint lane = gl_SubgroupInvocationID;
-	uint nu = (pc.K >> 8) * 16u;
-	uint row0 = (gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID) * RPS;
-	for (uint rr = 0u; rr < RPS; rr++) {
+	uint nu = nb * 16u;
+	uint row0 = (gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID) * pc.rps;
+	for (uint rr = 0u; rr < pc.rps; rr++) {
 		uint row = row0 + rr;
 		if (row >= pc.N)
 			return;
 		uint base = pc.w_off + row * pc.row_words;
-		float sum = 0.0;
+		/* fixed trip counts, fully unrolled: everything stays in
+		 * registers (a runtime-bounded array would spill) */
+		float acc[TT];
+		[[unroll]] for (uint t = 0u; t < TT; t++)
+			acc[t] = 0.0;
 		for (uint i = lane; i < nu; i += gl_SubgroupSize) {
-			uint b = i >> 4, xb = 73u * b;
-			sum += uintBitsToFloat(xs[xb]) * unit(base + b * BW, i & 15u, xb);
+			uint b = i >> 4;
+			grp g;
+			dec(base + b * BW, i & 15u, g);
+			[[unroll]] for (uint t = 0u; t < TT; t++) {
+				if (t < nt) {
+					uint xb = t * xw + 73u * b;
+					int ia = 0, ib = 0;
+					[[unroll]] for (uint j = 0u; j < 4u; j++) {
+						uint x = xs[xb + 1u + (g.o[j] >> 2)];
+						ia += g.sa[j] * idot(g.q[j], x);
+						ib += g.sb[j] * idot(ONES, x);
+					}
+					acc[t] += uintBitsToFloat(xs[xb]) * (g.D * float(ia) + g.M * float(ib));
+				}
+			}
 		}
-		sum = subgroupAdd(sum);
-		if (lane == 0u)
-			Y[pc.y_off + row] = sum;
+		[[unroll]] for (uint t = 0u; t < TT; t++) {
+			if (t < nt) {
+				float v = subgroupAdd(acc[t]);
+				if (lane == 0u)
+					Y[pc.y_off + (t0 + t) * pc.y_stride + row] = v;
+			}
+		}
 	}
 }
