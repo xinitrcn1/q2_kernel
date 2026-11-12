@@ -196,7 +196,9 @@ vk_init(size_t budget, int devidx, int verbose)
 	VkCommandBufferAllocateInfo cbai;
 	VkFenceCreateInfo fci;
 	VkPhysicalDeviceShaderIntegerDotProductFeatures idf;
-	const char *dotext = VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME;
+	const char *exts[2];
+	uint32_t next = 0;
+	int has_budget = 0;
 	void *p;
 
 	memset(&V, 0, sizeof(V));
@@ -276,9 +278,12 @@ vk_init(size_t budget, int devidx, int verbose)
 		vkEnumerateDeviceExtensionProperties(V.pd, NULL, &ne, NULL);
 		ep = calloc(ne ? ne : 1, sizeof(*ep));
 		if (ep && vkEnumerateDeviceExtensionProperties(V.pd, NULL, &ne, ep) == VK_SUCCESS)
-			for (i = 0; i < ne; i++)
+			for (i = 0; i < ne; i++) {
 				if (!strcmp(ep[i].extensionName, VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME))
 					V.dot = 1;
+				else if (!strcmp(ep[i].extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME))
+					has_budget = 1;
+			}
 		free(ep);
 	}
 	memset(&idf, 0, sizeof(idf));
@@ -299,15 +304,48 @@ vk_init(size_t budget, int devidx, int verbose)
 	dci.pQueueCreateInfos = &qi;
 	if (V.dot) {
 		dci.pNext = &idf;
-		dci.enabledExtensionCount = 1;
-		dci.ppEnabledExtensionNames = &dotext;
+		exts[next++] = VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME;
 	}
+	if (has_budget)
+		exts[next++] = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME;
+	dci.enabledExtensionCount = next;
+	dci.ppEnabledExtensionNames = exts;
 	CK(vkCreateDevice(V.pd, &dci, NULL, &V.dev));
 	vkGetDeviceQueue(V.dev, V.qf, 0, &V.q);
 
-	V.wcap = budget;
-	if (V.wcap < 4096)
-		V.wcap = 4096;
+	/* keep every allocation of ours inside the VRAM that is free:
+	 * at most VK_VRAM_LIMIT, and the driver's budget for the heap when
+	 * VK_EXT_memory_budget reports it */
+	{
+		size_t limit = VK_VRAM_LIMIT, other = (size_t)(XCAP + YCAP) * 4 + ((size_t)32 << 20);
+		if (has_budget) {
+			VkPhysicalDeviceMemoryBudgetPropertiesEXT mb;
+			VkPhysicalDeviceMemoryProperties2 mp2;
+			uint32_t h, t;
+			memset(&mb, 0, sizeof(mb));
+			mb.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+			memset(&mp2, 0, sizeof(mp2));
+			mp2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2;
+			mp2.pNext = &mb;
+			vkGetPhysicalDeviceMemoryProperties2(V.pd, &mp2);
+			/* the heap our device-local buffers come from */
+			for (t = 0; t < V.mp.memoryTypeCount; t++)
+				if ((V.mp.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
+				    !(V.mp.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))
+					break;
+			h = t < V.mp.memoryTypeCount ? V.mp.memoryTypes[t].heapIndex : 0;
+			if (mb.heapBudget[h] && mb.heapBudget[h] - mb.heapUsage[h] < limit)
+				limit = (size_t)(mb.heapBudget[h] - mb.heapUsage[h]);
+		}
+		V.wcap = budget;
+		if (V.wcap + other > limit) {
+			V.wcap = limit > other ? limit - other : 0;
+			fprintf(stderr, "vulkan: weight budget clamped to %zu MiB (VRAM available %zu MiB)\n",
+			    V.wcap >> 20, limit >> 20);
+		}
+		if (V.wcap < 4096)
+			V.wcap = 4096;
+	}
 	if (mkbuf(V.wcap, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
 	    0, &V.wbuf, &V.wmem, NULL))
 		return -1;
@@ -494,122 +532,154 @@ flush_upload(size_t n, uint64_t dst)
 }
 
 static size_t
-gpu_bytes(const wt *w, int rows)
+expert_bytes(const wt *w)
 {
 	size_t sb = ggml_type_bytes(w->type), db = gpu_block_bytes(w->type);
-	return (size_t)rows * (w->row_bytes / sb * db) * (size_t)w->E;
+	return (size_t)w->N * (w->row_bytes / sb * db);
 }
 
 int
-vk_upload(wt *w, int rows)
+vk_upload(wt *w, const int *ex, int n)
 {
-	size_t sb, db, rb, grb, fill = 0, total;
-	uint64_t base = V.wused, flushed = V.wused;
-	int e, r;
+	size_t sb, db, rb, grb, eb, fill = 0, total;
+	uint64_t base, flushed;
+	int k, r;
 	void *p;
 
-	if (!V.ok || !V.pipe[w->type] || rows <= 0)
+	if (!V.ok || !V.pipe[w->type] || n <= 0 || w->gpu_n)
 		return -1;
-	if (rows > w->N)
-		rows = w->N;
 	sb = ggml_type_bytes(w->type);
 	db = gpu_block_bytes(w->type);
 	rb = w->row_bytes;
 	grb = rb / sb * db;
-	total = gpu_bytes(w, rows);
+	eb = expert_bytes(w);
+	total = eb * (size_t)n;
 	if (V.wused + total > V.wcap)
+		return -1;
+	if (!w->gslot && !(w->gslot = malloc(sizeof(int) * (size_t)w->E)))
 		return -1;
 	if (!V.ubuf) {
 		if (mkbuf(UPCHUNK, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, 1, &V.ubuf, &V.umem, &p))
 			return -1;
 		V.umap = p;
 	}
-	/* rows [0, rows) of each expert, packed expert after expert */
-	for (e = 0; e < w->E; e++)
-		for (r = 0; r < rows; r++) {
+	base = flushed = V.wused;
+	for (k = 0; k < w->E; k++)
+		w->gslot[k] = -1;
+	/* experts packed in slot order */
+	for (k = 0; k < n; k++) {
+		const uint8_t *src = w->data + (size_t)ex[k] * (size_t)w->N * rb;
+		for (r = 0; r < w->N; r++) {
 			if (fill + grb > UPCHUNK) {
 				if (flush_upload(fill, flushed))
 					return -1;
 				flushed += fill;
 				fill = 0;
 			}
-			repack(w->type, w->data + ((size_t)e * (size_t)w->N + (size_t)r) * rb,
-			    V.umap + fill, rb / sb);
+			repack(w->type, src + (size_t)r * rb, V.umap + fill, rb / sb);
 			fill += grb;
 		}
+		w->gslot[ex[k]] = k;
+	}
 	if (flush_upload(fill, flushed))
 		return -1;
-	w->gpu_rows = rows;
+	w->gpu_n = n;
 	w->gpu_off = base;
 	w->gpu_row_bytes = grb;
 	V.wused += (total + 255) & ~(size_t)255;
 	return 0;
 }
 
-/* round down to whole workgroups of rows */
 static int
-round_rows(int rows, int N)
+by_size(const void *a, const void *b)
 {
-	if (rows >= N)
-		return N;
-	rows -= rows % (int)V.rows_per_wg;
-	return rows < 0 ? 0 : rows;
+	const wt *x = *(wt *const *)a, *y = *(wt *const *)b;
+	return x->nbytes < y->nbytes ? 1 : x->nbytes > y->nbytes ? -1 : 0;
 }
 
 /*
- * Every batch runs its GPU rows and CPU rows concurrently, so each
- * dense matrix outside the MoE block gets the same GPU share (balanced
- * per batch).  Shared experts go wholly to the GPU: they are batched
- * with the routed experts, which only get what is left, spread evenly
- * over all experts' leading rows.  Everything is scaled down if even
- * the dense part does not fit.
+ * Placement is by whole tensor and whole expert, fixed at load:
+ *  1. dense tensors (read every token: mixers, attention, shared
+ *     experts, the tied output), largest first;
+ *  2. then routed experts, each as its gate+up+down triple (they are
+ *     used together), the same number per layer, in rounds over the
+ *     layers, until the budget is spent.
+ * Every matvec then runs entirely where its weights live; a batch's
+ * GPU part runs alongside its CPU part.
  */
 void
 vk_plan_and_upload(model *m, int verbose)
 {
-	size_t dense = 0, shexp = 0, experts = 0, cap = V.wcap, left;
-	double share = g_gpu_share, fe, fs = 1;
+	wt *dense[512];
+	int nd = 0, i, l, nl = m->hp.n_layer, ne = m->hp.n_expert;
+	int **sel = NULL, *cnt = NULL, round, full = 0;
 	double hot = 0, hot_gpu = 0;
-	int i, ng = 0;
+	size_t dense_b = 0, exp_b = 0;
+	int nexp = 0, ndense = 0;
 
-	for (i = 0; i < m->n_all; i++) {
-		wt *w = m->all[i];
-		size_t b = gpu_bytes(w, w->N);
-		if (w->heat < 1)
-			experts += b;
-		else if (w->moe)
-			shexp += b;
-		else
-			dense += b;
+	for (i = 0; i < m->n_all; i++)
+		if (m->all[i]->heat >= 1)
+			dense[nd++] = m->all[i];
+	qsort(dense, (size_t)nd, sizeof(wt *), by_size);
+	for (i = 0; i < nd; i++) {
+		int zero = 0;
+		size_t before = V.wused;
+		if (vk_upload(dense[i], &zero, 1) == 0) {
+			ndense++;
+			dense_b += V.wused - before;
+		}
 	}
-	/* 256-byte alignment slack per tensor */
-	cap -= cap < (size_t)m->n_all * 256 ? cap : (size_t)m->n_all * 256;
-	if (share * dense > cap) {
-		share = (double)cap / dense;
-		left = 0;
-	} else
-		left = cap - (size_t)(share * dense);
-	if (shexp > left) {
-		fs = shexp ? (double)left / shexp : 0;
-		left = 0;
-	} else
-		left -= shexp;
-	fe = experts ? (double)left / experts : 0;
+
+	/* experts: choose per layer in rounds, then upload per tensor */
+	sel = calloc((size_t)nl, sizeof(*sel));
+	cnt = calloc((size_t)nl, sizeof(*cnt));
+	if (!sel || !cnt)
+		goto out;
+	for (l = 0; l < nl; l++)
+		if (!(sel[l] = malloc(sizeof(int) * (size_t)ne)))
+			goto out;
+	{
+		size_t left = V.wcap > V.wused ? V.wcap - V.wused : 0;
+		for (round = 0; round < ne && !full; round++)
+			for (l = 0; l < nl && !full; l++) {
+				const layer *L = &m->L[l];
+				size_t need = expert_bytes(&L->gate_e) + expert_bytes(&L->up_e) +
+				    expert_bytes(&L->down_e) + 3 * 256;
+				if (need > left) {
+					full = 1;
+					break;
+				}
+				left -= need;
+				sel[l][cnt[l]++] = round;
+			}
+	}
+	for (l = 0; l < nl; l++) {
+		layer *L = &m->L[l];
+		size_t before = V.wused;
+		if (!cnt[l])
+			continue;
+		vk_upload(&L->gate_e, sel[l], cnt[l]);
+		vk_upload(&L->up_e, sel[l], cnt[l]);
+		vk_upload(&L->down_e, sel[l], cnt[l]);
+		exp_b += V.wused - before;
+		nexp += cnt[l];
+	}
+out:
+	if (sel)
+		for (l = 0; l < nl; l++)
+			free(sel[l]);
+	free(sel);
+	free(cnt);
 	for (i = 0; i < m->n_all; i++) {
-		wt *w = m->all[i];
-		double f = w->heat < 1 ? fe : w->moe ? fs : share;
-		int rows = round_rows((int)(f * w->N), w->N);
-		if (rows > 0 && vk_upload(w, rows) == 0)
-			ng++;
-		/* bytes read per token, total and on the GPU */
+		const wt *w = m->all[i];
 		hot += w->heat * (double)w->nbytes;
-		hot_gpu += w->heat * (double)w->nbytes * w->gpu_rows / w->N;
+		hot_gpu += w->heat * (double)w->nbytes * w->gpu_n / w->E;
 	}
 	if (verbose)
-		fprintf(stderr, "vulkan: gpu rows: %.0f%% of dense, %.0f%% of shared experts, "
-		    "%.1f%% of routed experts; %d/%d tensors, %.1f MiB; "
-		    "%.0f%% of per-token weight bytes (%.0f of %.0f MiB)\n",
-		    100 * share, 100 * fs, 100 * fe, ng, m->n_all, V.wused / 1048576.0,
+		fprintf(stderr, "vulkan: resident: %d dense tensors (%.1f MiB) + %d experts "
+		    "(%.1f/layer, %.1f MiB) = %.1f MiB; %.0f%% of per-token weight bytes "
+		    "(%.0f of %.0f MiB)\n", ndense, dense_b / 1048576.0,
+		    nexp, (double)nexp / nl, exp_b / 1048576.0, V.wused / 1048576.0,
 		    100.0 * hot_gpu / hot, hot_gpu / 1048576.0, hot / 1048576.0);
 }
 
@@ -629,7 +699,7 @@ vk_add(const wt *w, int e, const float *x, const q8k *xq, float *y)
 	int i;
 	uint32_t xo, nw = (uint32_t)w->K / 256 * Q8W;
 
-	if (!w->gpu_rows || V.nd >= BMAX || V.yused + (uint32_t)w->gpu_rows > YCAP)
+	if (!w->gpu_n || w->gslot[e] < 0 || V.nd >= BMAX || V.yused + (uint32_t)w->N > YCAP)
 		return -1;
 	for (i = 0; i < V.nx; i++)
 		if (V.xs[i].x == x && V.xs[i].K == (uint32_t)w->K)
@@ -647,14 +717,14 @@ vk_add(const wt *w, int e, const float *x, const q8k *xq, float *y)
 	xo = V.xs[i].off;
 	V.d[V.nd].y = y;
 	V.d[V.nd].type = w->type;
-	V.d[V.nd].pc.w_off = (uint32_t)((w->gpu_off + (uint64_t)e * (uint64_t)w->gpu_rows *
+	V.d[V.nd].pc.w_off = (uint32_t)((w->gpu_off + (uint64_t)w->gslot[e] * (uint64_t)w->N *
 	    w->gpu_row_bytes) / 4);
 	V.d[V.nd].pc.row_words = (uint32_t)(w->gpu_row_bytes / 4);
 	V.d[V.nd].pc.K = (uint32_t)w->K;
-	V.d[V.nd].pc.N = (uint32_t)w->gpu_rows;
+	V.d[V.nd].pc.N = (uint32_t)w->N;
 	V.d[V.nd].pc.x_off = xo;
 	V.d[V.nd].pc.y_off = XCAP + V.yused;
-	V.yused += ((uint32_t)w->gpu_rows + 3) & ~3u;
+	V.yused += ((uint32_t)w->N + 3) & ~3u;
 	V.nd++;
 	return 0;
 }

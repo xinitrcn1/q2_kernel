@@ -10,17 +10,21 @@
 #include "kq.h"
 #include "model.h"
 
+/* all of our device memory stays within this (1.25 GiB available) */
+#define VK_VRAM_LIMIT ((size_t)1280 << 20)
+
 int vk_init(size_t weight_budget, int device_index, int verbose);
 int vk_ready(void);
 void vk_shutdown(void);
 const char *vk_device_name(void);
 
-/* copy the first 'rows' rows of each expert of a tensor into the
- * arena; 0 on success, -1 when it does not fit */
-int vk_upload(wt *w, int rows);
+/* copy whole experts of a tensor (dense: expert 0) into the arena;
+ * done once at load, they stay resident.  0 on success, -1 when they
+ * do not fit */
+int vk_upload(wt *w, const int *experts, int n);
 size_t vk_used(void);
 
-/* decide each tensor's GPU row share within the budget and upload */
+/* place whole tensors and whole experts within the budget, upload */
 void vk_plan_and_upload(model *m, int verbose);
 
 /* batch recording; vk_submit starts it, vk_wait copies results to y */

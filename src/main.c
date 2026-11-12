@@ -52,7 +52,6 @@ usage(void)
 	    "  -c N           context size (default 4096)\n"
 	    "  -g MIB         GPU weight split in MiB (default 512, 0 = CPU only)\n"
 	    "  -d N           Vulkan device index\n"
-	    "  --gpu-share F  fraction of each dense matvec's rows on the GPU (0.6)\n"
 	    "  --temp F       temperature (default 0 = greedy)\n"
 	    "  --top-k N      (default 40)  --top-p F (default 0.95)  --seed N\n"
 	    "  --ref          reference float kernels on the CPU\n"
@@ -108,7 +107,6 @@ parse(int argc, char **argv)
 		else if (!strcmp(a, "-c")) O.ctx = atoi(ARG());
 		else if (!strcmp(a, "-g")) O.gpu_mib = atoi(ARG());
 		else if (!strcmp(a, "-d")) O.device = atoi(ARG());
-		else if (!strcmp(a, "--gpu-share")) g_gpu_share = atof(ARG());
 		else if (!strcmp(a, "--temp")) O.temp = (float)atof(ARG());
 		else if (!strcmp(a, "--top-k")) O.top_k = atoi(ARG());
 		else if (!strcmp(a, "--top-p")) O.top_p = (float)atof(ARG());
@@ -320,7 +318,7 @@ info(void)
 		if (O.verbose)
 			printf("  %-32s %-5s %5d x %6d x %2d %9.2f MiB%s\n", w->name,
 			    ggml_type_name(w->type), w->K, w->N, w->E, w->nbytes / 1048576.0,
-			    w->gpu_rows ? "  [gpu]" : "");
+			    w->gpu_n ? "  [gpu]" : "");
 	}
 	printf("  quantized weights %.1f MiB (dense %.1f MiB), %.1f MiB read per token\n",
 	    tot / 1048576.0, dense / 1048576.0, hot / 1048576.0);
@@ -352,11 +350,15 @@ check(void)
 		wt *w = M.all[i];
 		double e_s = 0, e_k = 0, e_g = 0, nr = 0, t0, tc, tg = 0;
 		int e = w->E - 1;
+		/* an expert that is on the GPU, if any */
+		if (w->gpu_n)
+			for (e = 0; w->gslot[e] < 0; e++)
+				;
 		q8k *xq;
 		mv_item it;
 
 		/* one tensor per (type, K, gpu) combination */
-		uint32_t key = 1u << (w->type * 2 + (w->gpu_rows != 0));
+		uint32_t key = 1u << (w->type * 2 + (w->gpu_n != 0));
 		if ((seen & key) && !O.verbose)
 			continue;
 		seen |= key;
@@ -378,21 +380,20 @@ check(void)
 		tc = now() - t0;
 		for (r = 0; r < w->N; r++)
 			e_k += (double)(yk[r] - yr[r]) * (yk[r] - yr[r]);
-		if (w->gpu_rows) {
-			/* the GPU path alone, on its rows */
+		if (w->gpu_n) {
+			/* the GPU path alone */
 			vk_begin();
 			vk_add(w, e, x, xq, yg);
 			t0 = now();
 			vk_submit();
 			vk_wait();
 			tg = now() - t0;
-			for (r = 0; r < w->gpu_rows; r++)
+			for (r = 0; r < w->N; r++)
 				e_g += (double)(yg[r] - yr[r]) * (yg[r] - yr[r]);
-			e_g *= (double)w->N / w->gpu_rows;
 		}
 		printf("%-32s %-5s %10.2e %10.2e ", w->name, ggml_type_name(w->type),
 		    sqrt(e_s / nr), sqrt(e_k / nr));
-		if (w->gpu_rows)
+		if (w->gpu_n)
 			printf("%10.2e %9.3f %9.3f\n", sqrt(e_g / nr), tc * 1e3, tg * 1e3);
 		else
 			printf("%10s %9.3f %9s\n", "-", tc * 1e3, "-");

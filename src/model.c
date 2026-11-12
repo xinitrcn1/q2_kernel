@@ -12,7 +12,6 @@
 #include "vmath.h"
 
 int g_ref;
-double g_gpu_share = 0.6;
 
 #include <time.h>
 /* --bench breakdown: see PROF_* in model.h */
@@ -188,8 +187,6 @@ model_load(model *m, const char *path, char *err, size_t errlen)
 		    T(up_s, "ffn_up_shexp.weight") || T(down_s, "ffn_down_shexp.weight"))
 			return -1;
 		L->gate_s.heat = L->up_s.heat = L->down_s.heat = 1;
-		L->gate_s.moe = L->up_s.moe = L->down_s.moe = 1;
-		L->gate_e.moe = L->up_e.moe = L->down_e.moe = 1;
 		L->gate_e.heat = L->up_e.heat = L->down_e.heat =
 		    (double)h->n_expert_used / h->n_expert;
 #undef T
@@ -201,6 +198,9 @@ model_load(model *m, const char *path, char *err, size_t errlen)
 void
 model_free(model *m)
 {
+	int i;
+	for (i = 0; i < m->n_all; i++)
+		free(m->all[i]->gslot);
 	free(m->L);
 	gguf_close(&m->g);
 }
@@ -303,7 +303,6 @@ state_free(state *s, const model *m)
 
 typedef struct {
 	const mv_item *it;
-	const int *r0;          /* first row the CPU computes */
 	int n;
 	const q8k *xq[MV_MAX];
 	size_t *cum;            /* prefix sum of rows */
@@ -339,9 +338,8 @@ mv_worker(void *arg, int ith, int nth)
 		for (; i < j->n && j->cum[i] < hi; i++) {
 			const mv_item *t = &j->it[i];
 			const wt *w = t->w;
-			size_t r0 = (lo > j->cum[i] ? lo - j->cum[i] : 0) + (size_t)j->r0[i];
-			size_t r1 = (hi < j->cum[i + 1] ? hi : j->cum[i + 1]) - j->cum[i] +
-			    (size_t)j->r0[i];
+			size_t r0 = lo > j->cum[i] ? lo - j->cum[i] : 0;
+			size_t r1 = (hi < j->cum[i + 1] ? hi : j->cum[i + 1]) - j->cum[i];
 			const uint8_t *base = w->data + (size_t)t->e * (size_t)w->N * w->row_bytes;
 			size_t r;
 
@@ -365,7 +363,6 @@ mv_run(const mv_item *it, int n)
 {
 	mv_item cpu[MV_MAX];
 	const q8k *xq[MV_MAX], *cxq[MV_MAX];
-	int cr0[MV_MAX];
 	size_t cum[MV_MAX + 1], need = 0, used = 0;
 	mv_job job;
 	int i, k, nc = 0, ngpu = 0;
@@ -391,26 +388,22 @@ mv_run(const mv_item *it, int n)
 			continue;
 		}
 		xq[i] = qbuf + used;
-		if (!g_ref || it[i].w->gpu_rows)
+		if (!g_ref || it[i].w->gpu_n)
 			q8k_quantize(it[i].x, qbuf + used, (size_t)it[i].w->K);
 		used += (size_t)it[i].w->K / 256;
 	}
 
 	if (vk_ready())
 		vk_begin();
-	/* rows [0, gpu_rows) on the GPU, the rest on the CPU */
+	/* each matvec runs where its tensor/expert lives */
 	for (i = 0; i < n; i++) {
-		int r0 = 0;
-		if (vk_ready() && it[i].w->gpu_rows &&
+		if (vk_ready() && it[i].w->gpu_n && it[i].w->gslot[it[i].e] >= 0 &&
 		    vk_add(it[i].w, it[i].e, it[i].x, xq[i], it[i].y) == 0) {
 			ngpu++;
-			r0 = it[i].w->gpu_rows;
+			continue;
 		}
-		if (r0 < it[i].w->N) {
-			cxq[nc] = xq[i];
-			cr0[nc] = r0;
-			cpu[nc++] = it[i];
-		}
+		cxq[nc] = xq[i];
+		cpu[nc++] = it[i];
 	}
 	if (ngpu)
 		vk_submit();
@@ -418,12 +411,11 @@ mv_run(const mv_item *it, int n)
 	if (nc) {
 		memset(&job, 0, sizeof(job));
 		job.it = cpu;
-		job.r0 = cr0;
 		job.n = nc;
 		job.cum = cum;
 		cum[0] = 0;
 		for (i = 0; i < nc; i++) {
-			cum[i + 1] = cum[i] + (size_t)(cpu[i].w->N - cr0[i]);
+			cum[i + 1] = cum[i] + (size_t)cpu[i].w->N;
 			job.xq[i] = cxq[i];
 		}
 		job.total = cum[nc];

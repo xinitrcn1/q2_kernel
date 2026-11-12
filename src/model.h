@@ -15,11 +15,11 @@ typedef struct {
 	const uint8_t *data;    /* mmap */
 	size_t row_bytes;
 	size_t nbytes;
-	int gpu_rows;           /* leading rows of each expert resident on the GPU */
+	int *gslot;             /* per expert: slot in the GPU copy, -1 = CPU */
+	int gpu_n;              /* experts resident on the GPU */
 	uint64_t gpu_off;       /* byte offset in the GPU weight buffer */
 	size_t gpu_row_bytes;   /* rows are repacked to 4-byte-aligned blocks */
 	double heat;            /* bytes read per token / bytes stored */
-	int moe;                /* part of the MoE block (batched with experts) */
 } wt;
 
 typedef struct {
@@ -93,6 +93,5 @@ extern double prof_t[PROF_N];
 
 /* compute settings */
 extern int g_ref;           /* reference float kernels on CPU */
-extern double g_gpu_share;  /* fraction of each dense matvec's rows on the GPU */
 
 #endif
