@@ -2,7 +2,7 @@
 """Generate src/ucd.c: codepoint class ranges for the pre-tokenizer.
 
 Flags: 1 letter (L*), 2 number (N*), 4 whitespace (llama.cpp's set),
-8 assigned (any category but Cn).  Run: python3 tools/gen_ucd.py > src/ucd.c
+8 assigned (any category but Cn), 16 mark (M*).  Run: python3 tools/gen_ucd.py > src/ucd.c
 """
 import sys
 import unicodedata
@@ -22,6 +22,8 @@ def flags(cp):
         f |= 4
     if cat != 'Cn':
         f |= 8
+    if cat[0] == 'M':
+        f |= 16
     return f
 
 

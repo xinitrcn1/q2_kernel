@@ -201,6 +201,11 @@ tok_load(tokenizer *t, const gguf *g, char *err, size_t errlen)
 		t->mh[h].rank = i;
 		t->mh[h].id = r;
 	}
+	{
+		gstr pre;
+		if (gguf_get_str(g, "tokenizer.ggml.pre", &pre) == 0 && gstr_eq(pre, "qwen35"))
+			t->pre = 1;
+	}
 	t->bos = t->eos = -1;
 	if (gguf_get_u32(g, "tokenizer.ggml.bos_token_id", &u) == 0)
 		t->bos = (int)u;
@@ -314,12 +319,17 @@ utf8_get(const uint8_t *s, size_t len, size_t *adv)
 }
 
 /* llama3 / dbrx pre-tokenizer, ported from llama.cpp's hand-written
- * matcher for
+ * matcher (pre 0), and the qwen35 variant (pre 1: letter runs include
+ * marks \p{M}, digits one at a time, punctuation runs exclude marks)
+ * for
  *   (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}|
  *    ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+               */
 static int
 pretok(const tokenizer *t, const uint8_t *s, size_t len, int *out, int cap, int n)
 {
+	const int LM = t->pre == 1 ? (UC_L | UC_M) : UC_L;     /* letter-run class */
+	const int ndig = t->pre == 1 ? 1 : 3;                  /* \p{N}{1,ndig} */
+	const int PX = t->pre == 1 ? (UC_WS | UC_L | UC_M | UC_N) : (UC_WS | UC_L | UC_N);
 	size_t nc = 0, i, *off;
 	uint32_t *cp;
 	int *fl;
@@ -368,9 +378,9 @@ pretok(const tokenizer *t, const uint8_t *s, size_t len, int *out, int cap, int 
 			}
 		}
 		if (!(c == '\r' || c == '\n' || (f & UC_N))) {
-			if ((f & UC_L) || (FL(pos + 1) & UC_L)) {
+			if ((f & LM) || (FL(pos + 1) & LM)) {
 				pos++;
-				while (FL(pos) & UC_L)
+				while (FL(pos) & LM)
 					pos++;
 				EMIT(pos);
 				continue;
@@ -379,7 +389,7 @@ pretok(const tokenizer *t, const uint8_t *s, size_t len, int *out, int cap, int 
 		if (f & UC_N) {
 			size_t ini = pos;
 			while (FL(pos) & UC_N) {
-				if (++pos - ini >= 3) {
+				if (++pos - ini >= (size_t)ndig) {
 					EMIT(pos);
 					ini = pos;
 				}
@@ -388,9 +398,9 @@ pretok(const tokenizer *t, const uint8_t *s, size_t len, int *out, int cap, int 
 			continue;
 		}
 		f2 = c == ' ' ? FL(pos + 1) : f;
-		if (!(f2 & (UC_WS | UC_L | UC_N)) && f) {
+		if (!(f2 & PX) && f) {
 			pos += c == ' ';
-			while (!(f2 & (UC_WS | UC_L | UC_N)) && f2)
+			while (!(f2 & PX) && f2)
 				f2 = FL(pos + 1), pos++;
 			while (CPT(pos) == '\r' || CPT(pos) == '\n')
 				pos++;

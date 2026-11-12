@@ -1,4 +1,6 @@
-/* granitehybrid (Granite 4.0-H) forward pass, one token at a time. */
+/* Forward passes, one token at a time (prefill.c batches prompts):
+ * granitehybrid (Granite 4.0-H) in model.c, qwen35 (Qwen3.5-style
+ * Gated DeltaNet + gated attention) in qwen35.c. */
 #ifndef Q2K_MODEL_H
 #define Q2K_MODEL_H
 
@@ -35,22 +37,35 @@ typedef struct {
 	const float *router;    /* [n_expert][n_embd] f32 */
 	wt gate_e, up_e, down_e;
 	wt gate_s, up_s, down_s;
+	/* qwen35: post-attention norm, dense FFN, gated delta net, q/k norms */
+	const float *post_norm, *q_norm, *k_norm, *dt_bias, *ssm_a;
+	wt ffn_gate, ffn_up, ffn_down;
+	wt wqkv, wz, wbeta, walpha;
 } layer;
+
+enum { ARCH_GRANITE, ARCH_QWEN35 };
 
 typedef struct {
 	int n_embd, n_layer, n_vocab, n_head, n_head_kv, head_dim;
 	int n_expert, n_expert_used, n_ff, n_ff_sh;
 	int d_conv, d_inner, d_state, ssm_heads, ssm_head_dim, conv_ch, d_in_proj;
 	float eps, emb_scale, res_scale, logit_scale, attn_scale;
+	/* qwen35 */
+	int rope_dim;           /* rotated dims per head (NeoX pairs) */
+	float rope_base;
+	int dn_kh, dn_vh, dn_dim;   /* delta net: key heads, value heads, head dim */
+	int dn_qkv;             /* conv channels: q, k (dn_kh*dn_dim each), v */
 } hparams;
 
 typedef struct {
 	gguf g;
+	int arch;
 	hparams hp;
 	layer *L;
 	wt tok_embd;            /* also the (tied) output projection */
+	wt output;              /* untied output projection (qwen35) */
 	const float *out_norm;
-	wt *all[512];           /* every quantized matrix, for planning */
+	wt *all[1024];          /* every quantized matrix, for planning */
 	int n_all;
 } model;
 
@@ -68,6 +83,8 @@ typedef struct {
 	float *logits;
 	void *xq;               /* q8k scratch for the MoE input */
 	float *og;              /* GPU half of the mixer output */
+	/* qwen35 */
+	float *qkv, *z, *beta, *alpha, *ffg, *ffu;
 } state;
 
 int model_load(model *m, const char *path, char *err, size_t errlen);
@@ -81,6 +98,16 @@ void state_free(state *s, const model *m);
 
 /* device memory the fused Mamba2 path needs for recurrent state */
 size_t model_gpu_state_bytes(const model *m);
+
+/* qwen35.c */
+int qwen35_load(model *m, char *err, size_t errlen);
+int qwen35_state_init(state *s, const model *m, int ctx);
+void qwen35_state_reset(state *s, const model *m);
+const float *qwen35_forward(const model *m, state *s, int tok, int want_logits);
+/* shared helpers from model.c */
+int model_get_wt(model *m, wt *w, const char *name, int need, char *err, size_t errlen);
+const float *model_get_f32(model *m, const char *name, uint64_t n, char *err, size_t errlen);
+float *model_falloc(size_t n);
 
 /* consume n prompt tokens (batched on the CPU); last token's logits */
 const float *model_prefill(const model *m, state *s, const int *tok, int n);

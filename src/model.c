@@ -28,8 +28,8 @@ pnow(void)
 /* ---------------------------------------------------------------- */
 /* loading                                                          */
 
-static int
-get_wt(model *m, wt *w, const char *name, int need, char *err, size_t errlen)
+int
+model_get_wt(model *m, wt *w, const char *name, int need, char *err, size_t errlen)
 {
 	const gtensor *t = gguf_tensor(&m->g, name);
 	memset(w, 0, sizeof(*w));
@@ -55,8 +55,8 @@ get_wt(model *m, wt *w, const char *name, int need, char *err, size_t errlen)
 	return 0;
 }
 
-static const float *
-get_f32(model *m, const char *name, uint64_t n, char *err, size_t errlen)
+const float *
+model_get_f32(model *m, const char *name, uint64_t n, char *err, size_t errlen)
 {
 	const gtensor *t = gguf_tensor(&m->g, name);
 	if (!t || t->type != GT_F32 || t->ne[0] * t->ne[1] * t->ne[2] != n) {
@@ -80,10 +80,15 @@ model_load(model *m, const char *path, char *err, size_t errlen)
 	memset(m, 0, sizeof(*m));
 	if (gguf_open(&m->g, path, err, errlen) != 0)
 		return -1;
+	if (gguf_get_str(&m->g, "general.architecture", &arch) == 0 && gstr_eq(arch, "qwen35")) {
+		m->arch = ARCH_QWEN35;
+		return qwen35_load(m, err, errlen);
+	}
 	if (gguf_get_str(&m->g, "general.architecture", &arch) || !gstr_eq(arch, "granitehybrid")) {
-		snprintf(err, errlen, "architecture is not granitehybrid");
+		snprintf(err, errlen, "unsupported architecture (granitehybrid, qwen35)");
 		return -1;
 	}
+	m->arch = ARCH_GRANITE;
 #define U32(k, dst) do { if (gguf_get_u32(&m->g, KEY(k), &u)) { \
 	snprintf(err, errlen, "missing key %s", KEY(k)); return -1; } (dst) = (int)u; } while (0)
 	U32("embedding_length", h->n_embd);
@@ -129,10 +134,10 @@ model_load(model *m, const char *path, char *err, size_t errlen)
 		return -1;
 	}
 
-	if (get_wt(m, &m->tok_embd, "token_embd.weight", 1, err, errlen))
+	if (model_get_wt(m, &m->tok_embd, "token_embd.weight", 1, err, errlen))
 		return -1;
 	h->n_vocab = m->tok_embd.N;
-	if (!(m->out_norm = get_f32(m, "output_norm.weight", (uint64_t)h->n_embd, err, errlen)))
+	if (!(m->out_norm = model_get_f32(m, "output_norm.weight", (uint64_t)h->n_embd, err, errlen)))
 		return -1;
 	if (gguf_tensor(&m->g, "output.weight")) {
 		snprintf(err, errlen, "untied output.weight not supported");
@@ -150,9 +155,9 @@ model_load(model *m, const char *path, char *err, size_t errlen)
 		uint32_t kv = 0;
 		const int E = h->n_embd;
 #define T(field, s) (snprintf(nm, sizeof(nm), "blk.%d." s, i), \
-	get_wt(m, &L->field, nm, 1, err, errlen))
+	model_get_wt(m, &L->field, nm, 1, err, errlen))
 #define F(field, s, n) do { snprintf(nm, sizeof(nm), "blk.%d." s, i); \
-	if (!(L->field = get_f32(m, nm, (uint64_t)(n), err, errlen))) return -1; } while (0)
+	if (!(L->field = model_get_f32(m, nm, (uint64_t)(n), err, errlen))) return -1; } while (0)
 		gguf_get_arr_u32(&m->g, KEY("attention.head_count_kv"), (uint64_t)i, &kv);
 		L->attn = kv != 0;
 		F(attn_norm, "attn_norm.weight", E);
@@ -235,6 +240,8 @@ model_gpu_state_bytes(const model *m)
 	const hparams *h = &m->hp;
 	size_t n = 0;
 	int i;
+	if (m->arch != ARCH_GRANITE)
+		return 0;
 	for (i = 0; i < h->n_layer; i++)
 		if (!m->L[i].attn)
 			n += 3 * (size_t)h->conv_ch + (size_t)h->d_inner * (size_t)h->d_state;
@@ -247,7 +254,7 @@ model_free(model *m)
 	int i;
 	for (i = 0; i < m->n_all; i++)
 		free(m->all[i]->gslot);
-	for (i = 0; m->L && i < m->hp.n_layer; i++)
+	for (i = 0; m->arch == ARCH_GRANITE && m->L && i < m->hp.n_layer; i++)
 		if (m->L[i].ssm_out_cpu.data)
 			free((void *)m->L[i].ssm_out_cpu.data);
 	free(m->L);
@@ -263,6 +270,12 @@ fa(size_t n)
 	return calloc(n ? n : 1, sizeof(float));
 }
 
+float *
+model_falloc(size_t n)
+{
+	return fa(n);
+}
+
 int
 state_init(state *s, const model *m, int ctx)
 {
@@ -270,6 +283,8 @@ state_init(state *s, const model *m, int ctx)
 	int i, kvd = h->n_head_kv * h->head_dim;
 	size_t big = (size_t)(h->d_in_proj > h->n_vocab ? h->d_in_proj : h->n_vocab);
 
+	if (m->arch == ARCH_QWEN35)
+		return qwen35_state_init(s, m, ctx);
 	memset(s, 0, sizeof(*s));
 	s->ctx = ctx;
 	s->x = fa((size_t)h->n_embd);
@@ -322,6 +337,10 @@ state_reset(state *s, const model *m)
 	int i;
 	s->pos = 0;
 	vk_state_reset();
+	if (m->arch == ARCH_QWEN35) {
+		qwen35_state_reset(s, m);
+		return;
+	}
 	for (i = 0; i < h->n_layer; i++) {
 		if (s->conv[i])
 			memset(s->conv[i], 0, sizeof(float) * (size_t)(h->d_conv - 1) * (size_t)h->conv_ch);
@@ -345,6 +364,7 @@ state_free(state *s, const model *m)
 	free(s->y); free(s->q); free(s->k); free(s->v); free(s->att); free(s->ao);
 	free(s->rl); free(s->hs_g); free(s->hs_u); free(s->he_g); free(s->he_u);
 	free(s->eo); free(s->so); free(s->logits); free(s->xq); free(s->og);
+	free(s->qkv); free(s->z); free(s->beta); free(s->alpha); free(s->ffg); free(s->ffu);
 	memset(s, 0, sizeof(*s));
 }
 
@@ -880,6 +900,8 @@ moe(const model *m, const layer *L, state *s)
 const float *
 model_forward(const model *m, state *s, int tok, int want_logits)
 {
+	if (m->arch == ARCH_QWEN35)
+		return qwen35_forward(m, s, tok, want_logits);
 	const hparams *h = &m->hp;
 	const int E = h->n_embd;
 	int il, i;

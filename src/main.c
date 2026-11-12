@@ -20,7 +20,7 @@
 typedef struct {
 	const char *model, *prompt, *system, *dump;
 	int n_predict, threads, ctx, gpu_mib, device, chat, raw, info, tokens;
-	int bench, check, kbench, top_k, verbose, show_special, logits, noprefill;
+	int bench, check, kbench, top_k, verbose, show_special, logits, noprefill, think, sys_given;
 	float temp, top_p;
 	unsigned long seed;
 } opts;
@@ -48,6 +48,7 @@ usage(void)
 	    "  -n N           tokens to generate (default 256)\n"
 	    "  -i, --chat     interactive chat using the model's template\n"
 	    "  -s TEXT        system message for chat\n"
+	    "  --think        let thinking models think (chat; qwen35)\n"
 	    "  -t N           CPU threads (default: online CPUs - 1)\n"
 	    "  -c N           context size (default 4096)\n"
 	    "  -g MIB         GPU weight split in MiB (default 512, 0 = CPU only)\n"
@@ -106,7 +107,8 @@ parse(int argc, char **argv)
 #define ARG() (i + 1 < argc ? argv[++i] : (usage(), ""))
 		if (!strcmp(a, "-m")) O.model = ARG();
 		else if (!strcmp(a, "-p")) O.prompt = ARG();
-		else if (!strcmp(a, "-s")) O.system = ARG();
+		else if (!strcmp(a, "-s")) { O.system = ARG(); O.sys_given = 1; }
+		else if (!strcmp(a, "--think")) O.think = 1;
 		else if (!strcmp(a, "-n")) O.n_predict = atoi(ARG());
 		else if (!strcmp(a, "-t")) O.threads = atoi(ARG());
 		else if (!strcmp(a, "-c")) O.ctx = atoi(ARG());
@@ -311,6 +313,14 @@ info(void)
 
 	for (i = 0; i < h->n_layer; i++)
 		nattn += M.L[i].attn;
+	if (M.arch == ARCH_QWEN35) {
+		printf("qwen35: %d layers (%d gated delta net, %d gated attention), embd %d, vocab %d\n",
+		    h->n_layer, h->n_layer - nattn, nattn, h->n_embd, h->n_vocab);
+		printf("  attention: %d heads x %d, %d kv heads, rope %d dims base %g\n",
+		    h->n_head, h->head_dim, h->n_head_kv, h->rope_dim, h->rope_base);
+		printf("  delta net: %d key heads, %d value heads x %d, conv %d; ffn %d\n",
+		    h->dn_kh, h->dn_vh, h->dn_dim, h->d_conv, h->n_ff);
+	} else {
 	printf("granitehybrid: %d layers (%d mamba2, %d attention), embd %d, vocab %d\n",
 	    h->n_layer, h->n_layer - nattn, nattn, h->n_embd, h->n_vocab);
 	printf("  attention: %d heads x %d, %d kv heads, scale %g, no rope\n",
@@ -321,6 +331,7 @@ info(void)
 	    h->n_expert, h->n_expert_used, h->n_ff, h->n_ff_sh);
 	printf("  scales: embedding %g, residual %g, logits 1/%g, eps %g\n",
 	    h->emb_scale, h->res_scale, h->logit_scale, h->eps);
+	}
 	for (i = 0; i < M.n_all; i++) {
 		const wt *w = M.all[i];
 		tot += w->nbytes;
@@ -553,10 +564,19 @@ chat(void)
 		}
 		cap = strlen(line) + strlen(O.system) + 256;
 		msg = malloc(cap);
-		snprintf(msg, cap, "%s%s%s<|start_of_role|>user<|end_of_role|>%s<|end_of_text|>\n"
-		    "<|start_of_role|>assistant<|end_of_role|>",
-		    first ? "<|start_of_role|>system<|end_of_role|>" : "",
-		    first ? O.system : "", first ? "<|end_of_text|>\n" : "", line);
+		if (M.arch == ARCH_QWEN35)
+			/* ChatML; no default system message */
+			snprintf(msg, cap, "%s%s%s<|im_start|>user\n%s<|im_end|>\n"
+			    "<|im_start|>assistant\n%s",
+			    first && O.sys_given ? "<|im_start|>system\n" : "",
+			    first && O.sys_given ? O.system : "",
+			    first && O.sys_given ? "<|im_end|>\n" : "", line,
+			    O.think ? "<think>\n" : "<think>\n\n</think>\n\n");
+		else
+			snprintf(msg, cap, "%s%s%s<|start_of_role|>user<|end_of_role|>%s<|end_of_text|>\n"
+			    "<|start_of_role|>assistant<|end_of_role|>",
+			    first ? "<|start_of_role|>system<|end_of_role|>" : "",
+			    first ? O.system : "", first ? "<|end_of_text|>\n" : "", line);
 		ids = encode(msg, 1, &n);
 		p0 = S.pos;
 		lg = feed(ids, n);
@@ -566,7 +586,8 @@ chat(void)
 		gen = generate(lg, O.n_predict, &secs);
 		/* close the assistant turn in the cache */
 		{
-			int end = tok_find(&T, "<|end_of_text|>"), nl[4], k;
+			int end = tok_find(&T, M.arch == ARCH_QWEN35 ? "<|im_end|>" : "<|end_of_text|>"),
+			    nl[4], k;
 			k = tok_encode(&T, "\n", 1, 0, nl, 4);
 			if (end >= 0)
 				feed(&end, 1);
@@ -594,7 +615,10 @@ main(int argc, char **argv)
 		return 1;
 	}
 	pool_init(O.threads);
-	if (O.gpu_mib > 0 && !O.tokens) {
+	if (O.gpu_mib > 0 && !O.tokens && M.arch != ARCH_GRANITE) {
+		if (O.verbose)
+			fprintf(stderr, "q2k: no GPU path for this architecture yet\n");
+	} else if (O.gpu_mib > 0 && !O.tokens) {
 		if (vk_init((size_t)O.gpu_mib << 20, model_gpu_state_bytes(&M), O.device,
 		    O.verbose) == 0)
 		{

@@ -7,7 +7,7 @@
 
 #include "gguf.h"
 
-enum { UC_L = 1, UC_N = 2, UC_WS = 4, UC_DEF = 8 };
+enum { UC_L = 1, UC_N = 2, UC_WS = 4, UC_DEF = 8, UC_M = 16 };
 
 typedef struct {
 	uint32_t lo, hi;
@@ -30,6 +30,7 @@ typedef struct {
 	struct mrg { int a, b, rank, id; } *mh;
 	uint32_t mmask;
 	int bos, eos;
+	int pre;                /* pre-split rules: 0 llama3/dbrx, 1 qwen35 */
 } tokenizer;
 
 int tok_load(tokenizer *t, const gguf *g, char *err, size_t errlen);
