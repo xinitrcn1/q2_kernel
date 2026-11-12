@@ -43,14 +43,6 @@ long pf_rows;
 /* ---------------------------------------------------------------- */
 /* batched matmul: y[t*ldy + r] = dot(W[r], x_t), rows [r0, r1)      */
 
-typedef struct {
-	const wt *w;
-	int e;
-	const q8k *xq;          /* T vectors of xs blocks each */
-	int xs, T;
-	float *y;
-	int ldy, r0, r1;
-} mm_item;
 
 typedef struct {
 	const mm_item *it;
@@ -106,7 +98,7 @@ mm_worker(void *arg, int ith, int nth)
 	}
 }
 
-static void
+void
 mm_run(const mm_item *it, int n)
 {
 	mm_job j;
@@ -137,7 +129,7 @@ mm_run(const mm_item *it, int n)
 	}
 }
 
-static mm_item
+mm_item
 mmi(const wt *w, int e, const q8k *xq, int xs, int T, float *y, int ldy)
 {
 	mm_item m;
@@ -769,6 +761,8 @@ model_prefill(const model *m, state *s, const int *tok, int n)
 	const hparams *h = &m->hp;
 	int done = 0, il;
 
+	if (m->arch == ARCH_QWEN35 && n > 1 && !g_ref)
+		return qwen35_prefill(m, s, tok, n);
 	if (n <= 1 || g_ref || m->arch != ARCH_GRANITE || bufs(h) != 0) {
 		const float *lg = NULL;
 		int i;

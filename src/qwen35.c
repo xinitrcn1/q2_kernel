@@ -455,3 +455,311 @@ qwen35_forward(const model *m, state *s, int tok, int want_logits)
 	mv_run(&it, 1);
 	return s->logits;
 }
+
+/* ---------------------------------------------------------------- */
+/* batched prompts (CPU): chunks of up to QB tokens per layer        */
+
+#include "kq.h"
+
+#define QB 64
+
+static struct {
+	int ok;
+	float *x, *xn, *qkv, *z, *beta, *alpha, *y, *tmp, *fg, *fu, *q, *ao;
+	q8k *xq, *yq, *fq;
+} P;
+
+static int
+pbufs(const hparams *h)
+{
+	const size_t T = QB, E = (size_t)h->n_embd;
+	if (P.ok)
+		return 0;
+#define A(p, n) if (!((p) = calloc((n), sizeof(*(p))))) return -1
+	A(P.x, T * E); A(P.xn, T * E); A(P.tmp, T * E);
+	A(P.qkv, T * (size_t)h->dn_qkv); A(P.z, T * (size_t)h->d_inner);
+	A(P.beta, T * (size_t)h->dn_vh); A(P.alpha, T * (size_t)h->dn_vh);
+	A(P.y, T * (size_t)(h->d_inner > h->n_head * h->head_dim ? h->d_inner : h->n_head * h->head_dim));
+	A(P.fg, T * (size_t)h->n_ff); A(P.fu, T * (size_t)h->n_ff);
+	A(P.q, T * (size_t)(2 * h->n_head * h->head_dim)); A(P.ao, T * (size_t)(h->n_head * h->head_dim));
+	A(P.xq, T * E / 256); A(P.yq, T * (size_t)(h->d_inner > h->n_head * h->head_dim ?
+	    h->d_inner : h->n_head * h->head_dim) / 256);
+	A(P.fq, T * (size_t)h->n_ff / 256);
+#undef A
+	P.ok = 1;
+	return 0;
+}
+
+static void
+quant_rows(const float *x, q8k *q, int T, int n)
+{
+	int t;
+	for (t = 0; t < T; t++)
+		q8k_quantize(x + (size_t)t * (size_t)n, q + (size_t)t * (size_t)(n / 256), (size_t)n);
+}
+
+typedef struct {
+	const model *m;
+	const layer *L;
+	state *s;
+	int il, T;
+	long next;
+} pj;
+
+/* conv + SiLU per channel over the chunk, in token order */
+static void
+pconv(void *arg, int ith, int nth)
+{
+	pj *j = arg;
+	const int CH = j->m->hp.dn_qkv;
+	float *cs = j->s->conv[j->il];
+	long c0;
+	(void)ith;
+	(void)nth;
+	while ((c0 = pool_take(&j->next, 256, CH)) >= 0) {
+		int c, t, c1 = (int)c0 + 256 > CH ? CH : (int)c0 + 256;
+		for (c = (int)c0; c < c1; c++) {
+			const float *w = j->L->conv_w + 4 * c;
+			float s0 = cs[c], s1 = cs[CH + c], s2 = cs[2 * CH + c];
+			for (t = 0; t < j->T; t++) {
+				float in = P.qkv[(size_t)t * CH + c];
+				P.qkv[(size_t)t * CH + c] = s0 * w[0] + s1 * w[1] + s2 * w[2] + in * w[3];
+				s0 = s1;
+				s1 = s2;
+				s2 = in;
+			}
+			cs[c] = s0;
+			cs[CH + c] = s1;
+			cs[2 * CH + c] = s2;
+		}
+	}
+}
+
+/* the delta rule per value head over the chunk, in token order */
+static void
+pdelta(void *arg, int ith, int nth)
+{
+	pj *j = arg;
+	const hparams *h = &j->m->hp;
+	const int D = h->dn_dim, KH = h->dn_kh, CH = h->dn_qkv, DI = h->d_inner;
+	const float scale = 1.0f / sqrtf((float)D);
+	float delta[256];
+	long hv;
+	(void)ith;
+	(void)nth;
+	while ((hv = pool_take(&j->next, 1, h->dn_vh)) >= 0) {
+		float *M = j->s->ssm[j->il] + (size_t)hv * D * D;
+		int t, r;
+		for (t = 0; t < j->T; t++) {
+			const float *xb = P.qkv + (size_t)t * CH;
+			const float *q = xb + (hv % KH) * D, *k = xb + KH * D + (hv % KH) * D;
+			const float *v = xb + 2 * KH * D + hv * D;
+			const float decay = expf(softplusf(P.alpha[(size_t)t * h->dn_vh + hv] +
+			    j->L->dt_bias[hv]) * j->L->ssm_a[hv]);
+			const float beta = sigmoidf(P.beta[(size_t)t * h->dn_vh + hv]);
+			float *o = P.y + (size_t)t * DI + hv * D;
+			for (r = 0; r < D; r++) {
+				float *row = M + (size_t)r * D;
+				int c;
+				for (c = 0; c < D; c++)
+					row[c] *= decay;
+				delta[r] = (v[r] - v_dot(row, k, (size_t)D)) * beta;
+			}
+			for (r = 0; r < D; r++) {
+				float *row = M + (size_t)r * D;
+				v_axpy(row, delta[r], k, (size_t)D);
+				o[r] = v_dot(row, q, (size_t)D) * scale;
+			}
+		}
+	}
+}
+
+static void
+pdeltanet(const model *m, const layer *L, state *s, int il, int T)
+{
+	const hparams *h = &m->hp;
+	const int E = h->n_embd, D = h->dn_dim, CH = h->dn_qkv, DI = h->d_inner;
+	mm_item it[4];
+	pj j;
+	int t, i;
+
+	it[0] = mmi(&L->wqkv, 0, P.xq, E / 256, T, P.qkv, CH);
+	it[1] = mmi(&L->wz, 0, P.xq, E / 256, T, P.z, DI);
+	it[2] = mmi(&L->wbeta, 0, P.xq, E / 256, T, P.beta, h->dn_vh);
+	it[3] = mmi(&L->walpha, 0, P.xq, E / 256, T, P.alpha, h->dn_vh);
+	mm_run(it, 4);
+	j.m = m;
+	j.L = L;
+	j.s = s;
+	j.il = il;
+	j.T = T;
+	j.next = 0;
+	pool_run(pconv, &j);
+	for (t = 0; t < T; t++) {
+		float *xb = P.qkv + (size_t)t * CH;
+		v_silu(xb, (size_t)CH);
+		for (i = 0; i < 2 * h->dn_kh; i++)
+			l2norm(xb + i * D, D, h->eps);
+	}
+	j.next = 0;
+	pool_run(pdelta, &j);
+	for (t = 0; t < T; t++) {
+		float *y = P.y + (size_t)t * DI;
+		for (i = 0; i < h->dn_vh; i++)
+			v_rmsnorm(y + i * D, y + i * D, L->ssm_norm, (size_t)D, h->eps);
+		v_mul_silu(y, P.z + (size_t)t * DI, (size_t)DI);
+	}
+	quant_rows(P.y, P.yq, T, DI);
+	it[0] = mmi(&L->ssm_out, 0, P.yq, DI / 256, T, P.tmp, E);
+	mm_run(it, 1);
+}
+
+typedef struct {
+	const model *m;
+	state *s;
+	int il, T, pos;
+	long next;
+} paj;
+
+static void
+patt(void *arg, int ith, int nth)
+{
+	paj *j = arg;
+	const hparams *h = &j->m->hp;
+	const int hd = h->head_dim, kvd = h->n_head_kv * hd, grp = h->n_head / h->n_head_kv;
+	const float *kc = j->s->kc[j->il], *vc = j->s->vc[j->il];
+	float *a = malloc(sizeof(float) * (size_t)(j->pos + j->T));
+	long w;
+	(void)ith;
+	(void)nth;
+	if (!a)
+		return;
+	while ((w = pool_take(&j->next, 1, (long)j->T * h->n_head)) >= 0) {
+		int t = (int)(w / h->n_head), hh = (int)(w % h->n_head), n = j->pos + t + 1, k, d;
+		const float *q = P.q + (size_t)t * 2 * h->n_head * hd + (size_t)hh * 2 * hd, *gate = q + hd;
+		const int off = (hh / grp) * hd;
+		float *o = P.ao + (size_t)t * h->n_head * hd + (size_t)hh * hd, mx = -INFINITY, sum = 0;
+		for (k = 0; k < n; k++) {
+			a[k] = v_dot(q, kc + (size_t)k * kvd + off, (size_t)hd) * h->attn_scale;
+			if (a[k] > mx)
+				mx = a[k];
+		}
+		for (k = 0; k < n; k++)
+			a[k] -= mx;
+		v_exp(a, a, (size_t)n);
+		for (k = 0; k < n; k++)
+			sum += a[k];
+		memset(o, 0, sizeof(float) * (size_t)hd);
+		for (k = 0; k < n; k++)
+			v_axpy(o, a[k] / sum, vc + (size_t)k * kvd + off, (size_t)hd);
+		for (d = 0; d < hd; d++)
+			o[d] *= sigmoidf(gate[d]);
+	}
+	free(a);
+}
+
+static void
+pattention(const model *m, const layer *L, state *s, int il, int T)
+{
+	const hparams *h = &m->hp;
+	const int E = h->n_embd, hd = h->head_dim, kvd = h->n_head_kv * hd, QD = 2 * h->n_head * hd;
+	const int AD = h->n_head * hd;
+	float *kd = s->kc[il] + (size_t)s->pos * kvd, *vd = s->vc[il] + (size_t)s->pos * kvd;
+	mm_item it[3];
+	paj j;
+	int t, i;
+
+	it[0] = mmi(&L->q, 0, P.xq, E / 256, T, P.q, QD);
+	it[1] = mmi(&L->k, 0, P.xq, E / 256, T, kd, kvd);
+	it[2] = mmi(&L->v, 0, P.xq, E / 256, T, vd, kvd);
+	mm_run(it, 3);
+	for (t = 0; t < T; t++) {
+		for (i = 0; i < h->n_head; i++) {
+			float *q = P.q + (size_t)t * QD + i * 2 * hd;
+			v_rmsnorm(q, q, L->q_norm, (size_t)hd, h->eps);
+			rope(q, h->rope_dim, s->pos + t, h->rope_base);
+		}
+		for (i = 0; i < h->n_head_kv; i++) {
+			float *k = kd + (size_t)t * kvd + i * hd;
+			v_rmsnorm(k, k, L->k_norm, (size_t)hd, h->eps);
+			rope(k, h->rope_dim, s->pos + t, h->rope_base);
+		}
+	}
+	j.m = m;
+	j.s = s;
+	j.il = il;
+	j.T = T;
+	j.pos = s->pos;
+	j.next = 0;
+	pool_run(patt, &j);
+	quant_rows(P.ao, P.yq, T, AD);
+	it[0] = mmi(&L->o, 0, P.yq, AD / 256, T, P.tmp, E);
+	mm_run(it, 1);
+}
+
+static void
+pffn(const model *m, const layer *L, int T)
+{
+	const hparams *h = &m->hp;
+	const int E = h->n_embd, FF = h->n_ff;
+	mm_item it[2];
+	it[0] = mmi(&L->ffn_gate, 0, P.xq, E / 256, T, P.fg, FF);
+	it[1] = mmi(&L->ffn_up, 0, P.xq, E / 256, T, P.fu, FF);
+	mm_run(it, 2);
+	v_swiglu(P.fg, P.fu, (size_t)T * FF);
+	quant_rows(P.fg, P.fq, T, FF);
+	it[0] = mmi(&L->ffn_down, 0, P.fq, FF / 256, T, P.tmp, E);
+	mm_run(it, 1);
+}
+
+static void
+pchunk(const model *m, state *s, const int *tok, int T)
+{
+	const hparams *h = &m->hp;
+	const int E = h->n_embd;
+	int il, t;
+
+	for (t = 0; t < T; t++) {
+		int id = tok[t] < 0 || tok[t] >= h->n_vocab ? 0 : tok[t];
+		dequant_row(m->tok_embd.type, m->tok_embd.data + (size_t)id * m->tok_embd.row_bytes,
+		    P.x + (size_t)t * E, (size_t)E);
+	}
+	for (il = 0; il < h->n_layer; il++) {
+		const layer *L = &m->L[il];
+		for (t = 0; t < T; t++)
+			v_rmsnorm(P.xn + (size_t)t * E, P.x + (size_t)t * E, L->attn_norm, (size_t)E, h->eps);
+		quant_rows(P.xn, P.xq, T, E);
+		if (L->attn)
+			pattention(m, L, s, il, T);
+		else
+			pdeltanet(m, L, s, il, T);
+		v_axpy(P.x, 1.0f, P.tmp, (size_t)T * E);
+		for (t = 0; t < T; t++)
+			v_rmsnorm(P.xn + (size_t)t * E, P.x + (size_t)t * E, L->post_norm, (size_t)E, h->eps);
+		quant_rows(P.xn, P.xq, T, E);
+		pffn(m, L, T);
+		v_axpy(P.x, 1.0f, P.tmp, (size_t)T * E);
+	}
+	s->pos += T;
+}
+
+const float *
+qwen35_prefill(const model *m, state *s, const int *tok, int n)
+{
+	int done = 0;
+	if (pbufs(&m->hp) != 0) {
+		const float *lg = NULL;
+		int i;
+		for (i = 0; i < n; i++)
+			lg = qwen35_forward(m, s, tok[i], i == n - 1);
+		return lg;
+	}
+	/* all but the last token in chunks; the last one through the
+	 * single-token path, which also produces the logits */
+	while (done < n - 1) {
+		int T = n - 1 - done > QB ? QB : n - 1 - done;
+		pchunk(m, s, tok + done, T);
+		done += T;
+	}
+	return qwen35_forward(m, s, tok[n - 1], 1);
+}

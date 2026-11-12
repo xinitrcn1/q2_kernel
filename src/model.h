@@ -131,6 +131,21 @@ void mv_run(const mv_item *it, int n);
 /* CPU only (when a GPU sequence of ours is already in flight) */
 void mv_cpu(const mv_item *it, int n);
 
+/* batched matmul (prefill.c): y[t*ldy + r] = dot(W_e[r], x_t), rows
+ * [r0, r1), for T token vectors of xs q8k blocks each */
+struct q8k_s;
+typedef struct {
+	const wt *w;
+	int e;
+	const struct q8k_s *xq;
+	int xs, T;
+	float *y;
+	int ldy, r0, r1;
+} mm_item;
+void mm_run(const mm_item *it, int n);
+mm_item mmi(const wt *w, int e, const struct q8k_s *xq, int xs, int T, float *y, int ldy);
+const float *qwen35_prefill(const model *m, state *s, const int *tok, int n);
+
 /* time spent per phase, seconds */
 enum { PROF_CPU_MV, PROF_CPU_MV_OVERLAP, PROF_GPU_WAIT, PROF_SCAN, PROF_ATTN,
 	PROF_GPU_MIXER, PROF_MIX_IN, PROF_MIX_OUT, PROF_MOE_GU, PROF_MOE_D, PROF_N };

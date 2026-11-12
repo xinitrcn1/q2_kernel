@@ -11,7 +11,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-typedef struct {
+typedef struct q8k_s {
 	float d;
 	int8_t qs[256];
 	int16_t bsums[16];

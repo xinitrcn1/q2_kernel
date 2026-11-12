@@ -815,8 +815,135 @@ kq_dot(uint32_t t, const void *row, const q8k *x, size_t n)
  */
 typedef struct {
 	__m256i u[8], s[8], m;
+	__m256i sg[8];          /* i-quants: +-1 per weight, applied to x */
+	int sgn;
 	float A, C;
 } kblk;
+
+static __m256i
+s16pair(int lo, int hi)
+{
+	return _mm256_setr_m128i(_mm_set1_epi16((short)lo), _mm_set1_epi16((short)hi));
+}
+
+/* i-quant blocks for kq_dotT: magnitudes u_j, signs sg_j, scales s_j
+ * (per 16), the block scale A, and for IQ1_S the bsums term C*m */
+static int
+dec_block_iq(uint32_t t, const uint8_t *b, kblk *k)
+{
+	int ib, l;
+	k->sgn = 1;
+	k->m = _mm256_setzero_si256();
+	k->C = 0;
+	switch (t) {
+	case GT_IQ2_XXS:
+		for (ib = 0; ib < 8; ib++) {
+			const uint8_t *q = b + 2 + 8 * ib;
+			uint32_t a1 = rd32(q + 4);
+			int sc = 2 * (int)(a1 >> 28) + 1;
+			k->u[ib] = grid4(iq2xxs_grid[q[0]], iq2xxs_grid[q[1]], iq2xxs_grid[q[2]], iq2xxs_grid[q[3]]);
+			k->sg[ib] = grid4(sgn7[a1 & 127], sgn7[(a1 >> 7) & 127], sgn7[(a1 >> 14) & 127],
+			    sgn7[(a1 >> 21) & 127]);
+			k->s[ib] = s16pair(sc, sc);
+		}
+		k->A = h16f(b) * 0.125f;
+		return 1;
+	case GT_IQ2_XS:
+		for (ib = 0; ib < 8; ib++) {
+			const uint8_t *q = b + 2 + 8 * ib;
+			uint16_t q0 = (uint16_t)(q[0] | q[1] << 8), q1 = (uint16_t)(q[2] | q[3] << 8);
+			uint16_t q2 = (uint16_t)(q[4] | q[5] << 8), q3 = (uint16_t)(q[6] | q[7] << 8);
+			uint8_t sc = b[66 + ib];
+			k->u[ib] = grid4(iq2xs_grid[q0 & 511], iq2xs_grid[q1 & 511], iq2xs_grid[q2 & 511],
+			    iq2xs_grid[q3 & 511]);
+			k->sg[ib] = grid4(sgn7[q0 >> 9], sgn7[q1 >> 9], sgn7[q2 >> 9], sgn7[q3 >> 9]);
+			k->s[ib] = s16pair(2 * (sc & 15) + 1, 2 * (sc >> 4) + 1);
+		}
+		k->A = h16f(b) * 0.125f;
+		return 1;
+	case GT_IQ2_S: {
+		const uint8_t *qs = b + 2, *sgb = b + 34, *qh = b + 66, *scs = b + 74;
+		for (ib = 0; ib < 8; ib++, qs += 4, sgb += 4) {
+			uint8_t h = qh[ib], sc = scs[ib];
+			k->u[ib] = grid4(iq2s_grid[qs[0] | ((h << 8) & 0x300)], iq2s_grid[qs[1] | ((h << 6) & 0x300)],
+			    iq2s_grid[qs[2] | ((h << 4) & 0x300)], iq2s_grid[qs[3] | ((h << 2) & 0x300)]);
+			k->sg[ib] = grid4(sgn8[sgb[0]], sgn8[sgb[1]], sgn8[sgb[2]], sgn8[sgb[3]]);
+			k->s[ib] = s16pair(2 * (sc & 15) + 1, 2 * (sc >> 4) + 1);
+		}
+		k->A = h16f(b) * 0.125f;
+		return 1;
+	}
+	case GT_IQ3_XXS: {
+		const uint8_t *qs = b + 2;
+		for (ib = 0; ib < 8; ib++, qs += 8) {
+			uint32_t a = rd32(b + 66 + 4 * ib);
+			int sc = 2 * (int)(a >> 28) + 1;
+			k->u[ib] = _mm256_set_epi32((int)iq3xxs_grid[qs[7]], (int)iq3xxs_grid[qs[6]],
+			    (int)iq3xxs_grid[qs[5]], (int)iq3xxs_grid[qs[4]], (int)iq3xxs_grid[qs[3]],
+			    (int)iq3xxs_grid[qs[2]], (int)iq3xxs_grid[qs[1]], (int)iq3xxs_grid[qs[0]]);
+			k->sg[ib] = grid4(sgn7[a & 127], sgn7[(a >> 7) & 127], sgn7[(a >> 14) & 127],
+			    sgn7[(a >> 21) & 127]);
+			k->s[ib] = s16pair(sc, sc);
+		}
+		k->A = h16f(b) * 0.25f;
+		return 1;
+	}
+	case GT_IQ3_S: {
+		const uint8_t *qs = b + 2, *qh = b + 66, *sgb = b + 74, *scs = b + 106;
+		for (ib = 0; ib < 8; ib++, qs += 8, sgb += 4) {
+			const uint32_t h = qh[ib];
+			const int sc = 2 * (ib & 1 ? scs[ib / 2] >> 4 : scs[ib / 2] & 15) + 1;
+			k->u[ib] = _mm256_set_epi32(
+			    (int)iq3s_grid[qs[7] | ((h << 1) & 256)], (int)iq3s_grid[qs[6] | ((h << 2) & 256)],
+			    (int)iq3s_grid[qs[5] | ((h << 3) & 256)], (int)iq3s_grid[qs[4] | ((h << 4) & 256)],
+			    (int)iq3s_grid[qs[3] | ((h << 5) & 256)], (int)iq3s_grid[qs[2] | ((h << 6) & 256)],
+			    (int)iq3s_grid[qs[1] | ((h << 7) & 256)], (int)iq3s_grid[qs[0] | ((h << 8) & 256)]);
+			k->sg[ib] = grid4(sgn8[sgb[0]], sgn8[sgb[1]], sgn8[sgb[2]], sgn8[sgb[3]]);
+			k->s[ib] = s16pair(sc, sc);
+		}
+		k->A = h16f(b);
+		return 1;
+	}
+	case GT_IQ1_S: {
+		/* w = dl*(g + delta), g in {-1,0,1}: dl*(g+1) + dl*(delta-1);
+		 * (delta - 1)*8 is -7 or -9 */
+		const uint8_t *qs = b + 2;
+		short m16[16];
+		k->sgn = 0;
+		for (ib = 0; ib < 8; ib++, qs += 4) {
+			uint16_t qh = (uint16_t)(b[34 + 2 * ib] | b[35 + 2 * ib] << 8);
+			int sc = 2 * ((qh >> 12) & 7) + 1;
+			k->u[ib] = _mm256_add_epi8(grid4(iq1s_grid[qs[0] | ((qh << 8) & 0x700)],
+			    iq1s_grid[qs[1] | ((qh << 5) & 0x700)], iq1s_grid[qs[2] | ((qh << 2) & 0x700)],
+			    iq1s_grid[qs[3] | ((qh >> 1) & 0x700)]), _mm256_set1_epi8(1));
+			k->s[ib] = s16pair(sc, sc);
+			m16[2 * ib] = m16[2 * ib + 1] = (short)(sc * (qh & 0x8000 ? -9 : -7));
+		}
+		k->m = _mm256_loadu_si256((const __m256i *)m16);
+		k->A = h16f(b);
+		k->C = h16f(b) * 0.125f;
+		return 1;
+	}
+	case GT_IQ4_XS: {
+		const __m256i tbl = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)kvalues_iq4nl));
+		uint16_t sh = (uint16_t)(b[2] | b[3] << 8);
+		const uint8_t *sl = b + 4, *qs = b + 8;
+		for (ib = 0; ib < 8; ib++, qs += 16) {
+			int ls = ((sl[ib / 2] >> 4 * (ib % 2)) & 15) | (((sh >> 2 * ib) & 3) << 4);
+			__m128i q = _mm_loadu_si128((const __m128i *)qs);
+			__m256i n = _mm256_and_si256(_mm256_setr_m128i(q, _mm_srli_epi16(q, 4)), _mm256_set1_epi8(15));
+			__m256i w = _mm256_shuffle_epi8(tbl, n);
+			k->u[ib] = _mm256_sign_epi8(w, w);
+			k->sg[ib] = w;
+			k->s[ib] = s16pair(ls - 32, ls - 32);
+		}
+		k->A = h16f(b);
+		return 1;
+	}
+	}
+	(void)l;
+	return 0;
+}
 
 static void
 dec_block(uint32_t t, const uint8_t *b, kblk *k)
@@ -931,20 +1058,27 @@ kq_dotT(uint32_t t, const void *row, const q8k *x, size_t xs, int T, size_t n,
 	const uint8_t *b = row;
 	int tt, j;
 
-	if (T > 64 || (t != GT_Q2_K && t != GT_Q3_K && t != GT_Q4_K && t != GT_Q5_K &&
+	const int iq = t == GT_IQ2_XXS || t == GT_IQ2_XS || t == GT_IQ2_S || t == GT_IQ3_XXS ||
+	    t == GT_IQ3_S || t == GT_IQ1_S || t == GT_IQ4_XS;
+
+	if (T > 64 || (!iq && t != GT_Q2_K && t != GT_Q3_K && t != GT_Q4_K && t != GT_Q5_K &&
 	    t != GT_Q6_K))
 		return 0;
+	k.sgn = 0;
 	for (tt = 0; tt < T; tt++)
 		acc[tt] = _mm256_setzero_ps();
 	for (i = 0; i < n / 256; i++, b += bb) {
-		dec_block(t, b, &k);
+		if (iq)
+			dec_block_iq(t, b, &k);
+		else
+			dec_block(t, b, &k);
 		for (tt = 0; tt < T; tt++) {
 			const q8k *xb = x + (size_t)tt * xs + i;
 			__m256i isum = _mm256_setzero_si256();
 			__m256i msum = _mm256_madd_epi16(k.m, _mm256_loadu_si256((const __m256i *)xb->bsums));
 			for (j = 0; j < 8; j++) {
-				__m256i p = _mm256_maddubs_epi16(k.u[j],
-				    _mm256_loadu_si256((const __m256i *)(xb->qs + 32 * j)));
+				__m256i xv = _mm256_loadu_si256((const __m256i *)(xb->qs + 32 * j));
+				__m256i p = _mm256_maddubs_epi16(k.u[j], k.sgn ? _mm256_sign_epi8(xv, k.sg[j]) : xv);
 				isum = _mm256_add_epi32(isum, _mm256_madd_epi16(p, k.s[j]));
 			}
 			acc[tt] = _mm256_fmadd_ps(_mm256_set1_ps(k.A * xb->d), _mm256_cvtepi32_ps(isum), acc[tt]);
