@@ -11,6 +11,7 @@
 #include "vk.h"
 
 int g_ref;
+double g_gpu_share = 0.6;
 
 #include <time.h>
 /* --bench breakdown: see PROF_* in model.h */
@@ -186,6 +187,8 @@ model_load(model *m, const char *path, char *err, size_t errlen)
 		    T(up_s, "ffn_up_shexp.weight") || T(down_s, "ffn_down_shexp.weight"))
 			return -1;
 		L->gate_s.heat = L->up_s.heat = L->down_s.heat = 1;
+		L->gate_s.moe = L->up_s.moe = L->down_s.moe = 1;
+		L->gate_e.moe = L->up_e.moe = L->down_e.moe = 1;
 		L->gate_e.heat = L->up_e.heat = L->down_e.heat =
 		    (double)h->n_expert_used / h->n_expert;
 #undef T
@@ -299,41 +302,60 @@ state_free(state *s, const model *m)
 
 typedef struct {
 	const mv_item *it;
+	const int *r0;          /* first row the CPU computes */
 	int n;
 	const q8k *xq[MV_MAX];
-	size_t *cum;            /* prefix sum of row bytes, in units of rows */
+	size_t *cum;            /* prefix sum of rows */
 	size_t total;
+	long next, chunk;
 } mv_job;
 
 static q8k *qbuf;
 static size_t qbuf_cap;
 
+/* rows are claimed in chunks of ~CHUNK_BYTES of weights */
+#define CHUNK_BYTES (64 * 1024)
+
 static void
 mv_worker(void *arg, int ith, int nth)
 {
 	mv_job *j = arg;
-	size_t lo = j->total * (size_t)ith / (size_t)nth;
-	size_t hi = j->total * (size_t)(ith + 1) / (size_t)nth;
+	long c;
 	int i = 0;
 
-	/* walk the concatenated row space [lo, hi) */
-	while (i < j->n && j->cum[i + 1] <= lo)
-		i++;
-	for (; i < j->n && j->cum[i] < hi; i++) {
-		const mv_item *t = &j->it[i];
-		const wt *w = t->w;
-		size_t r0 = lo > j->cum[i] ? lo - j->cum[i] : 0;
-		size_t r1 = (hi < j->cum[i + 1] ? hi : j->cum[i + 1]) - j->cum[i];
-		const uint8_t *base = w->data + (size_t)t->e * (size_t)w->N * w->row_bytes;
-		size_t r;
+	(void)ith;
+	(void)nth;
+	while ((c = pool_take(&j->next, j->chunk, (long)j->total)) >= 0) {
+		size_t lo = (size_t)c, hi = lo + (size_t)j->chunk;
+		if (hi > j->total)
+			hi = j->total;
+		/* items in order; chunks only move forward per thread, but
+		 * other threads may have taken the ones in between */
+		while (i > 0 && j->cum[i] > lo)
+			i--;
+		while (j->cum[i + 1] <= lo)
+			i++;
+		for (; i < j->n && j->cum[i] < hi; i++) {
+			const mv_item *t = &j->it[i];
+			const wt *w = t->w;
+			size_t r0 = (lo > j->cum[i] ? lo - j->cum[i] : 0) + (size_t)j->r0[i];
+			size_t r1 = (hi < j->cum[i + 1] ? hi : j->cum[i + 1]) - j->cum[i] +
+			    (size_t)j->r0[i];
+			const uint8_t *base = w->data + (size_t)t->e * (size_t)w->N * w->row_bytes;
+			size_t r;
 
-		if (g_ref || w->type == GT_F32) {
-			for (r = r0; r < r1; r++)
-				t->y[r] = dot_row(w->type, base + r * w->row_bytes, t->x, (size_t)w->K);
-		} else {
-			for (r = r0; r < r1; r++)
-				t->y[r] = kq_dot(w->type, base + r * w->row_bytes, j->xq[i], (size_t)w->K);
+			if (g_ref || w->type == GT_F32) {
+				for (r = r0; r < r1; r++)
+					t->y[r] = dot_row(w->type, base + r * w->row_bytes, t->x,
+					    (size_t)w->K);
+			} else {
+				for (r = r0; r < r1; r++)
+					t->y[r] = kq_dot(w->type, base + r * w->row_bytes, j->xq[i],
+					    (size_t)w->K);
+			}
 		}
+		if (i > 0)
+			i--;
 	}
 }
 
@@ -342,6 +364,7 @@ mv_run(const mv_item *it, int n)
 {
 	mv_item cpu[MV_MAX];
 	const q8k *xq[MV_MAX], *cxq[MV_MAX];
+	int cr0[MV_MAX];
 	size_t cum[MV_MAX + 1], need = 0, used = 0;
 	mv_job job;
 	int i, k, nc = 0, ngpu = 0;
@@ -367,19 +390,24 @@ mv_run(const mv_item *it, int n)
 			continue;
 		}
 		xq[i] = qbuf + used;
-		if (!g_ref || it[i].w->gpu)
+		if (!g_ref || it[i].w->gpu_rows)
 			q8k_quantize(it[i].x, qbuf + used, (size_t)it[i].w->K);
 		used += (size_t)it[i].w->K / 256;
 	}
 
 	if (vk_ready())
 		vk_begin();
+	/* rows [0, gpu_rows) on the GPU, the rest on the CPU */
 	for (i = 0; i < n; i++) {
-		if (vk_ready() && it[i].w->gpu &&
-		    vk_add(it[i].w, it[i].e, it[i].x, xq[i], it[i].y) == 0)
+		int r0 = 0;
+		if (vk_ready() && it[i].w->gpu_rows &&
+		    vk_add(it[i].w, it[i].e, it[i].x, xq[i], it[i].y) == 0) {
 			ngpu++;
-		else {
+			r0 = it[i].w->gpu_rows;
+		}
+		if (r0 < it[i].w->N) {
 			cxq[nc] = xq[i];
+			cr0[nc] = r0;
 			cpu[nc++] = it[i];
 		}
 	}
@@ -389,14 +417,22 @@ mv_run(const mv_item *it, int n)
 	if (nc) {
 		memset(&job, 0, sizeof(job));
 		job.it = cpu;
+		job.r0 = cr0;
 		job.n = nc;
 		job.cum = cum;
 		cum[0] = 0;
 		for (i = 0; i < nc; i++) {
-			cum[i + 1] = cum[i] + (size_t)cpu[i].w->N;
+			cum[i + 1] = cum[i] + (size_t)(cpu[i].w->N - cr0[i]);
 			job.xq[i] = cxq[i];
 		}
 		job.total = cum[nc];
+		{
+			size_t rb = cpu[0].w->row_bytes;
+			job.chunk = (long)(CHUNK_BYTES / (rb ? rb : 1));
+			if (job.chunk < 4)
+				job.chunk = 4;
+			job.next = 0;
+		}
 		{
 			double t0 = pnow();
 			pool_run(mv_worker, &job);
@@ -474,6 +510,7 @@ typedef struct {
 	const layer *L;
 	state *s;
 	const float *dt;        /* softplus'd, per head */
+	long next;
 } scan_job;
 
 /* one head: s = s*exp(dt*A) + dt*x*B ; y = s.C + D*x */
@@ -485,9 +522,11 @@ scan_worker(void *arg, int ith, int nth)
 	const int P = h->ssm_head_dim, NS = h->d_state;
 	const float *x = j->s->xbc, *B = x + h->d_inner, *C = B + NS;
 	float *st = j->s->ssm[j->L - j->m->L];
-	int hd;
+	long hd;
 
-	for (hd = ith; hd < h->ssm_heads; hd += nth) {
+	(void)ith;
+	(void)nth;
+	while ((hd = pool_take(&j->next, 1, h->ssm_heads)) >= 0) {
 		const float dt = j->dt[hd];
 		const float dA = expf(dt * j->L->A[hd]);
 		const float Dh = j->L->D[hd];
@@ -542,6 +581,7 @@ mamba2(const model *m, const layer *L, state *s, int il)
 	sj.L = L;
 	sj.s = s;
 	sj.dt = dt;
+	sj.next = 0;
 	{
 		double t0 = pnow();
 		pool_run(scan_worker, &sj);

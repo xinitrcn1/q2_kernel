@@ -20,7 +20,7 @@
 typedef struct {
 	const char *model, *prompt, *system, *dump;
 	int n_predict, threads, ctx, gpu_mib, device, chat, raw, info, tokens;
-	int bench, check, top_k, verbose, show_special, logits;
+	int bench, check, kbench, top_k, verbose, show_special, logits;
 	float temp, top_p;
 	unsigned long seed;
 } opts;
@@ -52,6 +52,7 @@ usage(void)
 	    "  -c N           context size (default 4096)\n"
 	    "  -g MIB         GPU weight split in MiB (default 512, 0 = CPU only)\n"
 	    "  -d N           Vulkan device index\n"
+	    "  --gpu-share F  fraction of each dense matvec's rows on the GPU (0.6)\n"
 	    "  --temp F       temperature (default 0 = greedy)\n"
 	    "  --top-k N      (default 40)  --top-p F (default 0.95)  --seed N\n"
 	    "  --ref          reference float kernels on the CPU\n"
@@ -63,6 +64,7 @@ usage(void)
 	    "  --dump FILE    also write all of them as raw f32\n"
 	    "  --bench        time prompt processing and generation\n"
 	    "  --check        compare CPU/GPU kernels against the reference\n"
+	    "  --kbench       single-thread CPU kernel throughput per type\n"
 	    "  -v             verbose\n");
 	exit(2);
 }
@@ -106,6 +108,7 @@ parse(int argc, char **argv)
 		else if (!strcmp(a, "-c")) O.ctx = atoi(ARG());
 		else if (!strcmp(a, "-g")) O.gpu_mib = atoi(ARG());
 		else if (!strcmp(a, "-d")) O.device = atoi(ARG());
+		else if (!strcmp(a, "--gpu-share")) g_gpu_share = atof(ARG());
 		else if (!strcmp(a, "--temp")) O.temp = (float)atof(ARG());
 		else if (!strcmp(a, "--top-k")) O.top_k = atoi(ARG());
 		else if (!strcmp(a, "--top-p")) O.top_p = (float)atof(ARG());
@@ -120,6 +123,7 @@ parse(int argc, char **argv)
 		else if (!strcmp(a, "--dump")) { O.dump = ARG(); O.logits = 1; }
 		else if (!strcmp(a, "--bench")) O.bench = 1;
 		else if (!strcmp(a, "--check")) O.check = 1;
+		else if (!strcmp(a, "--kbench")) O.kbench = 1;
 		else if (!strcmp(a, "-v")) O.verbose = 1;
 		else if (a[0] == '-') usage();
 		else O.prompt = a;
@@ -316,7 +320,7 @@ info(void)
 		if (O.verbose)
 			printf("  %-32s %-5s %5d x %6d x %2d %9.2f MiB%s\n", w->name,
 			    ggml_type_name(w->type), w->K, w->N, w->E, w->nbytes / 1048576.0,
-			    w->gpu ? "  [gpu]" : "");
+			    w->gpu_rows ? "  [gpu]" : "");
 	}
 	printf("  quantized weights %.1f MiB (dense %.1f MiB), %.1f MiB read per token\n",
 	    tot / 1048576.0, dense / 1048576.0, hot / 1048576.0);
@@ -352,7 +356,7 @@ check(void)
 		mv_item it;
 
 		/* one tensor per (type, K, gpu) combination */
-		uint32_t key = 1u << (w->type * 2 + (w->gpu != 0));
+		uint32_t key = 1u << (w->type * 2 + (w->gpu_rows != 0));
 		if ((seen & key) && !O.verbose)
 			continue;
 		seen |= key;
@@ -374,20 +378,21 @@ check(void)
 		tc = now() - t0;
 		for (r = 0; r < w->N; r++)
 			e_k += (double)(yk[r] - yr[r]) * (yk[r] - yr[r]);
-		if (w->gpu) {
-			/* force the GPU path */
+		if (w->gpu_rows) {
+			/* the GPU path alone, on its rows */
 			vk_begin();
 			vk_add(w, e, x, xq, yg);
 			t0 = now();
 			vk_submit();
 			vk_wait();
 			tg = now() - t0;
-			for (r = 0; r < w->N; r++)
+			for (r = 0; r < w->gpu_rows; r++)
 				e_g += (double)(yg[r] - yr[r]) * (yg[r] - yr[r]);
+			e_g *= (double)w->N / w->gpu_rows;
 		}
 		printf("%-32s %-5s %10.2e %10.2e ", w->name, ggml_type_name(w->type),
 		    sqrt(e_s / nr), sqrt(e_k / nr));
-		if (w->gpu)
+		if (w->gpu_rows)
 			printf("%10.2e %9.3f %9.3f\n", sqrt(e_g / nr), tc * 1e3, tg * 1e3);
 		else
 			printf("%10s %9.3f %9s\n", "-", tc * 1e3, "-");
@@ -399,6 +404,55 @@ check(void)
 	free(yr);
 	free(yk);
 	free(yg);
+}
+
+/* single thread: cache-hot rows (compute bound) and a full streaming
+ * pass (memory bound), in GB/s of weights and ns per 256 weights */
+static void
+kbench(void)
+{
+	uint32_t seen = 0;
+	static float x[8192], y[200000];
+	volatile float sink = 0;
+	int i, r, it;
+
+	for (i = 0; i < 8192; i++)
+		x[i] = (float)((double)rand() / RAND_MAX * 2 - 1);
+	printf("%-5s %6s %10s %10s %12s\n", "type", "K", "hot GB/s", "ns/256", "stream GB/s");
+	for (i = 0; i < M.n_all; i++) {
+		wt *w = M.all[i];
+		q8k xq[32];
+		int hot_rows, reps;
+		double t0, th, ts;
+		size_t nbytes;
+
+		if (seen & (1u << w->type))
+			continue;
+		seen |= 1u << w->type;
+		q8k_quantize(x, xq, (size_t)w->K);
+		hot_rows = (int)(256 * 1024 / w->row_bytes);
+		if (hot_rows > w->N)
+			hot_rows = w->N;
+		reps = (int)(400e6 / ((double)hot_rows * w->row_bytes)) + 1;
+		for (r = 0; r < hot_rows; r++)   /* warm */
+			y[r] = kq_dot(w->type, w->data + r * w->row_bytes, xq, (size_t)w->K);
+		t0 = now();
+		for (it = 0; it < reps; it++)
+			for (r = 0; r < hot_rows; r++)
+				y[r] += kq_dot(w->type, w->data + r * w->row_bytes, xq, (size_t)w->K);
+		th = now() - t0;
+		nbytes = w->row_bytes * (size_t)w->N * (size_t)(w->E > 4 ? 4 : w->E);
+		t0 = now();
+		for (r = 0; (size_t)r * w->row_bytes < nbytes; r++)
+			y[r % 200000] += kq_dot(w->type, w->data + (size_t)r * w->row_bytes, xq, (size_t)w->K);
+		ts = now() - t0;
+		sink += y[0];
+		printf("%-5s %6d %10.2f %10.2f %12.2f\n", ggml_type_name(w->type), w->K,
+		    (double)reps * hot_rows * w->row_bytes / th / 1e9,
+		    th / ((double)reps * hot_rows * w->K / 256) * 1e9,
+		    nbytes / ts / 1e9);
+	}
+	(void)sink;
 }
 
 /* ---------------------------------------------------------------- */
@@ -485,6 +539,10 @@ main(int argc, char **argv)
 	}
 	if (O.check) {
 		check();
+		goto out;
+	}
+	if (O.kbench) {
+		kbench();
 		goto out;
 	}
 	if (O.prompt) {

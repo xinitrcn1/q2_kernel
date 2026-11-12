@@ -473,83 +473,144 @@ submit_wait(void)
 	return 0;
 }
 
-int
-vk_upload(wt *w)
+static int
+flush_upload(size_t n, uint64_t dst)
 {
-	size_t sb, db, nblk, gbytes, done = 0, per;
 	VkCommandBufferBeginInfo bi;
+	VkBufferCopy rg;
+
+	if (n == 0)
+		return 0;
+	memset(&bi, 0, sizeof(bi));
+	bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+	bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+	CK(vkBeginCommandBuffer(V.cb, &bi));
+	rg.srcOffset = 0;
+	rg.dstOffset = dst;
+	rg.size = n;
+	vkCmdCopyBuffer(V.cb, V.ubuf, V.wbuf, 1, &rg);
+	CK(vkEndCommandBuffer(V.cb));
+	return submit_wait();
+}
+
+static size_t
+gpu_bytes(const wt *w, int rows)
+{
+	size_t sb = ggml_type_bytes(w->type), db = gpu_block_bytes(w->type);
+	return (size_t)rows * (w->row_bytes / sb * db) * (size_t)w->E;
+}
+
+int
+vk_upload(wt *w, int rows)
+{
+	size_t sb, db, rb, grb, fill = 0, total;
+	uint64_t base = V.wused, flushed = V.wused;
+	int e, r;
 	void *p;
 
-	if (!V.ok || !V.pipe[w->type])
+	if (!V.ok || !V.pipe[w->type] || rows <= 0)
 		return -1;
+	if (rows > w->N)
+		rows = w->N;
 	sb = ggml_type_bytes(w->type);
 	db = gpu_block_bytes(w->type);
-	nblk = w->nbytes / sb;
-	gbytes = nblk * db;
-	if (V.wused + gbytes > V.wcap)
+	rb = w->row_bytes;
+	grb = rb / sb * db;
+	total = gpu_bytes(w, rows);
+	if (V.wused + total > V.wcap)
 		return -1;
 	if (!V.ubuf) {
 		if (mkbuf(UPCHUNK, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, 1, &V.ubuf, &V.umem, &p))
 			return -1;
 		V.umap = p;
 	}
-	per = UPCHUNK / db;
-	while (done < nblk) {
-		size_t n = nblk - done < per ? nblk - done : per;
-		VkBufferCopy rg;
-		repack(w->type, w->data + done * sb, V.umap, n);
-		memset(&bi, 0, sizeof(bi));
-		bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-		bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-		CK(vkBeginCommandBuffer(V.cb, &bi));
-		rg.srcOffset = 0;
-		rg.dstOffset = V.wused + done * db;
-		rg.size = n * db;
-		vkCmdCopyBuffer(V.cb, V.ubuf, V.wbuf, 1, &rg);
-		CK(vkEndCommandBuffer(V.cb));
-		if (submit_wait())
-			return -1;
-		done += n;
-	}
-	w->gpu = 1;
-	w->gpu_off = V.wused;
-	w->gpu_row_bytes = w->row_bytes / sb * db;
-	V.wused += (gbytes + 255) & ~(size_t)255;
+	/* rows [0, rows) of each expert, packed expert after expert */
+	for (e = 0; e < w->E; e++)
+		for (r = 0; r < rows; r++) {
+			if (fill + grb > UPCHUNK) {
+				if (flush_upload(fill, flushed))
+					return -1;
+				flushed += fill;
+				fill = 0;
+			}
+			repack(w->type, w->data + ((size_t)e * (size_t)w->N + (size_t)r) * rb,
+			    V.umap + fill, rb / sb);
+			fill += grb;
+		}
+	if (flush_upload(fill, flushed))
+		return -1;
+	w->gpu_rows = rows;
+	w->gpu_off = base;
+	w->gpu_row_bytes = grb;
+	V.wused += (total + 255) & ~(size_t)255;
 	return 0;
 }
 
+/* round down to whole workgroups of rows */
 static int
-by_heat(const void *a, const void *b)
+round_rows(int rows, int N)
 {
-	const wt *x = *(wt *const *)a, *y = *(wt *const *)b;
-	if (x->heat != y->heat)
-		return x->heat < y->heat ? 1 : -1;
-	/* equal heat: larger first so the arena fills densely */
-	return x->nbytes < y->nbytes ? 1 : x->nbytes > y->nbytes ? -1 : 0;
+	if (rows >= N)
+		return N;
+	rows -= rows % (int)V.rows_per_wg;
+	return rows < 0 ? 0 : rows;
 }
 
+/*
+ * Every batch runs its GPU rows and CPU rows concurrently, so each
+ * dense matrix outside the MoE block gets the same GPU share (balanced
+ * per batch).  Shared experts go wholly to the GPU: they are batched
+ * with the routed experts, which only get what is left, spread evenly
+ * over all experts' leading rows.  Everything is scaled down if even
+ * the dense part does not fit.
+ */
 void
 vk_plan_and_upload(model *m, int verbose)
 {
-	wt *order[512];
-	int i, n = m->n_all, ng = 0;
+	size_t dense = 0, shexp = 0, experts = 0, cap = V.wcap, left;
+	double share = g_gpu_share, fe, fs = 1;
 	double hot = 0, hot_gpu = 0;
+	int i, ng = 0;
 
-	memcpy(order, m->all, sizeof(wt *) * (size_t)n);
-	qsort(order, (size_t)n, sizeof(wt *), by_heat);
-	for (i = 0; i < n; i++) {
-		double h = order[i]->heat * (double)order[i]->nbytes;
-		hot += h;
-		if (vk_upload(order[i]) == 0) {
-			hot_gpu += h;
+	for (i = 0; i < m->n_all; i++) {
+		wt *w = m->all[i];
+		size_t b = gpu_bytes(w, w->N);
+		if (w->heat < 1)
+			experts += b;
+		else if (w->moe)
+			shexp += b;
+		else
+			dense += b;
+	}
+	/* 256-byte alignment slack per tensor */
+	cap -= cap < (size_t)m->n_all * 256 ? cap : (size_t)m->n_all * 256;
+	if (share * dense > cap) {
+		share = (double)cap / dense;
+		left = 0;
+	} else
+		left = cap - (size_t)(share * dense);
+	if (shexp > left) {
+		fs = shexp ? (double)left / shexp : 0;
+		left = 0;
+	} else
+		left -= shexp;
+	fe = experts ? (double)left / experts : 0;
+	for (i = 0; i < m->n_all; i++) {
+		wt *w = m->all[i];
+		double f = w->heat < 1 ? fe : w->moe ? fs : share;
+		int rows = round_rows((int)(f * w->N), w->N);
+		if (rows > 0 && vk_upload(w, rows) == 0)
 			ng++;
-		}
+		/* bytes read per token, total and on the GPU */
+		hot += w->heat * (double)w->nbytes;
+		hot_gpu += w->heat * (double)w->nbytes * w->gpu_rows / w->N;
 	}
 	if (verbose)
-		fprintf(stderr, "vulkan: %d/%d tensors resident, %.1f MiB used, "
-		    "%.0f%% of per-token weight bytes on GPU (%.0f of %.0f MiB)\n",
-		    ng, n, V.wused / 1048576.0, 100.0 * hot_gpu / hot,
-		    hot_gpu / 1048576.0, hot / 1048576.0);
+		fprintf(stderr, "vulkan: gpu rows: %.0f%% of dense, %.0f%% of shared experts, "
+		    "%.1f%% of routed experts; %d/%d tensors, %.1f MiB; "
+		    "%.0f%% of per-token weight bytes (%.0f of %.0f MiB)\n",
+		    100 * share, 100 * fs, 100 * fe, ng, m->n_all, V.wused / 1048576.0,
+		    100.0 * hot_gpu / hot, hot_gpu / 1048576.0, hot / 1048576.0);
 }
 
 /* ---------------------------------------------------------------- */
@@ -568,7 +629,7 @@ vk_add(const wt *w, int e, const float *x, const q8k *xq, float *y)
 	int i;
 	uint32_t xo, nw = (uint32_t)w->K / 256 * Q8W;
 
-	if (!w->gpu || V.nd >= BMAX || V.yused + (uint32_t)w->N > YCAP)
+	if (!w->gpu_rows || V.nd >= BMAX || V.yused + (uint32_t)w->gpu_rows > YCAP)
 		return -1;
 	for (i = 0; i < V.nx; i++)
 		if (V.xs[i].x == x && V.xs[i].K == (uint32_t)w->K)
@@ -586,14 +647,14 @@ vk_add(const wt *w, int e, const float *x, const q8k *xq, float *y)
 	xo = V.xs[i].off;
 	V.d[V.nd].y = y;
 	V.d[V.nd].type = w->type;
-	V.d[V.nd].pc.w_off = (uint32_t)((w->gpu_off + (uint64_t)e * (uint64_t)w->N *
+	V.d[V.nd].pc.w_off = (uint32_t)((w->gpu_off + (uint64_t)e * (uint64_t)w->gpu_rows *
 	    w->gpu_row_bytes) / 4);
 	V.d[V.nd].pc.row_words = (uint32_t)(w->gpu_row_bytes / 4);
 	V.d[V.nd].pc.K = (uint32_t)w->K;
-	V.d[V.nd].pc.N = (uint32_t)w->N;
+	V.d[V.nd].pc.N = (uint32_t)w->gpu_rows;
 	V.d[V.nd].pc.x_off = xo;
 	V.d[V.nd].pc.y_off = XCAP + V.yused;
-	V.yused += ((uint32_t)w->N + 3) & ~3u;
+	V.yused += ((uint32_t)w->gpu_rows + 3) & ~3u;
 	V.nd++;
 	return 0;
 }

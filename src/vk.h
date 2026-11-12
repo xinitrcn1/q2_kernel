@@ -15,11 +15,12 @@ int vk_ready(void);
 void vk_shutdown(void);
 const char *vk_device_name(void);
 
-/* copy a tensor into the arena; 0 on success, -1 when it does not fit */
-int vk_upload(wt *w);
+/* copy the first 'rows' rows of each expert of a tensor into the
+ * arena; 0 on success, -1 when it does not fit */
+int vk_upload(wt *w, int rows);
 size_t vk_used(void);
 
-/* place tensors (hottest first) until the budget is spent */
+/* decide each tensor's GPU row share within the budget and upload */
 void vk_plan_and_upload(model *m, int verbose);
 
 /* batch recording; vk_submit starts it, vk_wait copies results to y */

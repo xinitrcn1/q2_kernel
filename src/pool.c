@@ -18,6 +18,7 @@ static struct {
 	int n;
 	pthread_t *th;
 	pthread_mutex_t mu;
+	pthread_spinlock_t sl;
 	pthread_cond_t go, done;
 	volatile unsigned gen;
 	volatile int pending;
@@ -111,6 +112,7 @@ pool_init(int n)
 		n = 1;
 	P.n = n;
 	pthread_mutex_init(&P.mu, NULL);
+	pthread_spin_init(&P.sl, PTHREAD_PROCESS_PRIVATE);
 	pthread_cond_init(&P.go, NULL);
 	pthread_cond_init(&P.done, NULL);
 	P.th = calloc((size_t)n, sizeof(*P.th));
@@ -120,6 +122,18 @@ pool_init(int n)
 		if (pthread_create(&P.th[i], NULL, worker, (void *)(long)i) != 0)
 			return -1;
 	return 0;
+}
+
+long
+pool_take(long *next, long chunk, long total)
+{
+	long v;
+	pthread_spin_lock(&P.sl);
+	v = *next;
+	if (v < total)
+		*next = v + chunk;
+	pthread_spin_unlock(&P.sl);
+	return v < total ? v : -1;
 }
 
 int

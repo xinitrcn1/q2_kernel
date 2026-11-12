@@ -210,14 +210,41 @@ kq_dot_scalar(uint32_t t, const void *row, const q8k *x, size_t n)
 
 #if defined(__AVX2__)
 
-static int
-hsum8(__m256i v)
+/*
+ * Each kernel accumulates per-block integer sums, converts them once
+ * and folds them into a float vector with the block's scales; there is
+ * one horizontal sum per row.  The 6-bit scale unpacking works on whole
+ * 32-bit words (four scales per op); each word form was proved equal to
+ * the byte-wise definition (kept in kq_dot_scalar) by SAT with ucas.
+ */
+
+#if defined(__F16C__)
+static float
+h16f(const uint8_t *p)
 {
-	__m128i s = _mm_add_epi32(_mm256_castsi256_si128(v),
-	    _mm256_extracti128_si256(v, 1));
-	s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0x4e));
-	s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0xb1));
-	return _mm_cvtsi128_si32(s);
+	uint16_t v;
+	memcpy(&v, p, 2);
+	return _cvtsh_ss(v);
+}
+#else
+#define h16f h16
+#endif
+
+static uint32_t
+rd32(const uint8_t *p)
+{
+	uint32_t v;
+	memcpy(&v, p, 4);
+	return v;
+}
+
+static float
+hsumf(__m256 v)
+{
+	__m128 s = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+	s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+	s = _mm_add_ss(s, _mm_movehdup_ps(s));
+	return _mm_cvtss_f32(s);
 }
 
 /* byte masks picking i16 lanes (2j, 2j+1) of a broadcast 8 x i16 into
@@ -239,7 +266,7 @@ dot_q2_k(const uint8_t *b, const q8k *x, size_t nb)
 	const __m256i m3 = _mm256_set1_epi8(3);
 	const __m128i m4 = _mm_set1_epi8(15);
 	__m256i pm[4];
-	float sum = 0;
+	__m256 acc = _mm256_setzero_ps();
 	size_t i;
 	int j, c;
 
@@ -249,9 +276,9 @@ dot_q2_k(const uint8_t *b, const q8k *x, size_t nb)
 		__m128i sc8 = _mm_loadu_si128((const __m128i *)b);
 		__m256i mins = _mm256_cvtepu8_epi16(_mm_and_si128(_mm_srli_epi16(sc8, 4), m4));
 		__m256i s16 = _mm256_cvtepu8_epi16(_mm_and_si128(sc8, m4));
-		__m256i bs = _mm256_loadu_si256((const __m256i *)x->bsums);
-		int summ = hsum8(_mm256_madd_epi16(mins, bs));
-		__m256i acc = _mm256_setzero_si256();
+		__m256i msum = _mm256_madd_epi16(mins,
+		    _mm256_loadu_si256((const __m256i *)x->bsums));
+		__m256i isum = _mm256_setzero_si256();
 		const int8_t *xq = x->qs;
 
 		for (c = 0; c < 2; c++) {
@@ -261,12 +288,29 @@ dot_q2_k(const uint8_t *b, const q8k *x, size_t nb)
 			for (j = 0; j < 4; j++, xq += 32) {
 				__m256i u = _mm256_and_si256(_mm256_srli_epi16(qv, 2 * j), m3);
 				__m256i p = _mm256_maddubs_epi16(u, _mm256_loadu_si256((const __m256i *)xq));
-				acc = _mm256_add_epi32(acc, _mm256_madd_epi16(p, _mm256_shuffle_epi8(sb, pm[j])));
+				isum = _mm256_add_epi32(isum, _mm256_madd_epi16(p, _mm256_shuffle_epi8(sb, pm[j])));
 			}
 		}
-		sum += x->d * (h16(b + 80) * (float)hsum8(acc) - h16(b + 82) * (float)summ);
+		acc = _mm256_fmadd_ps(_mm256_set1_ps(h16f(b + 80) * x->d),
+		    _mm256_cvtepi32_ps(isum), acc);
+		acc = _mm256_fmadd_ps(_mm256_set1_ps(-h16f(b + 82) * x->d),
+		    _mm256_cvtepi32_ps(msum), acc);
 	}
-	return sum;
+	return hsumf(acc);
+}
+
+/* sixteen signed Q3_K scales from the 12 packed bytes */
+static __m256i
+q3_scales16(const uint8_t *s)
+{
+	const uint32_t m4 = 0x0f0f0f0fu, m2 = 0x03030303u;
+	uint32_t a0 = rd32(s), a1 = rd32(s + 4), a2 = rd32(s + 8);
+	__m128i w = _mm_setr_epi32(
+	    (int)((a0 & m4) | ((a2 & m2) << 4)),
+	    (int)((a1 & m4) | (((a2 >> 2) & m2) << 4)),
+	    (int)(((a0 >> 4) & m4) | (((a2 >> 4) & m2) << 4)),
+	    (int)(((a1 >> 4) & m4) | (((a2 >> 6) & m2) << 4)));
+	return _mm256_sub_epi16(_mm256_cvtepu8_epi16(w), _mm256_set1_epi16(32));
 }
 
 static float
@@ -274,23 +318,19 @@ dot_q3_k(const uint8_t *b, const q8k *x, size_t nb)
 {
 	const __m256i m3 = _mm256_set1_epi8(3), m1 = _mm256_set1_epi8(1);
 	__m256i pm[4];
-	float sum = 0;
+	__m256 acc = _mm256_setzero_ps();
 	size_t i;
 	int j, c;
 
 	for (j = 0; j < 4; j++)
 		pm[j] = pair_mask(j);
 	for (i = 0; i < nb; i++, b += 110, x++) {
-		int8_t sc[16];
-		__m256i s16, acc = _mm256_setzero_si256();
+		__m256i s16 = q3_scales16(b + 96), isum = _mm256_setzero_si256();
 		__m256i hv = _mm256_loadu_si256((const __m256i *)b);
+		__m256i offs = _mm256_madd_epi16(s16,
+		    _mm256_loadu_si256((const __m256i *)x->bsums));
 		const int8_t *xq = x->qs;
-		int offs;
 
-		q3_scales(b + 96, sc);
-		s16 = _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)sc));
-		offs = hsum8(_mm256_madd_epi16(s16,
-		    _mm256_loadu_si256((const __m256i *)x->bsums)));
 		for (c = 0; c < 2; c++) {
 			__m256i qv = _mm256_loadu_si256((const __m256i *)(b + 32 + 32 * c));
 			__m256i sb = _mm256_broadcastsi128_si256(c ? _mm256_extracti128_si256(s16, 1)
@@ -301,33 +341,54 @@ dot_q3_k(const uint8_t *b, const q8k *x, size_t nb)
 				__m256i p;
 				u = _mm256_or_si256(u, _mm256_slli_epi16(h, 2));
 				p = _mm256_maddubs_epi16(u, _mm256_loadu_si256((const __m256i *)xq));
-				acc = _mm256_add_epi32(acc, _mm256_madd_epi16(p, _mm256_shuffle_epi8(sb, pm[j])));
+				isum = _mm256_add_epi32(isum, _mm256_madd_epi16(p, _mm256_shuffle_epi8(sb, pm[j])));
 			}
 		}
-		sum += x->d * h16(b + 108) * (float)(hsum8(acc) - 4 * offs);
+		isum = _mm256_sub_epi32(isum, _mm256_slli_epi32(offs, 2));
+		acc = _mm256_fmadd_ps(_mm256_set1_ps(h16f(b + 108) * x->d),
+		    _mm256_cvtepi32_ps(isum), acc);
 	}
-	return sum;
+	return hsumf(acc);
+}
+
+/* byte mask broadcasting i16 lane s of a 128-bit half to all 16 lanes */
+static __m256i
+lane_mask(int s)
+{
+	return _mm256_set1_epi16((short)((2 * s) | (2 * s + 1) << 8));
 }
 
 static float
 dot_q45_k(const uint8_t *b, const q8k *x, size_t nb, int five)
 {
+	__m256i lm[8];
 	const __m256i m4 = _mm256_set1_epi8(15), m1 = _mm256_set1_epi8(1);
+	const uint32_t k6 = 0x3f3f3f3fu, k4 = 0x0f0f0f0fu, k2 = 0x03030303u;
 	const size_t bsz = five ? 176 : 144;
-	float sum = 0;
+	__m256 acc = _mm256_setzero_ps();
 	size_t i;
-	int c, k;
+	int c;
 
+	for (c = 0; c < 8; c++)
+		lm[c] = lane_mask(c);
 	for (i = 0; i < nb; i++, b += bsz, x++) {
-		uint8_t sc[8], mn[8];
 		const uint8_t *q = b + (five ? 48 : 16);
-		__m256i acc = _mm256_setzero_si256();
-		__m256i hv = five ? _mm256_loadu_si256((const __m256i *)(b + 16)) : acc;
-		int summ = 0;
+		uint32_t a0 = rd32(b + 4), a1 = rd32(b + 8), a2 = rd32(b + 12);
+		/* 8 scales and 8 mins, 6 bits each */
+		__m128i sm = _mm_setr_epi32((int)(a0 & k6),
+		    (int)((a2 & k4) | (((a0 >> 6) & k2) << 4)),
+		    (int)(a1 & k6),
+		    (int)(((a2 >> 4) & k4) | (((a1 >> 6) & k2) << 4)));
+		__m128i mn8 = _mm_unpackhi_epi64(sm, sm);
+		__m256i mins = _mm256_cvtepu8_epi16(_mm_unpacklo_epi8(mn8, mn8));
+		/* lanes 0-7 scales, 8-15 mins; scales broadcast to both halves */
+		__m256i sb = _mm256_broadcastsi128_si256(_mm256_castsi256_si128(
+		    _mm256_cvtepu8_epi16(sm)));
+		__m256i msum = _mm256_madd_epi16(mins,
+		    _mm256_loadu_si256((const __m256i *)x->bsums));
+		__m256i isum = _mm256_setzero_si256();
+		__m256i hv = five ? _mm256_loadu_si256((const __m256i *)(b + 16)) : isum;
 
-		k4_scales(b + 4, sc, mn);
-		for (k = 0; k < 8; k++)
-			summ += mn[k] * (x->bsums[2 * k] + x->bsums[2 * k + 1]);
 		for (c = 0; c < 4; c++) {
 			__m256i qv = _mm256_loadu_si256((const __m256i *)(q + 32 * c));
 			__m256i u0 = _mm256_and_si256(qv, m4);
@@ -341,12 +402,18 @@ dot_q45_k(const uint8_t *b, const q8k *x, size_t nb, int five)
 			}
 			p0 = _mm256_maddubs_epi16(u0, _mm256_loadu_si256((const __m256i *)(x->qs + 64 * c)));
 			p1 = _mm256_maddubs_epi16(u1, _mm256_loadu_si256((const __m256i *)(x->qs + 64 * c + 32)));
-			acc = _mm256_add_epi32(acc, _mm256_madd_epi16(p0, _mm256_set1_epi16(sc[2 * c])));
-			acc = _mm256_add_epi32(acc, _mm256_madd_epi16(p1, _mm256_set1_epi16(sc[2 * c + 1])));
+			/* scales 2c and 2c+1, each over 32 weights */
+			isum = _mm256_add_epi32(isum, _mm256_madd_epi16(p0,
+			    _mm256_shuffle_epi8(sb, lm[2 * c])));
+			isum = _mm256_add_epi32(isum, _mm256_madd_epi16(p1,
+			    _mm256_shuffle_epi8(sb, lm[2 * c + 1])));
 		}
-		sum += x->d * (h16(b) * (float)hsum8(acc) - h16(b + 2) * (float)summ);
+		acc = _mm256_fmadd_ps(_mm256_set1_ps(h16f(b) * x->d),
+		    _mm256_cvtepi32_ps(isum), acc);
+		acc = _mm256_fmadd_ps(_mm256_set1_ps(-h16f(b + 2) * x->d),
+		    _mm256_cvtepi32_ps(msum), acc);
 	}
-	return sum;
+	return hsumf(acc);
 }
 
 static float
@@ -354,7 +421,7 @@ dot_q6_k(const uint8_t *b, const q8k *x, size_t nb)
 {
 	const __m256i m4 = _mm256_set1_epi8(15), m3 = _mm256_set1_epi8(3);
 	__m256i pm[4];
-	float sum = 0;
+	__m256 acc = _mm256_setzero_ps();
 	size_t i;
 	int j, c;
 
@@ -362,9 +429,9 @@ dot_q6_k(const uint8_t *b, const q8k *x, size_t nb)
 		pm[j] = pair_mask(j);
 	for (i = 0; i < nb; i++, b += 210, x++) {
 		__m256i s16 = _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)(b + 192)));
-		int offs = hsum8(_mm256_madd_epi16(s16,
-		    _mm256_loadu_si256((const __m256i *)x->bsums)));
-		__m256i acc = _mm256_setzero_si256();
+		__m256i offs = _mm256_madd_epi16(s16,
+		    _mm256_loadu_si256((const __m256i *)x->bsums));
+		__m256i isum = _mm256_setzero_si256();
 		const int8_t *xq = x->qs;
 
 		for (c = 0; c < 2; c++) {
@@ -382,40 +449,35 @@ dot_q6_k(const uint8_t *b, const q8k *x, size_t nb)
 				__m256i h = _mm256_and_si256(_mm256_srli_epi16(qh, 2 * j), m3);
 				__m256i v = _mm256_or_si256(u[j], _mm256_slli_epi16(h, 4));
 				__m256i p = _mm256_maddubs_epi16(v, _mm256_loadu_si256((const __m256i *)xq));
-				acc = _mm256_add_epi32(acc, _mm256_madd_epi16(p, _mm256_shuffle_epi8(sb, pm[j])));
+				isum = _mm256_add_epi32(isum, _mm256_madd_epi16(p, _mm256_shuffle_epi8(sb, pm[j])));
 			}
 		}
-		sum += x->d * h16(b + 208) * (float)(hsum8(acc) - 32 * offs);
+		isum = _mm256_sub_epi32(isum, _mm256_slli_epi32(offs, 5));
+		acc = _mm256_fmadd_ps(_mm256_set1_ps(h16f(b + 208) * x->d),
+		    _mm256_cvtepi32_ps(isum), acc);
 	}
-	return sum;
+	return hsumf(acc);
 }
 
 static float
 dot_q8_0(const uint8_t *b, const q8k *x, size_t nb)
 {
 	const __m256i ones = _mm256_set1_epi16(1);
-	float sum = 0;
+	__m256 acc = _mm256_setzero_ps();
 	size_t i;
 	int k;
 
 	for (i = 0; i < nb; i++, x++) {
-		__m256 fs = _mm256_setzero_ps();
 		for (k = 0; k < 8; k++, b += 34) {
 			__m256i w = _mm256_loadu_si256((const __m256i *)(b + 2));
 			__m256i xv = _mm256_loadu_si256((const __m256i *)(x->qs + 32 * k));
 			__m256i p = _mm256_maddubs_epi16(_mm256_sign_epi8(w, w),
 			    _mm256_sign_epi8(xv, w));
 			__m256 pf = _mm256_cvtepi32_ps(_mm256_madd_epi16(p, ones));
-			fs = _mm256_fmadd_ps(_mm256_set1_ps(h16(b)), pf, fs);
-		}
-		{
-			__m128 s = _mm_add_ps(_mm256_castps256_ps128(fs), _mm256_extractf128_ps(fs, 1));
-			s = _mm_add_ps(s, _mm_movehl_ps(s, s));
-			s = _mm_add_ss(s, _mm_movehdup_ps(s));
-			sum += x->d * _mm_cvtss_f32(s);
+			acc = _mm256_fmadd_ps(_mm256_set1_ps(h16f(b) * x->d), pf, acc);
 		}
 	}
-	return sum;
+	return hsumf(acc);
 }
 
 float
@@ -435,7 +497,11 @@ kq_dot(uint32_t t, const void *row, const q8k *x, size_t n)
 const char *
 kq_isa(void)
 {
+#if defined(__F16C__)
+	return "avx2+f16c";
+#else
 	return "avx2";
+#endif
 }
 
 #else
