@@ -298,17 +298,28 @@ hsumf(__m256 v)
 	return _mm_cvtss_f32(s);
 }
 
+/* Shuffle masks are built from an opaque zero: with constant masks
+ * clang turns half of the vpshufb into vpshuflw+vpermd pairs, two
+ * port-5 uops instead of one, and port 5 bounds these loops. */
+/* (an external table: the compiler cannot prove it constant) */
+#define PM(a, b) { a, a + 1, a, a + 1, a, a + 1, a, a + 1, a, a + 1, a, a + 1, \
+	a, a + 1, a, a + 1, b, b + 1, b, b + 1, b, b + 1, b, b + 1, b, b + 1, \
+	b, b + 1, b, b + 1, b, b + 1 }
+#define LM(s) { 2 * s, 2 * s + 1, 2 * s, 2 * s + 1, 2 * s, 2 * s + 1, 2 * s, 2 * s + 1, \
+	2 * s, 2 * s + 1, 2 * s, 2 * s + 1, 2 * s, 2 * s + 1, 2 * s, 2 * s + 1, \
+	2 * s, 2 * s + 1, 2 * s, 2 * s + 1, 2 * s, 2 * s + 1, 2 * s, 2 * s + 1, \
+	2 * s, 2 * s + 1, 2 * s, 2 * s + 1, 2 * s, 2 * s + 1, 2 * s, 2 * s + 1 }
+uint8_t q2k_shuf_masks[12][32] = {
+	PM(0, 2), PM(4, 6), PM(8, 10), PM(12, 14),
+	LM(0), LM(1), LM(2), LM(3), LM(4), LM(5), LM(6), LM(7)
+};
+
 /* byte masks picking i16 lanes (2j, 2j+1) of a broadcast 8 x i16 into
  * [lane 2j x8 | lane 2j+1 x8] */
 static __m256i
 pair_mask(int j)
 {
-	int a = 4 * j, b = 4 * j + 2;
-	return _mm256_setr_epi8(
-	    a, a + 1, a, a + 1, a, a + 1, a, a + 1,
-	    a, a + 1, a, a + 1, a, a + 1, a, a + 1,
-	    b, b + 1, b, b + 1, b, b + 1, b, b + 1,
-	    b, b + 1, b, b + 1, b, b + 1, b, b + 1);
+	return _mm256_loadu_si256((const __m256i *)q2k_shuf_masks[j]);
 }
 
 static float
@@ -406,7 +417,7 @@ dot_q3_k(const uint8_t *b, const q8k *x, size_t nb)
 static __m256i
 lane_mask(int s)
 {
-	return _mm256_set1_epi16((short)((2 * s) | (2 * s + 1) << 8));
+	return _mm256_loadu_si256((const __m256i *)q2k_shuf_masks[4 + s]);
 }
 
 static float

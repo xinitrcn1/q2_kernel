@@ -430,7 +430,7 @@ kbench(void)
 			continue;
 		seen |= 1u << w->type;
 		q8k_quantize(x, xq, (size_t)w->K);
-		hot_rows = (int)(256 * 1024 / w->row_bytes);
+		hot_rows = (int)((getenv("KB_HOT") ? atoi(getenv("KB_HOT")) : 256) * 1024 / w->row_bytes);
 		if (hot_rows > w->N)
 			hot_rows = w->N;
 		reps = (int)(400e6 / ((double)hot_rows * w->row_bytes)) + 1;
