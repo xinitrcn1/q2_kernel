@@ -22,6 +22,7 @@ typedef struct {
 	uint64_t gpu_off;       /* byte offset in the GPU weight buffer */
 	size_t gpu_row_bytes;   /* rows are repacked to 4-byte-aligned blocks */
 	double heat;            /* bytes read per token / bytes stored */
+	const void *gsplit;     /* GPU copy of the leading rows (a wt), or NULL */
 } wt;
 
 typedef struct {

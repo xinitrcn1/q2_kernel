@@ -20,6 +20,8 @@
  */
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_control_flow_attributes : require
 #ifndef NO_DOT
 #extension GL_EXT_integer_dot_product : require
 #endif
@@ -64,7 +66,11 @@ uint b8(uint w, uint i) { return (w >> (8u * i)) & 0xffu; }
 uint bb(uint bw, uint i) { return b8(W[bw + (i >> 2)], i & 3u); }
 /* activation word holding elements e..e+3 of the q8k block at xb
  * (xb is relative to the staged copy) */
-uint xw(uint xb, uint e) { return xs[xb + 1u + (e >> 2)]; }
+/* x is staged in shared memory when it fits (K <= 4096), else read
+ * from global memory (L2) -- uniform per dispatch */
+bool staged;
+uint xword(uint i) { return staged ? xs[i] : X[pc.x_off + i]; }
+uint xw(uint xb, uint e) { return xword(xb + 1u + (e >> 2)); }
 
 #if QT == 10 /* Q2_K */
 #define BW 21u
@@ -179,6 +185,20 @@ float unit(uint bw, uint l, uint xb)
 		is += idot(W[qb + base + k], xw(xb, 16u * l + 4u * k));
 	return unpackHalf2x16(W[qb + 8u]).x * float(is);
 }
+#elif QT >= 100 || QT == 23 /* transcoded types, IQ4_XS (xdec.glsl) */
+#include "xdec.glsl"
+float unit(uint bw, uint l, uint xb)
+{
+	grp g;
+	int ia = 0, ib = 0;
+	dec(bw, l, g);
+	[[unroll]] for (uint j = 0u; j < 4u; j++) {
+		uint x = xw(xb, g.o[j]);
+		ia += g.sa[j] * idot(g.q[j], x);
+		ib += g.sb[j] * idot(ONES, x);
+	}
+	return g.D * float(ia) + g.M * float(ib);
+}
 #else
 #error "QT"
 #endif
@@ -186,8 +206,10 @@ float unit(uint bw, uint l, uint xb)
 void main()
 {
 	uint nx = (pc.K >> 8) * 73u;
-	for (uint i = gl_LocalInvocationID.x; i < nx; i += gl_WorkGroupSize.x)
-		xs[i] = X[pc.x_off + i];
+	staged = nx <= XMAX;
+	if (staged)
+		for (uint i = gl_LocalInvocationID.x; i < nx; i += gl_WorkGroupSize.x)
+			xs[i] = X[pc.x_off + i];
 	barrier();
 
 	/* RPS consecutive rows per subgroup: the staged x serves more rows */
@@ -202,7 +224,7 @@ void main()
 		float sum = 0.0;
 		for (uint i = lane; i < nu; i += gl_SubgroupSize) {
 			uint b = i >> 4, xb = 73u * b;
-			sum += uintBitsToFloat(xs[xb]) * unit(base + b * BW, i & 15u, xb);
+			sum += uintBitsToFloat(xword(xb)) * unit(base + b * BW, i & 15u, xb);
 		}
 		sum = subgroupAdd(sum);
 		if (lane == 0u)

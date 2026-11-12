@@ -510,7 +510,7 @@ mv_run_ex(const mv_item *it, int n, int allow_gpu)
 			continue;
 		}
 		xq[i] = qbuf + used;
-		if (!g_ref || it[i].w->gpu_n)
+		if (!g_ref || it[i].w->gpu_n || it[i].w->gsplit)
 			q8k_quantize(it[i].x, qbuf + used, (size_t)it[i].w->K);
 		used += (size_t)it[i].w->K / 256;
 	}
@@ -526,7 +526,15 @@ mv_run_ex(const mv_item *it, int n, int allow_gpu)
 			continue;
 		}
 		cxq[nc] = xq[i];
-		cpu[nc++] = it[i];
+		cpu[nc] = it[i];
+		/* row split: leading rows on the GPU, the rest here */
+		if (allow_gpu && vk_ready() && it[i].w->gsplit && it[i].e == 0 && it[i].r0 == 0 &&
+		    it[i].r1 == it[i].w->N && it[i].k0 == 0 &&
+		    vk_add((const wt *)it[i].w->gsplit, 0, it[i].x, xq[i], it[i].y) == 0) {
+			ngpu++;
+			cpu[nc].r0 = ((const wt *)it[i].w->gsplit)->N;
+		}
+		nc++;
 	}
 	if (ngpu)
 		vk_submit();

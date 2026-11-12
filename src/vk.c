@@ -20,10 +20,13 @@
 #ifndef VK_SPIN_S
 #define VK_SPIN_S 0.1
 #endif
-#define PIPE_CONV 21
-#define PIPE_SCAN 22
-#define PIPE_QBLK 23
-#define PIPE_BW 24
+/* pipelines: [type] matvec, [PIPE_MM + type] batched GEMM, ops at 120+
+ * (type ids are 0..23 and 100..103) */
+#define PIPE_MM 128
+#define PIPE_CONV 120
+#define PIPE_SCAN 121
+#define PIPE_QBLK 122
+#define PIPE_BW 123
 #define UPCHUNK (32u << 20)
 
 static double
@@ -63,7 +66,7 @@ static struct {
 	VkPipelineLayout pl;
 	VkDescriptorPool dp;
 	VkDescriptorSet ds;
-	VkPipeline pipe[64];        /* type: 1-token tile; 32 + type: 8-token */
+	VkPipeline pipe[256];
 	VkCommandPool cp;
 	VkCommandBuffer cb;
 	VkFence fence;
@@ -77,7 +80,7 @@ static struct {
 	uint32_t aused, cur;
 	int nup, upw, ndl;
 	VkBufferCopy up[MOE_MAX + 8];
-	struct { uint32_t off, n; float *dst; } dl[MOE_MAX + 8];
+	struct { uint32_t off, n, rows, ld; float *dst; } dl[MOE_MAX + 8];
 	int inflight;
 	/* slots: the current one's state lives in the fields above, the
 	 * others' here (vk_slot swaps); each has its own command buffer,
@@ -86,7 +89,7 @@ static struct {
 		VkCommandBuffer cb;
 		VkFence fence;
 		int inflight, ndl;
-		struct { uint32_t off, n; float *dst; } dl[MOE_MAX + 8];
+		struct { uint32_t off, n, rows, ld; float *dst; } dl[MOE_MAX + 8];
 	} sl[NSLOT];
 	int cs;
 	uint32_t abase;
@@ -458,10 +461,12 @@ vk_init(size_t budget, size_t state_bytes, int devidx, int verbose)
 	vkUpdateDescriptorSets(V.dev, 4, wr, 0, NULL);
 
 #define PIPE(t, a) ((V.dot ? mkpipe(t, a, sizeof(a)) : mkpipe(t, a##_nd, sizeof(a##_nd))) || \
-	(V.dot ? mkpipe(32 + t, a##_b, sizeof(a##_b)) : mkpipe(32 + t, a##_ndb, sizeof(a##_ndb))))
+	(V.dot ? mkpipe(PIPE_MM + t, a##_b, sizeof(a##_b)) : mkpipe(PIPE_MM + t, a##_ndb, sizeof(a##_ndb))))
 	if (PIPE(GT_Q2_K, spv_q2_k) || PIPE(GT_Q3_K, spv_q3_k) ||
 	    PIPE(GT_Q4_K, spv_q4_k) || PIPE(GT_Q5_K, spv_q5_k) ||
-	    PIPE(GT_Q6_K, spv_q6_k) || PIPE(GT_Q8_0, spv_q8_0))
+	    PIPE(GT_Q6_K, spv_q6_k) || PIPE(GT_Q8_0, spv_q8_0) ||
+	    PIPE(GT_IQ4_XS, spv_iq4_xs) || PIPE(GT_X2, spv_x2) || PIPE(GT_X3, spv_x3) ||
+	    PIPE(GT_X3S, spv_x3s) || PIPE(GT_X1, spv_x1))
 		return -1;
 #undef PIPE
 	if (mkpipe(PIPE_CONV, spv_op_conv, sizeof(spv_op_conv)) ||
@@ -515,7 +520,7 @@ vk_shutdown(void)
 	if (!V.dev)
 		return;
 	vkDeviceWaitIdle(V.dev);
-	for (i = 0; i < 64; i++)
+	for (i = 0; i < 256; i++)
 		if (V.pipe[i])
 			vkDestroyPipeline(V.dev, V.pipe[i], NULL);
 	vk_slot(0);
@@ -557,6 +562,27 @@ static void
 repack(uint32_t t, const uint8_t *src, uint8_t *dst, size_t n)
 {
 	size_t sb = ggml_type_bytes(t), db = gpu_block_bytes(t), i;
+	if (t == GT_X2 || t == GT_X3 || t == GT_X3S || t == GT_X1) {
+		/* planes first, multipliers after, d last (shaders/xdec.glsl) */
+		for (i = 0; i < n; i++, src += sb, dst += db) {
+			memset(dst, 0, db);
+			if (t == GT_X2) {
+				memcpy(dst, src + 18, 64);        /* lv */
+				memcpy(dst + 64, src + 82, 32);   /* sg */
+				memcpy(dst + 96, src + 2, 16);    /* mult */
+				memcpy(dst + 112, src, 2);        /* d */
+			} else if (t == GT_X1) {
+				memcpy(dst, src + 10, 64);        /* lv */
+				memcpy(dst + 64, src + 2, 8);     /* sd */
+				memcpy(dst + 72, src, 2);         /* d */
+			} else {
+				memcpy(dst, src + 10, 128);       /* q */
+				memcpy(dst + 128, src + 2, 8);    /* mult */
+				memcpy(dst + 136, src, 2);        /* d */
+			}
+		}
+		return;
+	}
 	if (sb == db) {
 		memcpy(dst, src, n * sb);
 		return;
@@ -904,6 +930,50 @@ out:
 		    (V.wused - b0) / 1048576.0, V.wused / 1048576.0, 100.0 * hot_gpu / hot);
 }
 
+/*
+ * Row split for dense models (qwen35): every matrix read per token keeps
+ * the same leading fraction of its rows on the GPU -- the budget over
+ * the bytes per token -- so each matvec's GPU and CPU parts finish
+ * together.  Types without a GPU kernel stay on the CPU.
+ */
+void
+vk_plan_rows(model *m, int verbose)
+{
+	size_t total = 0, cap = V.wcap > ((size_t)8 << 20) ? V.wcap - ((size_t)8 << 20) : 0;
+	double f;
+	int i, n = 0;
+
+	for (i = 0; i < m->n_all; i++) {
+		const wt *w = m->all[i];
+		if (w->heat >= 1 && V.pipe[w->type])
+			total += (size_t)w->N * (w->row_bytes / ggml_type_bytes(w->type) *
+			    gpu_block_bytes(w->type));
+	}
+	f = total ? (double)cap / (double)total : 0;
+	if (f > 1)
+		f = 1;
+	for (i = 0; i < m->n_all; i++) {
+		wt *w = m->all[i], *gs;
+		int rows = (int)(f * w->N), rg[1][2];
+		if (w->heat < 1 || !V.pipe[w->type])
+			continue;
+		rows -= rows % (int)V.sg_per_wg;
+		if (rows <= 0 || !(gs = malloc(sizeof(*gs))))
+			continue;
+		rg[0][0] = 0;
+		rg[0][1] = rows;
+		if (upload_rows(w, (const int (*)[2])rg, 1, w->K, w->name, gs) != 0) {
+			free(gs);
+			continue;
+		}
+		w->gsplit = gs;
+		n++;
+	}
+	if (verbose)
+		fprintf(stderr, "vulkan: leading %.1f%% of the rows of %d matrices on the gpu, %.1f MiB\n",
+		    100.0 * f, n, V.wused / 1048576.0);
+}
+
 const wt *
 vk_lm(void)
 {
@@ -1053,7 +1123,7 @@ seq_matmul(const wt *w, int e, uint32_t r0, uint32_t n, uint32_t kel, uint32_t x
 	pc.rps = T == 1 ? 4 : 1;
 	if (T > 1 && w->type != GT_Q8_0) {
 		/* tiled GEMM: 32 rows x 32 tokens per workgroup */
-		seq_pipe(32 + w->type);
+		seq_pipe(PIPE_MM + w->type);
 		vkCmdPushConstants(V.cb, V.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
 		vkCmdDispatch(V.cb, (n + 31) / 32, (T + 31) / 32, 1);
 		return;
@@ -1114,8 +1184,18 @@ seq_get(uint32_t off, uint32_t n, float *dst)
 {
 	V.dl[V.ndl].off = off;
 	V.dl[V.ndl].n = n;
+	V.dl[V.ndl].rows = 0;
 	V.dl[V.ndl].dst = dst;
 	V.ndl++;
+}
+
+/* fetch n = T*rows compact floats into dst with row stride ld */
+static void
+seq_get_strided(uint32_t off, uint32_t T, uint32_t rows, float *dst, uint32_t ld)
+{
+	seq_get(off, T * rows, dst);
+	V.dl[V.ndl - 1].rows = rows;
+	V.dl[V.ndl - 1].ld = ld;
 }
 
 static void
@@ -1168,9 +1248,75 @@ vk_wait(void)
 	vk_t_wait += vnow() - t0;
 	vkResetFences(V.dev, 1, &V.fence);
 	V.inflight = 0;
-	for (i = 0; i < V.ndl; i++)
-		memcpy(V.dl[i].dst, V.hmap + V.dl[i].off, sizeof(float) * V.dl[i].n);
+	for (i = 0; i < V.ndl; i++) {
+		if (V.dl[i].rows) {
+			uint32_t t, T = V.dl[i].n / V.dl[i].rows;
+			for (t = 0; t < T; t++)
+				memcpy(V.dl[i].dst + (size_t)t * V.dl[i].ld,
+				    V.hmap + V.dl[i].off + t * V.dl[i].rows, sizeof(float) * V.dl[i].rows);
+		} else
+			memcpy(V.dl[i].dst, V.hmap + V.dl[i].off, sizeof(float) * V.dl[i].n);
+	}
 	V.ndl = 0;
+}
+
+/* ---------------------------------------------------------------- */
+/* batched matmuls of GPU row slices (prompts)                        */
+
+static struct {
+	const wt *w;
+	const q8k *xq;
+	int xs, T, ldy;
+	float *y;
+} MM[MOE_MAX];
+static int nmm;
+
+void
+vk_mm_begin(void)
+{
+	nmm = 0;
+}
+
+/* rows [0, w->N) of w over T token vectors (xs q8k blocks each) into
+ * y[t*ldy + r] */
+int
+vk_mm_add(const wt *w, const q8k *xq, int xs, int T, float *y, int ldy)
+{
+	if (!V.ok || nmm >= MOE_MAX || !w->gpu_n)
+		return -1;
+	MM[nmm].w = w;
+	MM[nmm].xq = xq;
+	MM[nmm].xs = xs;
+	MM[nmm].T = T;
+	MM[nmm].y = y;
+	MM[nmm].ldy = ldy;
+	nmm++;
+	return 0;
+}
+
+void
+vk_mm_submit(void)
+{
+	uint32_t xo[MOE_MAX];
+	int i, k;
+
+	if (!nmm)
+		return;
+	seq_begin();
+	for (i = 0; i < nmm; i++) {
+		for (k = 0; k < i; k++)
+			if (MM[k].xq == MM[i].xq && MM[k].T == MM[i].T)
+				break;
+		xo[i] = k < i ? xo[k] : seq_put(MM[i].xq, (uint32_t)(MM[i].T * MM[i].xs) * Q8W);
+	}
+	seq_flush_up();
+	for (i = 0; i < nmm; i++) {
+		const uint32_t N = (uint32_t)MM[i].w->N, T = (uint32_t)MM[i].T;
+		uint32_t y = seq_alloc(T * N);
+		seq_matmul(MM[i].w, 0, 0, N, (uint32_t)MM[i].w->K, xo[i], (uint32_t)MM[i].xs * Q8W, T, y, N);
+		seq_get_strided(y, T, N, MM[i].y, (uint32_t)MM[i].ldy);
+	}
+	seq_submit();
 }
 
 /* ---------------------------------------------------------------- */

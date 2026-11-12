@@ -645,9 +645,11 @@ main(int argc, char **argv)
 	}
 	kq_init();
 	pool_init(O.threads);
-	if (O.gpu_mib > 0 && !O.tokens && M.arch != ARCH_GRANITE) {
-		if (O.verbose)
-			fprintf(stderr, "q2k: no GPU path for this architecture yet\n");
+	if (O.gpu_mib > 0 && !O.tokens && M.arch == ARCH_QWEN35) {
+		if (vk_init((size_t)O.gpu_mib << 20, 0, O.device, O.verbose) == 0)
+			vk_plan_rows(&M, O.verbose);
+		else
+			fprintf(stderr, "q2k: Vulkan unavailable, running on the CPU\n");
 	} else if (O.gpu_mib > 0 && !O.tokens) {
 		if (vk_init((size_t)O.gpu_mib << 20, model_gpu_state_bytes(&M), O.device,
 		    O.verbose) == 0)

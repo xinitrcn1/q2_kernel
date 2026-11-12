@@ -3,13 +3,18 @@
 PROG=		q2k
 SRCS=		main.c gguf.c quant.c kq.c pool.c model.c tok.c ucd.c vk.c vmath.c prefill.c iqtab.c qwen35.c transcode.c
 HDRS=		gguf.h quant.h kq.h pool.h model.h tok.h vk.h vmath.h iqtab.h
-QTYPES=		q2_k q3_k q4_k q5_k q6_k q8_0
+QTYPES=		q2_k q3_k q4_k q5_k q6_k q8_0 iq4_xs x2 x3 x3s x1
 QT.q2_k=	10
 QT.q3_k=	11
 QT.q4_k=	12
 QT.q5_k=	13
 QT.q6_k=	14
 QT.q8_0=	8
+QT.iq4_xs=	23
+QT.x2=		100
+QT.x3=		101
+QT.x3s=		102
+QT.x1=		103
 
 CC?=		cc
 OPT?=		-O2 -march=native
@@ -38,21 +43,21 @@ build/vk.o: gen/shaders.h
 # per type: DP4A and emulated-dot (_nd) variants of the matvec (decode)
 # and of the tiled GEMM (_b, mmq.comp: batches)
 .for t in ${QTYPES}
-gen/spv_${t}.h: shaders/matvec.comp
+gen/spv_${t}.h: shaders/matvec.comp shaders/xdec.glsl
 	@mkdir -p gen
-	${GLSLANG} -V --target-env vulkan1.1 -DQT=${QT.${t}} --vn spv_${t} \
+	${GLSLANG} -V --target-env vulkan1.1 -Ishaders -DQT=${QT.${t}} --vn spv_${t} \
 	    -o ${.TARGET} shaders/matvec.comp >/dev/null
-gen/spv_${t}_nd.h: shaders/matvec.comp
+gen/spv_${t}_nd.h: shaders/matvec.comp shaders/xdec.glsl
 	@mkdir -p gen
-	${GLSLANG} -V --target-env vulkan1.1 -DQT=${QT.${t}} -DNO_DOT --vn spv_${t}_nd \
+	${GLSLANG} -V --target-env vulkan1.1 -Ishaders -DQT=${QT.${t}} -DNO_DOT --vn spv_${t}_nd \
 	    -o ${.TARGET} shaders/matvec.comp >/dev/null
-gen/spv_${t}_b.h: shaders/mmq.comp
+gen/spv_${t}_b.h: shaders/mmq.comp shaders/xdec.glsl
 	@mkdir -p gen
-	${GLSLANG} -V --target-env vulkan1.1 -DQT=${QT.${t}} --vn spv_${t}_b \
+	${GLSLANG} -V --target-env vulkan1.1 -Ishaders -DQT=${QT.${t}} --vn spv_${t}_b \
 	    -o ${.TARGET} shaders/mmq.comp >/dev/null
-gen/spv_${t}_ndb.h: shaders/mmq.comp
+gen/spv_${t}_ndb.h: shaders/mmq.comp shaders/xdec.glsl
 	@mkdir -p gen
-	${GLSLANG} -V --target-env vulkan1.1 -DQT=${QT.${t}} -DNO_DOT --vn spv_${t}_ndb \
+	${GLSLANG} -V --target-env vulkan1.1 -Ishaders -DQT=${QT.${t}} -DNO_DOT --vn spv_${t}_ndb \
 	    -o ${.TARGET} shaders/mmq.comp >/dev/null
 .endfor
 

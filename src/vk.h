@@ -28,6 +28,14 @@ size_t vk_used(void);
 
 /* place whole tensors and whole experts within the budget, upload */
 void vk_plan_and_upload(model *m, int verbose);
+/* batched matmuls of GPU row slices (prompts): rows [0, w->N) of w over
+ * T token vectors of xs q8k blocks each into y[t*ldy + r]; async,
+ * vk_wait delivers */
+void vk_mm_begin(void);
+int vk_mm_add(const wt *w, const q8k *xq, int xs, int T, float *y, int ldy);
+void vk_mm_submit(void);
+/* dense models (qwen35): the same leading fraction of every matrix's rows */
+void vk_plan_rows(model *m, int verbose);
 
 /* batch recording; vk_submit starts it, vk_wait copies results to y */
 void vk_begin(void);

@@ -99,14 +99,29 @@ mm_worker(void *arg, int ith, int nth)
 }
 
 void
-mm_run(const mm_item *it, int n)
+mm_run(const mm_item *in, int n)
 {
 	mm_job j;
+	mm_item it[MM_MAX];
 	size_t work = 0;
-	int i;
+	int i, ngpu = 0;
 
 	if (n == 0)
 		return;
+	/* matrices with a GPU row slice: those rows there, the rest here */
+	memcpy(it, in, sizeof(*in) * (size_t)n);
+	if (vk_ready()) {
+		vk_mm_begin();
+		for (i = 0; i < n; i++)
+			if (it[i].w->gsplit && it[i].e == 0 && it[i].r0 == 0 && it[i].r1 == it[i].w->N &&
+			    vk_mm_add((const wt *)it[i].w->gsplit, (const q8k *)it[i].xq, it[i].xs, it[i].T,
+			    it[i].y, it[i].ldy) == 0) {
+				it[i].r0 = ((const wt *)it[i].w->gsplit)->N;
+				ngpu++;
+			}
+		if (ngpu)
+			vk_mm_submit();
+	}
 	j.it = it;
 	j.n = n;
 	j.cum[0] = 0;
@@ -127,6 +142,8 @@ mm_run(const mm_item *it, int n)
 		pf_t[0] += now() - t0;
 		pf_rows += (long)work;
 	}
+	if (ngpu)
+		vk_wait();
 }
 
 mm_item
