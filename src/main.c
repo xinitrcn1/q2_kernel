@@ -356,16 +356,24 @@ info(void)
 static void
 check(void)
 {
-	uint32_t seen = 0;
+	uint64_t seen = 0;
 	int i, r;
 	float *x, *yr, *yk, *yg;
 
-	x = malloc(sizeof(float) * 8192);
-	yr = malloc(sizeof(float) * 200000);
-	yk = malloc(sizeof(float) * 200000);
-	yg = malloc(sizeof(float) * 200000);
+	int kmax = 0, nmax = 0;
+	for (i = 0; i < M.n_all; i++) {
+		if (M.all[i]->K > kmax)
+			kmax = M.all[i]->K;
+		if (M.all[i]->N > nmax)
+			nmax = M.all[i]->N;
+	}
+	kmax += 64;
+	x = malloc(sizeof(float) * (size_t)kmax);
+	yr = malloc(sizeof(float) * (size_t)nmax * 5);
+	yk = malloc(sizeof(float) * (size_t)nmax * 5);
+	yg = malloc(sizeof(float) * (size_t)nmax * 5);
 	srand(1);
-	for (i = 0; i < 8192; i++)
+	for (i = 0; i < kmax; i++)
 		x[i] = (float)((double)rand() / RAND_MAX * 2 - 1);
 	printf("%-32s %-5s %10s %10s %10s %9s %9s\n", "tensor", "type",
 	    "kq-scalar", "mv_run", "gpu", "cpu ms", "gpu ms");
@@ -381,7 +389,7 @@ check(void)
 		mv_item it;
 
 		/* one tensor per (type, K, gpu) combination */
-		uint32_t key = 1u << (w->type * 2 + (w->gpu_n != 0));
+		uint64_t key = 1ull << (w->type * 2 + (w->gpu_n != 0));
 		if ((seen & key) && !O.verbose)
 			continue;
 		seen |= key;
@@ -417,7 +425,7 @@ check(void)
 			float o5[5], md = 0, mr = 0;
 			int t5, rr;
 			for (t5 = 0; t5 < 5; t5++)
-				q8k_quantize(x + t5 * 7, x5 + t5 * (w->K / 256), (size_t)w->K);
+				q8k_quantize(x + t5 * 7 % 64, x5 + t5 * (w->K / 256), (size_t)w->K);
 			for (rr = 0; rr < 64 && rr < w->N; rr++) {
 				const uint8_t *row = w->data + ((size_t)e * w->N + rr) * w->row_bytes;
 				if (!kq_dotT(w->type, row, x5, (size_t)(w->K / 256), 5, (size_t)w->K, o5, 1))
@@ -473,16 +481,21 @@ static void
 kbench(void)
 {
 	uint32_t seen = 0;
-	static float x[8192], y[200000];
+	float *x, *y;
 	volatile float sink = 0;
-	int i, r, it;
+	int i, r, it, kmax = 0;
 
-	for (i = 0; i < 8192; i++)
+	for (i = 0; i < M.n_all; i++)
+		if (M.all[i]->K > kmax)
+			kmax = M.all[i]->K;
+	x = malloc(sizeof(float) * (size_t)kmax);
+	y = malloc(sizeof(float) * 200000);
+	for (i = 0; i < kmax; i++)
 		x[i] = (float)((double)rand() / RAND_MAX * 2 - 1);
 	printf("%-5s %6s %10s %10s %12s\n", "type", "K", "hot GB/s", "ns/256", "stream GB/s");
 	for (i = 0; i < M.n_all; i++) {
 		wt *w = M.all[i];
-		q8k xq[32];
+		q8k *xq = malloc(sizeof(q8k) * (size_t)(w->K / 256));
 		int hot_rows, reps;
 		double t0, th, ts;
 		size_t nbytes;
@@ -504,13 +517,14 @@ kbench(void)
 		th = now() - t0;
 		{
 			/* multi-token kernel, T = 64, cache-hot rows */
-			static q8k x64[64 * 16];
+			static q8k x64[64 * 80];
 			static float o64[64];
 			int tt, KT = getenv("KB_T") ? atoi(getenv("KB_T")) : 64;
 			double td;
 			for (tt = 0; tt < 64; tt++)
 				memcpy(x64 + tt * (w->K / 256), xq, sizeof(q8k) * (size_t)(w->K / 256));
-			if (kq_dotT(w->type, w->data, x64, (size_t)(w->K / 256), 64, (size_t)w->K, o64, 1)) {
+			if (w->K <= 80 * 256 &&
+			    kq_dotT(w->type, w->data, x64, (size_t)(w->K / 256), 64, (size_t)w->K, o64, 1)) {
 				int rr = hot_rows < 64 ? hot_rows : 64;
 				t0 = now();
 				for (it = 0; it < 20; it++)
@@ -528,12 +542,15 @@ kbench(void)
 			y[r % 200000] += kq_dot(w->type, w->data + (size_t)r * w->row_bytes, xq, (size_t)w->K);
 		ts = now() - t0;
 		sink += y[0];
-		printf("%-5s %6d %10.2f %10.2f %12.2f\n", ggml_type_name(w->type), w->K,
+		free(xq);
+		printf("%-7s %6d %10.2f %10.2f %12.2f\n", ggml_type_name(w->type), w->K,
 		    (double)reps * hot_rows * w->row_bytes / th / 1e9,
 		    th / ((double)reps * hot_rows * w->K / 256) * 1e9,
 		    nbytes / ts / 1e9);
 	}
 	(void)sink;
+	free(x);
+	free(y);
 }
 
 /* ---------------------------------------------------------------- */
@@ -614,6 +631,7 @@ main(int argc, char **argv)
 		fprintf(stderr, "q2k: %s\n", err);
 		return 1;
 	}
+	kq_init();
 	pool_init(O.threads);
 	if (O.gpu_mib > 0 && !O.tokens && M.arch != ARCH_GRANITE) {
 		if (O.verbose)

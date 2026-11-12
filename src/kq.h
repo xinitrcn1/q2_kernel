@@ -32,5 +32,7 @@ int kq_dotT(uint32_t t, const void *row, const q8k *x, size_t xs, int T, size_t 
 float kq_dot_scalar(uint32_t t, const void *row, const q8k *x, size_t n);
 
 const char *kq_isa(void);
+/* tables for the i-quant kernels; call once before any kq_dot */
+void kq_init(void);
 
 #endif

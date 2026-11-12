@@ -5,6 +5,7 @@
 
 #include "gguf.h"
 #include "quant.h"
+#include "iqtab.h"
 
 #if defined(__AVX2__)
 #include <immintrin.h>
@@ -555,6 +556,235 @@ dot_q8_0(const uint8_t *b, const q8k *x, size_t nb)
 	return hsumf(acc);
 }
 
+/* ---------------------------------------------------------------- */
+/* i-quants, AVX2.  Each 8 weights come from a codebook entry (unsigned
+ * magnitudes) and an 8-bit sign mask; the signs go onto the
+ * activations (vpsignb) so maddubs takes the magnitudes as they are. */
+
+/* +-1 bytes for every 8-bit sign mask (bit j set: byte j = -1) */
+static uint64_t sgn8[256];
+/* the same for the 7-bit codes of ksigns_iq2xs (parity sign bit) */
+static uint64_t sgn7[128];
+
+void
+kq_init(void)
+{
+	static int done;
+	int i, j;
+	if (done)
+		return;
+	for (i = 0; i < 256; i++) {
+		uint64_t v = 0;
+		for (j = 0; j < 8; j++)
+			v |= (uint64_t)((i >> j) & 1 ? 0xff : 0x01) << (8 * j);
+		sgn8[i] = v;
+	}
+	for (i = 0; i < 128; i++)
+		sgn7[i] = sgn8[ksigns_iq2xs[i]];
+	done = 1;
+}
+
+static __m256i
+grid4(uint64_t a, uint64_t b, uint64_t c, uint64_t d)
+{
+	return _mm256_set_epi64x((long long)d, (long long)c, (long long)b, (long long)a);
+}
+
+/* maddubs(u, x*sign) with its i16 pairs summed and scaled by sc
+ * (|maddubs| <= 2*62*127, sc <= 63: no overflow) -> 8 x i32 */
+static __m256i
+dot32s(__m256i u, __m256i x, __m256i sg, int sc)
+{
+	return _mm256_madd_epi16(_mm256_maddubs_epi16(u, _mm256_sign_epi8(x, sg)),
+	    _mm256_set1_epi16((short)sc));
+}
+
+static float
+dot_iq2_xxs(const uint8_t *b, const q8k *x, size_t nb)
+{
+	__m256 acc = _mm256_setzero_ps();
+	size_t i;
+	int ib;
+	for (i = 0; i < nb; i++, b += 66, x++) {
+		__m256i s = _mm256_setzero_si256();
+		for (ib = 0; ib < 8; ib++) {
+			const uint8_t *q = b + 2 + 8 * ib;
+			uint32_t a1 = rd32(q + 4);
+			__m256i u = grid4(iq2xxs_grid[q[0]], iq2xxs_grid[q[1]], iq2xxs_grid[q[2]],
+			    iq2xxs_grid[q[3]]);
+			__m256i sg = grid4(sgn7[a1 & 127], sgn7[(a1 >> 7) & 127], sgn7[(a1 >> 14) & 127],
+			    sgn7[(a1 >> 21) & 127]);
+			s = _mm256_add_epi32(s, dot32s(u, _mm256_loadu_si256((const __m256i *)(x->qs + 32 * ib)),
+			    sg, 2 * (int)(a1 >> 28) + 1));
+		}
+		acc = _mm256_fmadd_ps(_mm256_set1_ps(h16f(b) * x->d * 0.125f), _mm256_cvtepi32_ps(s), acc);
+	}
+	return hsumf(acc);
+}
+
+static float
+dot_iq2_xs(const uint8_t *b, const q8k *x, size_t nb)
+{
+	__m256 acc = _mm256_setzero_ps();
+	size_t i;
+	int ib;
+	for (i = 0; i < nb; i++, b += 74, x++) {
+		__m256i s = _mm256_setzero_si256();
+		for (ib = 0; ib < 8; ib++) {
+			const uint8_t *q = b + 2 + 8 * ib;
+			uint16_t q0 = (uint16_t)(q[0] | q[1] << 8), q1 = (uint16_t)(q[2] | q[3] << 8);
+			uint16_t q2 = (uint16_t)(q[4] | q[5] << 8), q3 = (uint16_t)(q[6] | q[7] << 8);
+			uint8_t sc = b[66 + ib];
+			__m256i u = grid4(iq2xs_grid[q0 & 511], iq2xs_grid[q1 & 511], iq2xs_grid[q2 & 511],
+			    iq2xs_grid[q3 & 511]);
+			__m256i sg = grid4(sgn7[q0 >> 9], sgn7[q1 >> 9], sgn7[q2 >> 9], sgn7[q3 >> 9]);
+			__m256i p = _mm256_maddubs_epi16(u, _mm256_sign_epi8(
+			    _mm256_loadu_si256((const __m256i *)(x->qs + 32 * ib)), sg));
+			/* scales per 16: low half (sc & 15), high half (sc >> 4) */
+			__m256i w = _mm256_setr_m128i(_mm_set1_epi16((short)(2 * (sc & 15) + 1)),
+			    _mm_set1_epi16((short)(2 * (sc >> 4) + 1)));
+			s = _mm256_add_epi32(s, _mm256_madd_epi16(p, w));
+		}
+		acc = _mm256_fmadd_ps(_mm256_set1_ps(h16f(b) * x->d * 0.125f), _mm256_cvtepi32_ps(s), acc);
+	}
+	return hsumf(acc);
+}
+
+static float
+dot_iq2_s(const uint8_t *b, const q8k *x, size_t nb)
+{
+	__m256 acc = _mm256_setzero_ps();
+	size_t i;
+	int ib;
+	for (i = 0; i < nb; i++, b += 82, x++) {
+		const uint8_t *qs = b + 2, *sgb = b + 34, *qh = b + 66, *scs = b + 74;
+		__m256i s = _mm256_setzero_si256();
+		for (ib = 0; ib < 8; ib++, qs += 4, sgb += 4) {
+			uint8_t h = qh[ib], sc = scs[ib];
+			__m256i u = grid4(iq2s_grid[qs[0] | ((h << 8) & 0x300)],
+			    iq2s_grid[qs[1] | ((h << 6) & 0x300)], iq2s_grid[qs[2] | ((h << 4) & 0x300)],
+			    iq2s_grid[qs[3] | ((h << 2) & 0x300)]);
+			__m256i sg = grid4(sgn8[sgb[0]], sgn8[sgb[1]], sgn8[sgb[2]], sgn8[sgb[3]]);
+			__m256i p = _mm256_maddubs_epi16(u, _mm256_sign_epi8(
+			    _mm256_loadu_si256((const __m256i *)(x->qs + 32 * ib)), sg));
+			__m256i w = _mm256_setr_m128i(_mm_set1_epi16((short)(2 * (sc & 15) + 1)),
+			    _mm_set1_epi16((short)(2 * (sc >> 4) + 1)));
+			s = _mm256_add_epi32(s, _mm256_madd_epi16(p, w));
+		}
+		acc = _mm256_fmadd_ps(_mm256_set1_ps(h16f(b) * x->d * 0.125f), _mm256_cvtepi32_ps(s), acc);
+	}
+	return hsumf(acc);
+}
+
+static float
+dot_iq3_xxs(const uint8_t *b, const q8k *x, size_t nb)
+{
+	__m256 acc = _mm256_setzero_ps();
+	size_t i;
+	int ib;
+	for (i = 0; i < nb; i++, b += 98, x++) {
+		const uint8_t *qs = b + 2;
+		__m256i s = _mm256_setzero_si256();
+		for (ib = 0; ib < 8; ib++, qs += 8) {
+			uint32_t a = rd32(b + 66 + 4 * ib);
+			__m256i u = _mm256_set_epi32((int)iq3xxs_grid[qs[7]], (int)iq3xxs_grid[qs[6]],
+			    (int)iq3xxs_grid[qs[5]], (int)iq3xxs_grid[qs[4]], (int)iq3xxs_grid[qs[3]],
+			    (int)iq3xxs_grid[qs[2]], (int)iq3xxs_grid[qs[1]], (int)iq3xxs_grid[qs[0]]);
+			__m256i sg = grid4(sgn7[a & 127], sgn7[(a >> 7) & 127], sgn7[(a >> 14) & 127],
+			    sgn7[(a >> 21) & 127]);
+			s = _mm256_add_epi32(s, dot32s(u, _mm256_loadu_si256((const __m256i *)(x->qs + 32 * ib)),
+			    sg, 2 * (int)(a >> 28) + 1));
+		}
+		acc = _mm256_fmadd_ps(_mm256_set1_ps(h16f(b) * x->d * 0.25f), _mm256_cvtepi32_ps(s), acc);
+	}
+	return hsumf(acc);
+}
+
+static float
+dot_iq3_s(const uint8_t *b, const q8k *x, size_t nb)
+{
+	__m256 acc = _mm256_setzero_ps();
+	size_t i;
+	int ib;
+	for (i = 0; i < nb; i++, b += 110, x++) {
+		const uint8_t *qs = b + 2, *qh = b + 66, *sgb = b + 74, *scs = b + 106;
+		__m256i s = _mm256_setzero_si256();
+		for (ib = 0; ib < 8; ib++, qs += 8, sgb += 4) {
+			const uint32_t h = qh[ib];
+			const int sc = ib & 1 ? scs[ib / 2] >> 4 : scs[ib / 2] & 15;
+			__m256i u = _mm256_set_epi32(
+			    (int)iq3s_grid[qs[7] | ((h << 1) & 256)], (int)iq3s_grid[qs[6] | ((h << 2) & 256)],
+			    (int)iq3s_grid[qs[5] | ((h << 3) & 256)], (int)iq3s_grid[qs[4] | ((h << 4) & 256)],
+			    (int)iq3s_grid[qs[3] | ((h << 5) & 256)], (int)iq3s_grid[qs[2] | ((h << 6) & 256)],
+			    (int)iq3s_grid[qs[1] | ((h << 7) & 256)], (int)iq3s_grid[qs[0] | ((h << 8) & 256)]);
+			__m256i sg = grid4(sgn8[sgb[0]], sgn8[sgb[1]], sgn8[sgb[2]], sgn8[sgb[3]]);
+			s = _mm256_add_epi32(s, dot32s(u, _mm256_loadu_si256((const __m256i *)(x->qs + 32 * ib)),
+			    sg, 2 * sc + 1));
+		}
+		acc = _mm256_fmadd_ps(_mm256_set1_ps(h16f(b) * x->d), _mm256_cvtepi32_ps(s), acc);
+	}
+	return hsumf(acc);
+}
+
+static float
+dot_iq1_s(const uint8_t *b, const q8k *x, size_t nb)
+{
+	const __m256i one = _mm256_set1_epi8(1);
+	__m256 acc = _mm256_setzero_ps();
+	float sum = 0;
+	size_t i;
+	int ib;
+	for (i = 0; i < nb; i++, b += 50, x++) {
+		const uint8_t *qs = b + 2;
+		const float dd = h16f(b) * x->d;
+		__m256i s = _mm256_setzero_si256();
+		float bs = 0;
+		for (ib = 0; ib < 8; ib++, qs += 4) {
+			uint16_t qh = (uint16_t)(b[34 + 2 * ib] | b[35 + 2 * ib] << 8);
+			int sc = 2 * ((qh >> 12) & 7) + 1;
+			/* grid values in {-1, 0, 1}: (g + 1) is unsigned; the -1
+			 * comes back with the delta through sum(x) */
+			__m256i u = _mm256_add_epi8(grid4(iq1s_grid[qs[0] | ((qh << 8) & 0x700)],
+			    iq1s_grid[qs[1] | ((qh << 5) & 0x700)], iq1s_grid[qs[2] | ((qh << 2) & 0x700)],
+			    iq1s_grid[qs[3] | ((qh >> 1) & 0x700)]), one);
+			s = _mm256_add_epi32(s, _mm256_madd_epi16(_mm256_maddubs_epi16(u,
+			    _mm256_loadu_si256((const __m256i *)(x->qs + 32 * ib))), _mm256_set1_epi16((short)sc)));
+			bs += (float)sc * ((qh & 0x8000 ? -0.125f : 0.125f) - 1.0f) *
+			    (float)(x->bsums[2 * ib] + x->bsums[2 * ib + 1]);
+		}
+		acc = _mm256_fmadd_ps(_mm256_set1_ps(dd), _mm256_cvtepi32_ps(s), acc);
+		sum += dd * bs;
+	}
+	return hsumf(acc) + sum;
+}
+
+static float
+dot_iq4_xs(const uint8_t *b, const q8k *x, size_t nb)
+{
+	const __m128i tab = _mm_loadu_si128((const __m128i *)kvalues_iq4nl);
+	const __m256i tbl = _mm256_broadcastsi128_si256(tab), m4 = _mm256_set1_epi8(15);
+	__m256 acc = _mm256_setzero_ps();
+	size_t i;
+	int ib;
+	for (i = 0; i < nb; i++, b += 136, x++) {
+		uint16_t sh = (uint16_t)(b[2] | b[3] << 8);
+		const uint8_t *sl = b + 4, *qs = b + 8;
+		__m256i s = _mm256_setzero_si256();
+		for (ib = 0; ib < 8; ib++, qs += 16) {
+			int ls = ((sl[ib / 2] >> 4 * (ib % 2)) & 15) | (((sh >> 2 * ib) & 3) << 4);
+			__m128i q = _mm_loadu_si128((const __m128i *)qs);
+			/* elements 0-15 low nibbles, 16-31 high nibbles */
+			__m256i n = _mm256_and_si256(_mm256_setr_m128i(q, _mm_srli_epi16(q, 4)), m4);
+			__m256i w = _mm256_shuffle_epi8(tbl, n);
+			__m256i xv = _mm256_loadu_si256((const __m256i *)(x->qs + 32 * ib));
+			s = _mm256_add_epi32(s, _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_sign_epi8(w, w),
+			    _mm256_sign_epi8(xv, w)), _mm256_set1_epi16((short)(ls - 32))));
+		}
+		acc = _mm256_fmadd_ps(_mm256_set1_ps(h16f(b) * x->d), _mm256_cvtepi32_ps(s), acc);
+	}
+	return hsumf(acc);
+}
+
 float
 kq_dot(uint32_t t, const void *row, const q8k *x, size_t n)
 {
@@ -565,6 +795,13 @@ kq_dot(uint32_t t, const void *row, const q8k *x, size_t n)
 	case GT_Q5_K: return dot_q45_k(row, x, n / 256, 1);
 	case GT_Q6_K: return dot_q6_k(row, x, n / 256);
 	case GT_Q8_0: return dot_q8_0(row, x, n / 256);
+	case GT_IQ2_XXS: return dot_iq2_xxs(row, x, n / 256);
+	case GT_IQ2_XS: return dot_iq2_xs(row, x, n / 256);
+	case GT_IQ2_S: return dot_iq2_s(row, x, n / 256);
+	case GT_IQ3_XXS: return dot_iq3_xxs(row, x, n / 256);
+	case GT_IQ3_S: return dot_iq3_s(row, x, n / 256);
+	case GT_IQ1_S: return dot_iq1_s(row, x, n / 256);
+	case GT_IQ4_XS: return dot_iq4_xs(row, x, n / 256);
 	default: return kq_dot_scalar(t, row, x, n);
 	}
 }
