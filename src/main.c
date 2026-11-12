@@ -343,7 +343,7 @@ check(void)
 	for (i = 0; i < 8192; i++)
 		x[i] = (float)((double)rand() / RAND_MAX * 2 - 1);
 	printf("%-32s %-5s %10s %10s %10s %9s %9s\n", "tensor", "type",
-	    "kq-scalar", "kq-cpu", "gpu", "cpu ms", "gpu ms");
+	    "kq-scalar", "mv_run", "gpu", "cpu ms", "gpu ms");
 	for (i = 0; i < M.n_all; i++) {
 		wt *w = M.all[i];
 		double e_s = 0, e_k = 0, e_g = 0, nr = 0, t0, tc, tg = 0;
@@ -377,7 +377,7 @@ check(void)
 		if (w->gpu) {
 			/* force the GPU path */
 			vk_begin();
-			vk_add(w, e, x, yg);
+			vk_add(w, e, x, xq, yg);
 			t0 = now();
 			vk_submit();
 			vk_wait();
@@ -393,8 +393,8 @@ check(void)
 			printf("%10s %9.3f %9s\n", "-", tc * 1e3, "-");
 		free(xq);
 	}
-	printf("(relative L2 error vs the f32 reference; the CPU path "
-	    "quantizes x to 8 bits, the GPU path keeps x in f32)\n");
+	printf("(relative L2 error vs the f32 reference; kq-scalar and the CPU/GPU\n"
+	    " kernels use x quantized to 8 bits, so they should agree with each other)\n");
 	free(x);
 	free(yr);
 	free(yk);
@@ -532,6 +532,17 @@ main(int argc, char **argv)
 		}
 		gen = generate(lg, O.n_predict, &tg);
 		printf("\n");
+		if (O.bench) {
+			extern double vk_t_wait, vk_t_sub;
+			extern long vk_n_sub;
+			fprintf(stderr, "time: cpu matvec %.3f s (+%.3f s alongside gpu), "
+			    "gpu wait %.3f s, ssm scan %.3f s, attention %.3f s\n",
+			    prof_t[PROF_CPU_MV], prof_t[PROF_CPU_MV_OVERLAP],
+			    prof_t[PROF_GPU_WAIT], prof_t[PROF_SCAN], prof_t[PROF_ATTN]);
+			if (vk_n_sub)
+				fprintf(stderr, "vulkan: %ld batches, %.3f s recording\n",
+				    vk_n_sub, vk_t_sub);
+		}
 		if (O.bench || O.verbose)
 			fprintf(stderr, "prompt: %d tok in %.2f s (%.2f tok/s); "
 			    "gen: %d tok in %.2f s (%.2f tok/s)\n",

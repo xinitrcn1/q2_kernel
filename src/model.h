@@ -86,6 +86,10 @@ typedef struct {
 
 void mv_run(const mv_item *it, int n);
 
+/* time spent per phase, seconds */
+enum { PROF_CPU_MV, PROF_CPU_MV_OVERLAP, PROF_GPU_WAIT, PROF_SCAN, PROF_ATTN, PROF_N };
+extern double prof_t[PROF_N];
+
 /* compute settings */
 extern int g_ref;           /* reference float kernels on CPU */
 

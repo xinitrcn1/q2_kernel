@@ -19,7 +19,7 @@ LDLIBS+=	-lvulkan -lpthread -lm
 GLSLANG?=	glslangValidator
 
 OBJS=		${SRCS:%.c=build/%.o}
-SPVH=		${QTYPES:%=gen/spv_%.h}
+SPVH=		${QTYPES:%=gen/spv_%.h} ${QTYPES:%=gen/spv_%_nd.h}
 
 all: ${PROG}
 
@@ -34,10 +34,15 @@ build/${s:R}.o: src/${s} ${HDRS:%=src/%}
 
 build/vk.o: gen/shaders.h
 
+# per type: a DP4A variant and one with an emulated dot (_nd)
 .for t in ${QTYPES}
 gen/spv_${t}.h: shaders/matvec.comp
 	@mkdir -p gen
 	${GLSLANG} -V --target-env vulkan1.1 -DQT=${QT.${t}} --vn spv_${t} \
+	    -o ${.TARGET} shaders/matvec.comp >/dev/null
+gen/spv_${t}_nd.h: shaders/matvec.comp
+	@mkdir -p gen
+	${GLSLANG} -V --target-env vulkan1.1 -DQT=${QT.${t}} -DNO_DOT --vn spv_${t}_nd \
 	    -o ${.TARGET} shaders/matvec.comp >/dev/null
 .endfor
 

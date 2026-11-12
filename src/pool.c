@@ -2,18 +2,74 @@
 
 #include <pthread.h>
 #include <stdlib.h>
+#include <time.h>
+
+/*
+ * Workers spin for a short while before blocking on the condition
+ * variable.  A token's forward pass issues a few hundred pool runs a
+ * few microseconds apart; blocking between them lets cores fall into
+ * deep C-states and clock down, which costs far more than the spin.
+ * The spin only reads 'gen'; the job itself is always picked up under
+ * the mutex, which orders it.
+ */
+#define SPIN_NS 2000000L        /* 2 ms */
 
 static struct {
 	int n;
 	pthread_t *th;
 	pthread_mutex_t mu;
 	pthread_cond_t go, done;
-	unsigned gen;
-	int pending;
-	int quit;
+	volatile unsigned gen;
+	volatile int pending;
+	volatile int quit;
 	pool_fn fn;
 	void *arg;
 } P;
+
+static long
+nsnow(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ts.tv_sec * 1000000000L + ts.tv_nsec;
+}
+
+/* spin until *v != old or the budget is spent; returns 1 if it changed */
+static int
+spin_ne(volatile unsigned *v, unsigned old)
+{
+	long t0 = 0;
+	unsigned k;
+	for (k = 0;; k++) {
+		if (*v != old || P.quit)
+			return 1;
+		if ((k & 1023) == 1023) {
+			long t = nsnow();
+			if (t0 == 0)
+				t0 = t;
+			else if (t - t0 > SPIN_NS)
+				return 0;
+		}
+	}
+}
+
+static int
+spin_zero(volatile int *v)
+{
+	long t0 = 0;
+	unsigned k;
+	for (k = 0;; k++) {
+		if (*v == 0)
+			return 1;
+		if ((k & 1023) == 1023) {
+			long t = nsnow();
+			if (t0 == 0)
+				t0 = t;
+			else if (t - t0 > SPIN_NS)
+				return 0;
+		}
+	}
+}
 
 static void *
 worker(void *p)
@@ -25,6 +81,7 @@ worker(void *p)
 		pool_fn fn;
 		void *arg;
 
+		spin_ne(&P.gen, seen);
 		pthread_mutex_lock(&P.mu);
 		while (P.gen == seen && !P.quit)
 			pthread_cond_wait(&P.go, &P.mu);
@@ -88,6 +145,7 @@ pool_run(pool_fn fn, void *arg)
 
 	fn(arg, 0, P.n);
 
+	spin_zero(&P.pending);
 	pthread_mutex_lock(&P.mu);
 	while (P.pending)
 		pthread_cond_wait(&P.done, &P.mu);

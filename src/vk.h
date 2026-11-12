@@ -7,6 +7,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "kq.h"
 #include "model.h"
 
 int vk_init(size_t weight_budget, int device_index, int verbose);
@@ -23,7 +24,8 @@ void vk_plan_and_upload(model *m, int verbose);
 
 /* batch recording; vk_submit starts it, vk_wait copies results to y */
 void vk_begin(void);
-int vk_add(const wt *w, int e, const float *x, float *y);
+/* x is given both as the f32 key (for dedupe) and its q8k blocks */
+int vk_add(const wt *w, int e, const float *xkey, const q8k *xq, float *y);
 void vk_submit(void);
 void vk_wait(void);
 

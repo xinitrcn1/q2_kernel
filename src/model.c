@@ -12,6 +12,17 @@
 
 int g_ref;
 
+#include <time.h>
+/* --bench breakdown: see PROF_* in model.h */
+double prof_t[PROF_N];
+static double
+pnow(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (double)ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+
 /* ---------------------------------------------------------------- */
 /* loading                                                          */
 
@@ -330,24 +341,50 @@ void
 mv_run(const mv_item *it, int n)
 {
 	mv_item cpu[MV_MAX];
+	const q8k *xq[MV_MAX], *cxq[MV_MAX];
 	size_t cum[MV_MAX + 1], need = 0, used = 0;
 	mv_job job;
 	int i, k, nc = 0, ngpu = 0;
 
-	if (vk_ready()) {
-		vk_begin();
-		for (i = 0; i < n; i++) {
-			if (it[i].w->gpu && vk_add(it[i].w, it[i].e, it[i].x, it[i].y) == 0)
-				ngpu++;
-			else
-				cpu[nc++] = it[i];
+	/* quantize each distinct input once, for both CPU and GPU */
+	for (i = 0; i < n; i++)
+		need += (size_t)it[i].w->K / 256;
+	if (need > qbuf_cap) {
+		free(qbuf);
+		qbuf = malloc(need * sizeof(q8k));
+		qbuf_cap = qbuf ? need : 0;
+		if (!qbuf) {
+			fprintf(stderr, "out of memory\n");
+			exit(1);
 		}
-		if (ngpu)
-			vk_submit();
-	} else {
-		memcpy(cpu, it, sizeof(*it) * (size_t)n);
-		nc = n;
 	}
+	for (i = 0; i < n; i++) {
+		for (k = 0; k < i; k++)
+			if (it[k].x == it[i].x && it[k].w->K == it[i].w->K)
+				break;
+		if (k < i) {
+			xq[i] = xq[k];
+			continue;
+		}
+		xq[i] = qbuf + used;
+		if (!g_ref || it[i].w->gpu)
+			q8k_quantize(it[i].x, qbuf + used, (size_t)it[i].w->K);
+		used += (size_t)it[i].w->K / 256;
+	}
+
+	if (vk_ready())
+		vk_begin();
+	for (i = 0; i < n; i++) {
+		if (vk_ready() && it[i].w->gpu &&
+		    vk_add(it[i].w, it[i].e, it[i].x, xq[i], it[i].y) == 0)
+			ngpu++;
+		else {
+			cxq[nc] = xq[i];
+			cpu[nc++] = it[i];
+		}
+	}
+	if (ngpu)
+		vk_submit();
 
 	if (nc) {
 		memset(&job, 0, sizeof(job));
@@ -357,37 +394,20 @@ mv_run(const mv_item *it, int n)
 		cum[0] = 0;
 		for (i = 0; i < nc; i++) {
 			cum[i + 1] = cum[i] + (size_t)cpu[i].w->N;
-			need += (size_t)cpu[i].w->K / 256;
+			job.xq[i] = cxq[i];
 		}
 		job.total = cum[nc];
-		if (!g_ref) {
-			if (need > qbuf_cap) {
-				free(qbuf);
-				qbuf = malloc(need * sizeof(q8k));
-				qbuf_cap = qbuf ? need : 0;
-				if (!qbuf) {
-					fprintf(stderr, "out of memory\n");
-					exit(1);
-				}
-			}
-			/* quantize each distinct input once */
-			for (i = 0; i < nc; i++) {
-				for (k = 0; k < i; k++)
-					if (cpu[k].x == cpu[i].x && cpu[k].w->K == cpu[i].w->K)
-						break;
-				if (k < i) {
-					job.xq[i] = job.xq[k];
-					continue;
-				}
-				job.xq[i] = qbuf + used;
-				q8k_quantize(cpu[i].x, qbuf + used, (size_t)cpu[i].w->K);
-				used += (size_t)cpu[i].w->K / 256;
-			}
+		{
+			double t0 = pnow();
+			pool_run(mv_worker, &job);
+			prof_t[ngpu ? PROF_CPU_MV_OVERLAP : PROF_CPU_MV] += pnow() - t0;
 		}
-		pool_run(mv_worker, &job);
 	}
-	if (ngpu)
+	if (ngpu) {
+		double t0 = pnow();
 		vk_wait();
+		prof_t[PROF_GPU_WAIT] += pnow() - t0;
+	}
 }
 
 static void
@@ -522,7 +542,11 @@ mamba2(const model *m, const layer *L, state *s, int il)
 	sj.L = L;
 	sj.s = s;
 	sj.dt = dt;
-	pool_run(scan_worker, &sj);
+	{
+		double t0 = pnow();
+		pool_run(scan_worker, &sj);
+		prof_t[PROF_SCAN] += pnow() - t0;
+	}
 
 	/* gate with silu(z), grouped (n_group = 1) rms norm */
 	for (i = 0; i < DI; i++)
@@ -599,7 +623,11 @@ attention(const model *m, const layer *L, state *s, int il)
 	aj.s = s;
 	aj.il = il;
 	aj.n = s->pos + 1;
-	pool_run(att_worker, &aj);
+	{
+		double t0 = pnow();
+		pool_run(att_worker, &aj);
+		prof_t[PROF_ATTN] += pnow() - t0;
+	}
 
 	mv1(&L->o, 0, s->ao, s->tmp);
 }
