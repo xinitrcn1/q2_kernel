@@ -1,8 +1,8 @@
 # q2k: GGUF kernel for Granite 4.0-H (BSD make)
 
 PROG=		q2k
-SRCS=		main.c gguf.c quant.c kq.c pool.c model.c tok.c ucd.c vk.c vmath.c prefill.c
-HDRS=		gguf.h quant.h kq.h pool.h model.h tok.h vk.h vmath.h
+SRCS=		main.c gguf.c quant.c kq.c pool.c model.c tok.c ucd.c vk.c vmath.c prefill.c iqtab.c
+HDRS=		gguf.h quant.h kq.h pool.h model.h tok.h vk.h vmath.h iqtab.h
 QTYPES=		q2_k q3_k q4_k q5_k q6_k q8_0
 QT.q2_k=	10
 QT.q3_k=	11
@@ -70,6 +70,10 @@ gen/shaders.h: ${SPVH}
 	( echo '#include <stdint.h>'; \
 	  for f in ${SPVH:T}; do echo "#include \"$$f\""; done ) > ${.TARGET}
 
+# regenerate the i-quant tables from ggml's ggml-common.h
+iqtab:
+	python3 tools/gen_iqtab.py ${GGML_COMMON:U$${HOME}/llama.cpp/ggml/src/ggml-common.h} > src/iqtab.c
+
 # regenerate the pre-tokenizer's Unicode table (needs python3; the
 # output is committed so normal builds do not)
 ucd:
@@ -78,4 +82,4 @@ ucd:
 clean:
 	rm -rf build gen ${PROG}
 
-.PHONY: all clean ucd
+.PHONY: all clean ucd iqtab

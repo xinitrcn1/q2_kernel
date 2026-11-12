@@ -3,6 +3,7 @@
 #include <string.h>
 
 #include "gguf.h"
+#include "iqtab.h"
 
 float
 fp16_to_f32(uint16_t h)
@@ -193,6 +194,162 @@ dq_q8_0(const uint8_t *b, float *y)
 		y[l] = d * (int8_t)b[2 + l];
 }
 
+/* ---- i-quants (layouts and math as ggml's dequantize_row_iq*) ---- */
+
+static uint32_t
+u32le(const uint8_t *p)
+{
+	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+}
+
+static float
+gsign(uint8_t s, int j)
+{
+	return s & kmask_iq2xs[j] ? -1.f : 1.f;
+}
+
+/* IQ2_XXS: d qs[32 x u16] = 66 */
+static void
+dq_iq2_xxs(const uint8_t *b, float *y)
+{
+	float d = h16(b);
+	int ib, l, j;
+	for (ib = 0; ib < 8; ib++) {
+		const uint8_t *q = b + 2 + 8 * ib;
+		uint32_t a1 = u32le(q + 4);
+		float db = d * (0.5f + (a1 >> 28)) * 0.25f;
+		for (l = 0; l < 4; l++) {
+			const uint8_t *g = (const uint8_t *)(iq2xxs_grid + q[l]);
+			uint8_t sg = ksigns_iq2xs[(a1 >> 7 * l) & 127];
+			for (j = 0; j < 8; j++)
+				*y++ = db * g[j] * gsign(sg, j);
+		}
+	}
+}
+
+/* IQ2_XS: d qs[32 x u16] scales[8] = 74 */
+static void
+dq_iq2_xs(const uint8_t *b, float *y)
+{
+	float d = h16(b);
+	int ib, l, j;
+	for (ib = 0; ib < 8; ib++) {
+		uint8_t sc = b[66 + ib];
+		float db[2];
+		db[0] = d * (0.5f + (sc & 15)) * 0.25f;
+		db[1] = d * (0.5f + (sc >> 4)) * 0.25f;
+		for (l = 0; l < 4; l++) {
+			uint16_t q = (uint16_t)(b[2 + 8 * ib + 2 * l] | b[3 + 8 * ib + 2 * l] << 8);
+			const uint8_t *g = (const uint8_t *)(iq2xs_grid + (q & 511));
+			uint8_t sg = ksigns_iq2xs[q >> 9];
+			for (j = 0; j < 8; j++)
+				*y++ = db[l / 2] * g[j] * gsign(sg, j);
+		}
+	}
+}
+
+/* IQ2_S: d qs[64] signs[32] qh[8] scales[8] = 82 (qs[32] then signs[32]) */
+static void
+dq_iq2_s(const uint8_t *b, float *y)
+{
+	float d = h16(b);
+	const uint8_t *qs = b + 2, *sg = b + 34, *qh = b + 66, *sc = b + 74;
+	int ib, l, j;
+	for (ib = 0; ib < 8; ib++, qs += 4, sg += 4) {
+		float db[2];
+		db[0] = d * (0.5f + (sc[ib] & 15)) * 0.25f;
+		db[1] = d * (0.5f + (sc[ib] >> 4)) * 0.25f;
+		for (l = 0; l < 4; l++) {
+			const uint8_t *g = (const uint8_t *)(iq2s_grid + (qs[l] | ((qh[ib] << (8 - 2 * l)) & 0x300)));
+			for (j = 0; j < 8; j++)
+				*y++ = db[l / 2] * g[j] * gsign(sg[l], j);
+		}
+	}
+}
+
+/* IQ3_XXS: d qs[64] scales_and_signs[32] = 98 */
+static void
+dq_iq3_xxs(const uint8_t *b, float *y)
+{
+	float d = h16(b);
+	const uint8_t *qs = b + 2;
+	int ib, l, j;
+	for (ib = 0; ib < 8; ib++, qs += 8) {
+		uint32_t a = u32le(b + 66 + 4 * ib);
+		float db = d * (0.5f + (a >> 28)) * 0.5f;
+		for (l = 0; l < 4; l++) {
+			uint8_t sg = ksigns_iq2xs[(a >> 7 * l) & 127];
+			const uint8_t *g1 = (const uint8_t *)(iq3xxs_grid + qs[2 * l]);
+			const uint8_t *g2 = (const uint8_t *)(iq3xxs_grid + qs[2 * l + 1]);
+			for (j = 0; j < 4; j++) {
+				y[j] = db * g1[j] * gsign(sg, j);
+				y[j + 4] = db * g2[j] * gsign(sg, j + 4);
+			}
+			y += 8;
+		}
+	}
+}
+
+/* IQ3_S: d qs[64] qh[8] signs[32] scales[4] = 110 */
+static void
+dq_iq3_s(const uint8_t *b, float *y)
+{
+	float d = h16(b);
+	const uint8_t *qs = b + 2, *qh = b + 66, *sg = b + 74, *sc = b + 106;
+	int ib, l, j, h;
+	for (ib = 0; ib < 8; ib += 2) {
+		for (h = 0; h < 2; h++, qs += 8, sg += 4) {
+			float db = d * (1 + 2 * (h ? sc[ib / 2] >> 4 : sc[ib / 2] & 15));
+			for (l = 0; l < 4; l++) {
+				const uint8_t *g1 = (const uint8_t *)(iq3s_grid + (qs[2 * l] | ((qh[ib + h] << (8 - 2 * l)) & 256)));
+				const uint8_t *g2 = (const uint8_t *)(iq3s_grid + (qs[2 * l + 1] | ((qh[ib + h] << (7 - 2 * l)) & 256)));
+				for (j = 0; j < 4; j++) {
+					y[j] = db * g1[j] * gsign(sg[l], j);
+					y[j + 4] = db * g2[j] * gsign(sg[l], j + 4);
+				}
+				y += 8;
+			}
+		}
+	}
+}
+
+/* IQ1_S: d qs[32] qh[8 x u16] = 50 */
+static void
+dq_iq1_s(const uint8_t *b, float *y)
+{
+	float d = h16(b);
+	const uint8_t *qs = b + 2;
+	int ib, l, j;
+	for (ib = 0; ib < 8; ib++, qs += 4) {
+		uint16_t qh = (uint16_t)(b[34 + 2 * ib] | b[35 + 2 * ib] << 8);
+		float dl = d * (2 * ((qh >> 12) & 7) + 1);
+		float delta = qh & 0x8000 ? -IQ1S_DELTA : IQ1S_DELTA;
+		for (l = 0; l < 4; l++) {
+			const int8_t *g = (const int8_t *)(iq1s_grid + (qs[l] | (((qh >> 3 * l) & 7) << 8)));
+			for (j = 0; j < 8; j++)
+				*y++ = dl * (g[j] + delta);
+		}
+	}
+}
+
+/* IQ4_XS: d scales_h(u16) scales_l[4] qs[128] = 136 */
+static void
+dq_iq4_xs(const uint8_t *b, float *y)
+{
+	float d = h16(b);
+	uint16_t sh = (uint16_t)(b[2] | b[3] << 8);
+	const uint8_t *sl = b + 4, *qs = b + 8;
+	int ib, j;
+	for (ib = 0; ib < 8; ib++, qs += 16, y += 32) {
+		int ls = ((sl[ib / 2] >> 4 * (ib % 2)) & 15) | (((sh >> 2 * ib) & 3) << 4);
+		float dl = d * (ls - 32);
+		for (j = 0; j < 16; j++) {
+			y[j] = dl * kvalues_iq4nl[qs[j] & 15];
+			y[j + 16] = dl * kvalues_iq4nl[qs[j] >> 4];
+		}
+	}
+}
+
 void
 dequant_row(uint32_t t, const void *src, float *dst, size_t n)
 {
@@ -216,6 +373,13 @@ dequant_row(uint32_t t, const void *src, float *dst, size_t n)
 		case GT_Q5_K: dq_q5_k(b, dst); break;
 		case GT_Q6_K: dq_q6_k(b, dst); break;
 		case GT_Q8_0: dq_q8_0(b, dst); break;
+		case GT_IQ2_XXS: dq_iq2_xxs(b, dst); break;
+		case GT_IQ2_XS: dq_iq2_xs(b, dst); break;
+		case GT_IQ2_S: dq_iq2_s(b, dst); break;
+		case GT_IQ3_XXS: dq_iq3_xxs(b, dst); break;
+		case GT_IQ3_S: dq_iq3_s(b, dst); break;
+		case GT_IQ1_S: dq_iq1_s(b, dst); break;
+		case GT_IQ4_XS: dq_iq4_xs(b, dst); break;
 		default: memset(dst, 0, bs * sizeof(float)); break;
 		}
 	}

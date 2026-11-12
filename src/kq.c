@@ -250,6 +250,19 @@ kq_dot_scalar(uint32_t t, const void *row, const q8k *x, size_t n)
 		}
 		return sum;
 	default:
+		/* i-quants (until they have integer kernels): dequantize */
+		if (ggml_type_block(t) == 256) {
+			float w[256];
+			size_t bb = ggml_type_bytes(t);
+			for (nb = 0; nb < n / 256; nb++, b += bb, x++) {
+				float s = 0;
+				dequant_row(t, b, w, 256);
+				for (l = 0; l < 256; l++)
+					s += w[l] * x->qs[l];
+				sum += x->d * s;
+			}
+			return sum;
+		}
 		break;
 	}
 	(void)i;
