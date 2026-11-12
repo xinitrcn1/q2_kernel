@@ -1,7 +1,8 @@
 # q2k
 
-A small C99 inference kernel and CLI for Granite 4.0-H Tiny
-(`granitehybrid`) in GGUF, built with BSD make.  The model file is
+A small C99 inference kernel and CLI for GGUF models, built with BSD
+make: Granite 4.0-H (`granitehybrid`) and Qwen3.5-style hybrids
+(`qwen35`, e.g. Qwen3.8-27B).  The model file is
 mmapped read-only; nothing is copied at load except what goes to the GPU.
 
     make
@@ -88,6 +89,32 @@ time:
 `--bench` prints a time breakdown; `Q2K_GPUPROF=1` adds per-stage GPU
 timestamps.  Pool and fence waits spin up to 100 ms before sleeping:
 with deep C-states, cores woken from sleep ran CPU matmuls 3.5x slower.
+
+## Qwen3.5 (qwen35)
+
+`src/qwen35.c`: Gated DeltaNet layers (per value head a 128x128 state:
+decay, delta rule, gated per-head RMS norm) and gated full attention
+every 4th layer (query|gate, q/k norms, partial NeoX RoPE), dense
+SwiGLU FFN.  Prompts are batched on the CPU (`qwen35_prefill`).
+
+The i-quants (IQ1_S, IQ2_XXS/XS/S, IQ3_XXS/S, IQ4_XS) have CPU
+kernels, but the codebook gathers make them compute-bound.  A lossless
+transcode turns the codebook types into bit-plane layouts that decode
+with shifts and table shuffles (and have GPU kernels):
+
+    ./q2k -m model.gguf --transcode model.q2k.gguf     # once, ~4 min
+    ./q2k -m model.q2k.gguf -g 1600 --vram 1800 -i
+
+(Every converted tensor dequantizes identically; the 27B file grows
+from 9.5 to 13.1 GB.)  Every matrix keeps the same leading fraction of
+its rows on the GPU.  On this host (CPU-bound, 6 threads):
+
+| Qwen3.8-27B | decode | prompt |
+|---|---|---|
+| llama.cpp CPU | 1.04 | |
+| original GGUF, CPU | 1.55 | 5.7 |
+| transcoded, CPU | 1.9-2.0 | 5.9 |
+| transcoded, `-g 1600 --vram 1800` | 2.2 | 6.4 |
 
 ## Checking
 
