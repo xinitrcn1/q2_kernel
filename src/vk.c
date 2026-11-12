@@ -73,17 +73,19 @@ static struct {
 	struct { uint32_t off, n; float *dst; } dl[BMAX];
 	int inflight;
 	/* fused paths */
-	struct lay { int ok; uint32_t an, fn, cw, cb, dtb, a, d, sn, sconv, sssm; } *lay;
+	struct lay { int ok, hg; uint32_t an, cw, cb, dtb, a, d, sn, sconv, sssm; wt gin, gout; } *lay;
 	int nlay;
-	uint32_t xq_moe, x_out, xn_out;
+	wt lm;                  /* leading rows of the output projection */
+	int has_lm;
 	int nmoe;
 	struct { const wt *g, *u, *d; int e; float *out; } moe[16];
 	/* Q2K_GPUPROF: per-stage GPU timestamps of the fused mixer */
 	VkQueryPool qp;
 	int prof, nts;
 	float ts_period;
-	double stage[16];
-	long nstage;
+	double stage[16], mstage[16];
+	long nstage, mstage_n, mn[17];
+	int moe_prof, nmoe_last;
 } V;
 
 #define CK(x) do { VkResult r_ = (x); if (r_ != VK_SUCCESS) { \
@@ -270,7 +272,7 @@ vk_init(size_t budget, size_t state_bytes, int devidx, int verbose)
 		fprintf(stderr, "vulkan: %s lacks subgroup arithmetic\n", V.name);
 		return -1;
 	}
-	V.rows_per_wg = 256 / sp.subgroupSize;
+	V.rows_per_wg = 256 / sp.subgroupSize * 4;  /* RPS in matvec.comp */
 	V.sg_per_wg = 256 / sp.subgroupSize;
 
 	vkGetPhysicalDeviceQueueFamilyProperties(V.pd, &nqf, NULL);
@@ -655,82 +657,187 @@ upload_raw(const void *src, size_t bytes)
 	return (uint32_t)(off / 4);
 }
 
-/* norms, conv and SSM parameters of a Mamba2 layer whose projections
- * are resident, and its state slots: enables vk_mamba_layer */
+/* rows (ranges of src rows of expert 0) with their first kel columns,
+ * repacked, as a GPU-only matrix */
+static int
+upload_rows(const wt *src, const int (*rg)[2], int nr, int kel, const char *name, wt *dst)
+{
+	size_t sb = ggml_type_bytes(src->type), db = gpu_block_bytes(src->type);
+	size_t nblk = (size_t)kel / ggml_type_block(src->type), grb = nblk * db;
+	size_t rows = 0, fill = 0, total;
+	uint64_t base = V.wused, flushed = V.wused;
+	int i, r;
+	void *p;
+
+	(void)sb;
+	if (!V.ok || !V.pipe[src->type])
+		return -1;
+	for (i = 0; i < nr; i++)
+		rows += (size_t)(rg[i][1] - rg[i][0]);
+	total = rows * grb;
+	if (rows == 0 || V.wused + total > V.wcap)
+		return -1;
+	if (!V.ubuf) {
+		if (mkbuf(UPCHUNK, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, 1, &V.ubuf, &V.umem, &p))
+			return -1;
+		V.umap = p;
+	}
+	for (i = 0; i < nr; i++)
+		for (r = rg[i][0]; r < rg[i][1]; r++) {
+			if (fill + grb > UPCHUNK) {
+				if (flush_upload(fill, flushed))
+					return -1;
+				flushed += fill;
+				fill = 0;
+			}
+			repack(src->type, src->data + (size_t)r * src->row_bytes, V.umap + fill, nblk);
+			fill += grb;
+		}
+	if (flush_upload(fill, flushed))
+		return -1;
+	memset(dst, 0, sizeof(*dst));
+	snprintf(dst->name, sizeof(dst->name), "%s", name);
+	dst->type = src->type;
+	dst->K = kel;
+	dst->N = (int)rows;
+	dst->E = 1;
+	dst->row_bytes = nblk * sb;
+	dst->gpu_off = base;
+	dst->gpu_row_bytes = grb;
+	dst->gslot = calloc(1, sizeof(int));
+	dst->gpu_n = 1;
+	V.wused += (total + 255) & ~(size_t)255;
+	return dst->gslot ? 0 : -1;
+}
+
+/*
+ * Mamba2 mixer split by SSM heads: the GPU owns heads [0, hg) -- its
+ * rows of ssm_in (z, x, dt) plus the shared B/C rows, those conv
+ * channels, those heads' scan and state, and the matching column slice
+ * of ssm_out -- and the CPU the rest.  The gated RMS norm only scales
+ * ssm_out's input, so each side returns a partial ssm_out(y*w) and its
+ * sum of squares; out = (part_gpu + part_cpu) / rms.
+ */
 static void
-setup_mamba(const model *m, int il)
+setup_mamba(const model *m, int il, int hg)
 {
 	const hparams *h = &m->hp;
 	const layer *L = &m->L[il];
 	struct lay *ly = &V.lay[il];
-	size_t E = (size_t)h->n_embd, CH = (size_t)h->conv_ch, DI = (size_t)h->d_inner;
-	size_t need = 3 * CH + DI * (size_t)h->d_state;
+	const int P = h->ssm_head_dim, DI = h->d_inner, DS = h->d_state, E = h->n_embd;
+	const int gdi = hg * P, gch = gdi + 2 * DS;
+	int rin[4][2], rout[1][2], c;
+	size_t need = 3 * (size_t)gch + (size_t)gdi * (size_t)DS;
+	float *cw, *cb;
 
-	if (L->attn || !L->ssm_in.gpu_n || !L->ssm_out.gpu_n || V.sused + need > V.scap)
+	if (L->attn || hg <= 0 || gdi % 256 || V.sused + need > V.scap)
 		return;
-	ly->an = upload_raw(L->attn_norm, E * 4);
-	ly->fn = upload_raw(L->ffn_norm, E * 4);
-	ly->cw = upload_raw(L->conv_w, 4 * CH * 4);
-	ly->cb = upload_raw(L->conv_b, CH * 4);
-	ly->dtb = upload_raw(L->dt_b, (size_t)h->ssm_heads * 4);
-	ly->a = upload_raw(L->A, (size_t)h->ssm_heads * 4);
-	ly->d = upload_raw(L->D, (size_t)h->ssm_heads * 4);
-	ly->sn = upload_raw(L->ssm_norm, DI * 4);
-	if (ly->an == NONE || ly->fn == NONE || ly->cw == NONE || ly->cb == NONE ||
-	    ly->dtb == NONE || ly->a == NONE || ly->d == NONE || ly->sn == NONE)
+	rin[0][0] = 0;                rin[0][1] = gdi;              /* z */
+	rin[1][0] = DI;               rin[1][1] = DI + gdi;         /* x */
+	rin[2][0] = 2 * DI;           rin[2][1] = 2 * DI + 2 * DS;  /* B, C */
+	rin[3][0] = 2 * DI + 2 * DS;  rin[3][1] = 2 * DI + 2 * DS + hg; /* dt */
+	rout[0][0] = 0;
+	rout[0][1] = E;
+	if (upload_rows(&L->ssm_in, (const int (*)[2])rin, 4, h->n_embd, "ssm_in[gpu heads]", &ly->gin) ||
+	    upload_rows(&L->ssm_out, (const int (*)[2])rout, 1, gdi, "ssm_out[gpu cols]", &ly->gout))
+		return;
+	cw = malloc(sizeof(float) * 4 * (size_t)gch);
+	cb = malloc(sizeof(float) * (size_t)gch);
+	if (!cw || !cb) {
+		free(cw);
+		free(cb);
+		return;
+	}
+	for (c = 0; c < gch; c++) {
+		int src = c < gdi ? c : DI + (c - gdi);
+		memcpy(cw + 4 * c, L->conv_w + 4 * src, 4 * sizeof(float));
+		cb[c] = L->conv_b[src];
+	}
+	ly->an = upload_raw(L->attn_norm, (size_t)E * 4);
+	ly->cw = upload_raw(cw, 4 * (size_t)gch * 4);
+	ly->cb = upload_raw(cb, (size_t)gch * 4);
+	free(cw);
+	free(cb);
+	ly->dtb = upload_raw(L->dt_b, (size_t)hg * 4);
+	ly->a = upload_raw(L->A, (size_t)hg * 4);
+	ly->d = upload_raw(L->D, (size_t)hg * 4);
+	ly->sn = upload_raw(L->ssm_norm, (size_t)gdi * 4);
+	if (ly->an == NONE || ly->cw == NONE || ly->cb == NONE || ly->dtb == NONE ||
+	    ly->a == NONE || ly->d == NONE || ly->sn == NONE)
 		return;
 	ly->sconv = (uint32_t)V.sused;
-	ly->sssm = (uint32_t)(V.sused + 3 * CH);
+	ly->sssm = (uint32_t)(V.sused + 3 * (size_t)gch);
 	V.sused += need;
+	ly->hg = hg;
 	ly->ok = 1;
 }
 
-static int
-by_size(const void *a, const void *b)
-{
-	const wt *x = *(wt *const *)a, *y = *(wt *const *)b;
-	return x->nbytes < y->nbytes ? 1 : x->nbytes > y->nbytes ? -1 : 0;
-}
-
 /*
- * Placement is by whole tensor and whole expert, fixed at load:
- *  1. dense tensors (read every token: mixers, attention, shared
- *     experts, the tied output), largest first;
- *  2. then routed experts, each as its gate+up+down triple (they are
- *     used together), the same number per layer, in rounds over the
- *     layers, until the budget is spent.
- * Every matvec then runs entirely where its weights live; a batch's
- * GPU part runs alongside its CPU part.
+ * Placement, fixed at load (weights stay resident, nothing is uploaded
+ * while decoding), in this order until the budget is spent:
+ *  1. each Mamba2 mixer's GPU head share (--split of the heads, in
+ *     multiples of 4) -- the GPU and CPU halves run concurrently;
+ *  2. attention projections and shared experts, whole;
+ *  3. the leading --split of the output projection's rows (the CPU
+ *     does the other rows at the same time);
+ *  4. routed experts as gate+up+down triples, the same number per
+ *     layer, in rounds over the layers.
  */
 void
 vk_plan_and_upload(model *m, int verbose)
 {
-	wt *dense[512];
-	int nd = 0, i, l, nl = m->hp.n_layer, ne = m->hp.n_expert;
-	int **sel = NULL, *cnt = NULL, round, full = 0;
+	const hparams *hp = &m->hp;
+	int i, l, nl = hp->n_layer, ne = hp->n_expert, hg, nmix = 0;
+	int **sel = NULL, *cnt = NULL, round, full = 0, nexp = 0;
 	double hot = 0, hot_gpu = 0;
-	size_t dense_b = 0, exp_b = 0;
-	int nexp = 0, ndense = 0;
+	size_t b0;
 
-	for (i = 0; i < m->n_all; i++)
-		if (m->all[i]->heat >= 1)
-			dense[nd++] = m->all[i];
-	qsort(dense, (size_t)nd, sizeof(wt *), by_size);
-	for (i = 0; i < nd; i++) {
-		int zero = 0;
-		size_t before = V.wused;
-		if (vk_upload(dense[i], &zero, 1) == 0) {
-			ndense++;
-			dense_b += V.wused - before;
-		}
-	}
-	/* fused mixer for every Mamba2 layer whose projections fit */
+	hg = (int)(g_split * hp->ssm_heads / 4 + 0.5) * 4;
+	if (hg > hp->ssm_heads)
+		hg = hp->ssm_heads;
 	V.nlay = nl;
 	V.lay = calloc((size_t)nl, sizeof(*V.lay));
-	for (l = 0; V.lay && l < nl; l++)
-		setup_mamba(m, l);
+	b0 = V.wused;
+	for (l = 0; V.lay && l < nl; l++) {
+		setup_mamba(m, l, hg);
+		nmix += V.lay[l].ok;
+	}
 	if (V.lay)
 		vk_state_reset();
+	if (verbose)
+		fprintf(stderr, "vulkan: mixers: %d layers with %d/%d heads on the gpu (%.1f MiB)\n",
+		    nmix, hg, hp->ssm_heads, (V.wused - b0) / 1048576.0);
+
+	b0 = V.wused;
+	for (l = 0; l < nl; l++) {
+		layer *L = &m->L[l];
+		int zero = 0;
+		if (L->attn) {
+			vk_upload(&L->q, &zero, 1);
+			vk_upload(&L->k, &zero, 1);
+			vk_upload(&L->v, &zero, 1);
+			vk_upload(&L->o, &zero, 1);
+		}
+		vk_upload(&L->gate_s, &zero, 1);
+		vk_upload(&L->up_s, &zero, 1);
+		vk_upload(&L->down_s, &zero, 1);
+	}
+	{
+		int rows = (int)(g_split * m->tok_embd.N);
+		int rg[1][2];
+		rows -= rows % (int)V.rows_per_wg;
+		rg[0][0] = 0;
+		rg[0][1] = rows;
+		while (rows > 0 && upload_rows(&m->tok_embd, (const int (*)[2])rg, 1,
+		    m->tok_embd.K, "output[gpu rows]", &V.lm) != 0) {
+			rows = rows / 2 - (rows / 2) % (int)V.rows_per_wg;
+			rg[0][1] = rows;
+		}
+		V.has_lm = rows > 0;
+	}
+	if (verbose)
+		fprintf(stderr, "vulkan: attention + shared experts + %d output rows: %.1f MiB\n",
+		    V.has_lm ? V.lm.N : 0, (V.wused - b0) / 1048576.0);
 
 	/* experts: choose per layer in rounds, then upload per tensor */
 	sel = calloc((size_t)nl, sizeof(*sel));
@@ -755,15 +862,14 @@ vk_plan_and_upload(model *m, int verbose)
 				sel[l][cnt[l]++] = round;
 			}
 	}
+	b0 = V.wused;
 	for (l = 0; l < nl; l++) {
 		layer *L = &m->L[l];
-		size_t before = V.wused;
 		if (!cnt[l])
 			continue;
 		vk_upload(&L->gate_e, sel[l], cnt[l]);
 		vk_upload(&L->up_e, sel[l], cnt[l]);
 		vk_upload(&L->down_e, sel[l], cnt[l]);
-		exp_b += V.wused - before;
 		nexp += cnt[l];
 	}
 out:
@@ -772,17 +878,28 @@ out:
 			free(sel[l]);
 	free(sel);
 	free(cnt);
+	/* bytes read per token, total and on the GPU */
 	for (i = 0; i < m->n_all; i++) {
 		const wt *w = m->all[i];
 		hot += w->heat * (double)w->nbytes;
 		hot_gpu += w->heat * (double)w->nbytes * w->gpu_n / w->E;
 	}
+	for (l = 0; V.lay && l < nl; l++)
+		if (V.lay[l].ok)
+			hot_gpu += (double)(V.lay[l].gin.N * V.lay[l].gin.row_bytes +
+			    V.lay[l].gout.N * V.lay[l].gout.row_bytes);
+	if (V.has_lm)
+		hot_gpu += (double)V.lm.N * V.lm.row_bytes;
 	if (verbose)
-		fprintf(stderr, "vulkan: resident: %d dense tensors (%.1f MiB) + %d experts "
-		    "(%.1f/layer, %.1f MiB) = %.1f MiB; %.0f%% of per-token weight bytes "
-		    "(%.0f of %.0f MiB)\n", ndense, dense_b / 1048576.0,
-		    nexp, (double)nexp / nl, exp_b / 1048576.0, V.wused / 1048576.0,
-		    100.0 * hot_gpu / hot, hot_gpu / 1048576.0, hot / 1048576.0);
+		fprintf(stderr, "vulkan: experts: %d (%.1f/layer, %.1f MiB); %.1f MiB resident; "
+		    "%.0f%% of per-token weight bytes on the gpu\n", nexp, (double)nexp / nl,
+		    (V.wused - b0) / 1048576.0, V.wused / 1048576.0, 100.0 * hot_gpu / hot);
+}
+
+const wt *
+vk_lm(void)
+{
+	return V.ok && V.has_lm ? &V.lm : NULL;
 }
 
 /* ---------------------------------------------------------------- */
@@ -930,6 +1047,7 @@ seq_norm(uint32_t a, uint32_t b, float s, uint32_t n, uint32_t x_out, uint32_t w
 	memset(p, 0, sizeof(p));
 	p[0] = a; p[1] = b; p[2] = fbits(s); p[3] = n; p[4] = x_out; p[5] = w;
 	p[6] = fbits(eps); p[7] = f_out; p[8] = q_out; p[9] = mode;
+	p[10] = NONE; p[11] = 0;
 	seq_op(PIPE_NORM, p, 1);
 }
 
@@ -1071,21 +1189,23 @@ vk_state_reset(void)
 	}
 }
 
-/*
- * x (residual stream) in, x out after the mixer's residual add, and
- * xn = ffn_norm(x) for the MoE block; one submit:
- *   attn_norm+q8k, ssm_in, conv, scan, ssm_norm+q8k, ssm_out,
- *   residual + ffn_norm (+ q8k kept on the GPU for the MoE)
- */
+int
+vk_mamba_heads(int il)
+{
+	return vk_mamba_ok(il) ? V.lay[il].hg : 0;
+}
+
+/* GPU half of a split Mamba2 mixer (async; vk_wait delivers out[E],
+ * the partial ssm_out of the GPU heads, and *ss, their sum of y^2) */
 void
-vk_mamba_layer(const model *m, int il, float *x, float *xn)
+vk_mamba_submit(const model *m, int il, const float *x, float *out, float *ss)
 {
 	const hparams *h = &m->hp;
-	const layer *L = &m->L[il];
 	const struct lay *ly = &V.lay[il];
-	const uint32_t E = (uint32_t)h->n_embd, DI = (uint32_t)h->d_inner;
-	const uint32_t CH = (uint32_t)h->conv_ch, NH = (uint32_t)h->ssm_heads;
-	uint32_t ax, q1, zx, xbc, dt, y, q2, o, p[16];
+	const uint32_t E = (uint32_t)h->n_embd, DS = (uint32_t)h->d_state;
+	const uint32_t gdi = (uint32_t)(ly->hg * h->ssm_head_dim), gch = gdi + 2 * DS;
+	const uint32_t hg = (uint32_t)ly->hg;
+	uint32_t ax, q1, zx, xbc, dt, y, q2, o, sso, p[16];
 
 	seq_begin();
 	if (V.prof) {
@@ -1098,62 +1218,82 @@ vk_mamba_layer(const model *m, int il, float *x, float *xn)
 	q1 = seq_alloc(E / 256 * Q8W);
 	seq_norm(ax, NONE, 0, E, NONE, ly->an, h->eps, NONE, q1, 0);
 	cbar();
-	zx = seq_alloc((uint32_t)h->d_in_proj);
-	seq_matvec(&L->ssm_in, 0, q1, zx);
+	zx = seq_alloc((uint32_t)ly->gin.N);
+	seq_matvec(&ly->gin, 0, q1, zx);
 	cbar();
-	xbc = seq_alloc(CH);
-	dt = seq_alloc(NH);
+	xbc = seq_alloc(gch);
+	dt = seq_alloc(hg);
 	memset(p, 0, sizeof(p));
-	p[0] = zx + DI; p[1] = zx + DI + CH; p[2] = xbc; p[3] = dt; p[4] = ly->sconv;
-	p[5] = ly->cw; p[6] = ly->cb; p[7] = ly->dtb; p[8] = CH; p[9] = NH;
-	seq_op(PIPE_CONV, p, (CH + 255) / 256);
+	p[0] = zx + gdi; p[1] = zx + gdi + gch; p[2] = xbc; p[3] = dt; p[4] = ly->sconv;
+	p[5] = ly->cw; p[6] = ly->cb; p[7] = ly->dtb; p[8] = gch; p[9] = hg;
+	seq_op(PIPE_CONV, p, (gch + 255) / 256);
 	cbar();
-	y = seq_alloc(DI);
+	y = seq_alloc(gdi);
 	memset(p, 0, sizeof(p));
 	p[0] = xbc; p[1] = dt; p[2] = zx; p[3] = y; p[4] = ly->sssm; p[5] = ly->a; p[6] = ly->d;
-	p[7] = DI; p[8] = (uint32_t)h->d_state; p[9] = (uint32_t)h->ssm_head_dim;
-	seq_op(PIPE_SCAN, p, (DI + V.sg_per_wg - 1) / V.sg_per_wg);
+	p[7] = gdi; p[8] = DS; p[9] = (uint32_t)h->ssm_head_dim;
+	seq_op(PIPE_SCAN, p, (gdi + V.sg_per_wg - 1) / V.sg_per_wg);
 	cbar();
-	q2 = seq_alloc(DI / 256 * Q8W);
-	seq_norm(y, NONE, 0, DI, NONE, ly->sn, h->eps, NONE, q2, 0);
+	q2 = seq_alloc(gdi / 256 * Q8W);
+	sso = seq_alloc(1);
+	memset(p, 0, sizeof(p));
+	p[0] = y; p[1] = NONE; p[3] = gdi; p[4] = NONE; p[5] = ly->sn; p[7] = NONE;
+	p[8] = q2; p[10] = sso; p[11] = 1;
+	seq_op(PIPE_NORM, p, 1);
 	cbar();
 	o = seq_alloc(E);
-	seq_matvec(&L->ssm_out, 0, q2, o);
-	cbar();
-	V.xq_moe = XQ_RES;      /* outside the bump allocator: read by the MoE submit */
-	V.x_out = seq_alloc(E);
-	V.xn_out = seq_alloc(E);
-	seq_norm(ax, o, h->res_scale, E, V.x_out, ly->fn, h->eps, V.xn_out, V.xq_moe, 0);
-	seq_get(V.x_out, E, x);
-	seq_get(V.xn_out, E, xn);
+	seq_matvec(&ly->gout, 0, q2, o);
 	ts();
+	seq_get(o, E, out);
+	seq_get(sso, 1, ss);
 	seq_submit();
-	vk_wait();
-	if (V.prof) {
+}
+
+void
+vk_prof_collect(void)
+{
+	if (V.prof && V.nts > 1) {
 		uint64_t t[16];
 		int i;
 		if (vkGetQueryPoolResults(V.dev, V.qp, 0, (uint32_t)V.nts, sizeof(t), t, 8,
 		    VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS) {
-			for (i = 1; i < V.nts; i++)
-				V.stage[i - 1] += (double)(t[i] - t[i - 1]) * V.ts_period * 1e-9;
-			V.nstage++;
+			if (V.moe_prof) {
+				for (i = 1; i < V.nts; i++)
+					V.mstage[i - 1] += (double)(t[i] - t[i - 1]) * V.ts_period * 1e-9;
+				V.mn[V.nmoe_last]++;
+				V.mstage_n++;
+			} else {
+				for (i = 1; i < V.nts; i++)
+					V.stage[i - 1] += (double)(t[i] - t[i - 1]) * V.ts_period * 1e-9;
+				V.nstage++;
+			}
 		}
+		V.nts = 0;
+		V.moe_prof = 0;
 	}
-	(void)0;
 }
 
 void
 vk_prof_report(void)
 {
-	static const char *nm[] = { "attn_norm+q", "ssm_in", "conv", "scan", "ssm_norm+q",
-	    "ssm_out", "res+ffn_norm" };
+	static const char *nm[] = { "attn_norm+q", "ssm_in", "conv", "scan", "y*w+q",
+	    "ssm_out", "-" };
 	int i;
 	if (!V.prof || !V.nstage)
 		return;
 	fprintf(stderr, "gpu mixer per layer (us):");
-	for (i = 0; i < 7; i++)
+	for (i = 0; i < 6; i++)
 		fprintf(stderr, " %s %.1f", nm[i], V.stage[i] / V.nstage * 1e6);
 	fprintf(stderr, "\n");
+	if (V.mstage_n) {
+		fprintf(stderr, "gpu moe per submit (us): gate+up %.1f swiglu+q %.1f down %.1f; experts/submit:",
+		    V.mstage[0] / V.mstage_n * 1e6, V.mstage[1] / V.mstage_n * 1e6,
+		    V.mstage[2] / V.mstage_n * 1e6);
+		for (i = 1; i <= 16; i++)
+			if (V.mn[i])
+				fprintf(stderr, " %d:%ld", i, V.mn[i]);
+		fprintf(stderr, "\n");
+	}
 }
 
 /* ---------------------------------------------------------------- */
@@ -1180,8 +1320,6 @@ vk_moe_add(const wt *gate, const wt *up, const wt *down, int e, float *out)
 	return 0;
 }
 
-/* xq: the block input as q8k, or NULL to use the one the fused mixer
- * left on the GPU */
 void
 vk_moe_submit(const q8k *xq, int K)
 {
@@ -1191,8 +1329,15 @@ vk_moe_submit(const q8k *xq, int K)
 	if (!V.nmoe)
 		return;
 	seq_begin();
-	xo = xq ? seq_put(xq, (uint32_t)K / 256 * Q8W) : V.xq_moe;
+	if (V.prof) {
+		vkCmdResetQueryPool(V.cb, V.qp, 0, 16);
+		V.nts = 0;
+		V.moe_prof = 1;
+	}
+	V.nmoe_last = V.nmoe;
+	xo = seq_put(xq, (uint32_t)K / 256 * Q8W);
 	seq_flush_up();
+	ts();
 	for (i = 0; i < V.nmoe; i++) {
 		g[i] = seq_alloc((uint32_t)V.moe[i].g->N);
 		u[i] = seq_alloc((uint32_t)V.moe[i].u->N);
@@ -1211,5 +1356,6 @@ vk_moe_submit(const q8k *xq, int K)
 		seq_matvec(V.moe[i].d, V.moe[i].e, hq[i], o[i]);
 		seq_get(o[i], (uint32_t)V.moe[i].d->N, V.moe[i].out);
 	}
+	ts();
 	seq_submit();
 }

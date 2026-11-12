@@ -66,6 +66,7 @@ typedef struct {
 	float *hs_g, *hs_u, *he_g, *he_u, *eo, *so;
 	float *logits;
 	void *xq;               /* q8k scratch for the MoE input */
+	float *og;              /* GPU half of the mixer output */
 } state;
 
 int model_load(model *m, const char *path, char *err, size_t errlen);
@@ -86,10 +87,16 @@ typedef struct {
 	const wt *w;
 	int e;                  /* expert index */
 	const float *x;
-	float *y;
+	float *y;               /* y[r] for r in [r0, r1) */
+	int r0, r1;             /* row range (r1 = 0: all rows) */
+	int k0;                 /* first column (multiple of 256): partial dot */
 } mv_item;
 
+mv_item mv(const wt *w, int e, const float *x, float *y);
+mv_item mv_rows(const wt *w, int e, const float *x, float *y, int r0, int r1, int k0);
 void mv_run(const mv_item *it, int n);
+/* CPU only (when a GPU sequence of ours is already in flight) */
+void mv_cpu(const mv_item *it, int n);
 
 /* time spent per phase, seconds */
 enum { PROF_CPU_MV, PROF_CPU_MV_OVERLAP, PROF_GPU_WAIT, PROF_SCAN, PROF_ATTN,
@@ -98,5 +105,6 @@ extern double prof_t[PROF_N];
 
 /* compute settings */
 extern int g_ref;           /* reference float kernels on CPU */
+extern double g_split;      /* GPU share of split work (mixer heads, output rows) */
 
 #endif

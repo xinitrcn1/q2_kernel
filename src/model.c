@@ -12,6 +12,7 @@
 #include "vmath.h"
 
 int g_ref;
+double g_split = 0.6;
 
 #include <time.h>
 /* --bench breakdown: see PROF_* in model.h */
@@ -255,6 +256,7 @@ state_init(state *s, const model *m, int ctx)
 	s->so = fa((size_t)h->n_embd);
 	s->logits = fa(big);
 	s->xq = malloc(sizeof(q8k) * (size_t)(h->n_embd / 256));
+	s->og = fa((size_t)h->n_embd);
 	s->conv = calloc((size_t)h->n_layer, sizeof(float *));
 	s->ssm = calloc((size_t)h->n_layer, sizeof(float *));
 	s->kc = calloc((size_t)h->n_layer, sizeof(float *));
@@ -306,7 +308,7 @@ state_free(state *s, const model *m)
 	free(s->x); free(s->xn); free(s->tmp); free(s->zxbcdt); free(s->xbc);
 	free(s->y); free(s->q); free(s->k); free(s->v); free(s->att); free(s->ao);
 	free(s->rl); free(s->hs_g); free(s->hs_u); free(s->he_g); free(s->he_u);
-	free(s->eo); free(s->so); free(s->logits); free(s->xq);
+	free(s->eo); free(s->so); free(s->logits); free(s->xq); free(s->og);
 	memset(s, 0, sizeof(*s));
 }
 
@@ -352,19 +354,22 @@ mv_worker(void *arg, int ith, int nth)
 		for (; i < j->n && j->cum[i] < hi; i++) {
 			const mv_item *t = &j->it[i];
 			const wt *w = t->w;
-			size_t r0 = lo > j->cum[i] ? lo - j->cum[i] : 0;
-			size_t r1 = (hi < j->cum[i + 1] ? hi : j->cum[i + 1]) - j->cum[i];
-			const uint8_t *base = w->data + (size_t)t->e * (size_t)w->N * w->row_bytes;
+			size_t r0 = (lo > j->cum[i] ? lo - j->cum[i] : 0) + (size_t)t->r0;
+			size_t r1 = (hi < j->cum[i + 1] ? hi : j->cum[i + 1]) - j->cum[i] +
+			    (size_t)t->r0;
+			/* columns [k0, K): skip whole blocks of the row and of x */
+			size_t kb = (size_t)t->k0 / ggml_type_block(w->type) * ggml_type_bytes(w->type);
+			size_t nk = (size_t)(w->K - t->k0);
+			const uint8_t *base = w->data + (size_t)t->e * (size_t)w->N * w->row_bytes + kb;
 			size_t r;
 
 			if (g_ref || w->type == GT_F32) {
 				for (r = r0; r < r1; r++)
-					t->y[r] = dot_row(w->type, base + r * w->row_bytes, t->x,
-					    (size_t)w->K);
+					t->y[r] = dot_row(w->type, base + r * w->row_bytes, t->x + t->k0, nk);
 			} else {
 				for (r = r0; r < r1; r++)
-					t->y[r] = kq_dot(w->type, base + r * w->row_bytes, j->xq[i],
-					    (size_t)w->K);
+					t->y[r] = kq_dot(w->type, base + r * w->row_bytes,
+					    j->xq[i] + t->k0 / 256, nk);
 			}
 		}
 		if (i > 0)
@@ -373,6 +378,32 @@ mv_worker(void *arg, int ith, int nth)
 }
 
 static void mv_run_ex(const mv_item *it, int n, int allow_gpu);
+
+mv_item
+mv_rows(const wt *w, int e, const float *x, float *y, int r0, int r1, int k0)
+{
+	mv_item it;
+	it.w = w;
+	it.e = e;
+	it.x = x;
+	it.y = y;
+	it.r0 = r0;
+	it.r1 = r1 ? r1 : w->N;
+	it.k0 = k0;
+	return it;
+}
+
+mv_item
+mv(const wt *w, int e, const float *x, float *y)
+{
+	return mv_rows(w, e, x, y, 0, 0, 0);
+}
+
+void
+mv_cpu(const mv_item *it, int n)
+{
+	mv_run_ex(it, n, 0);
+}
 
 void
 mv_run(const mv_item *it, int n)
@@ -420,6 +451,7 @@ mv_run_ex(const mv_item *it, int n, int allow_gpu)
 	/* each matvec runs where its tensor/expert lives */
 	for (i = 0; i < n; i++) {
 		if (allow_gpu && vk_ready() && it[i].w->gpu_n && it[i].w->gslot[it[i].e] >= 0 &&
+		    it[i].r0 == 0 && it[i].r1 == it[i].w->N && it[i].k0 == 0 &&
 		    vk_add(it[i].w, it[i].e, it[i].x, xq[i], it[i].y) == 0) {
 			ngpu++;
 			continue;
@@ -437,7 +469,7 @@ mv_run_ex(const mv_item *it, int n, int allow_gpu)
 		job.cum = cum;
 		cum[0] = 0;
 		for (i = 0; i < nc; i++) {
-			cum[i + 1] = cum[i] + (size_t)cpu[i].w->N;
+			cum[i + 1] = cum[i] + (size_t)(cpu[i].r1 - cpu[i].r0);
 			job.xq[i] = cxq[i];
 		}
 		job.total = cum[nc];
@@ -464,11 +496,7 @@ mv_run_ex(const mv_item *it, int n, int allow_gpu)
 static void
 mv1(const wt *w, int e, const float *x, float *y)
 {
-	mv_item it;
-	it.w = w;
-	it.e = e;
-	it.x = x;
-	it.y = y;
+	mv_item it = mv(w, e, x, y);
 	mv_run(&it, 1);
 }
 
@@ -553,49 +581,83 @@ scan_worker(void *arg, int ith, int nth)
 	}
 }
 
+/*
+ * Mamba2 mixer, with heads [0, hg) on the GPU (vk_mamba_submit) and
+ * heads [hg, n) here, concurrently; hg = 0 is CPU only.  The gated RMS
+ * norm is folded through ssm_out: each side computes ssm_out over its
+ * own columns of y*w, and out = (gpu + cpu) / rms(y).
+ * In: s->x.  Out: s->tmp (the mixer output).
+ */
 static void
 mamba2(const model *m, const layer *L, state *s, int il)
 {
 	const hparams *h = &m->hp;
-	const int CH = h->conv_ch, DI = h->d_inner;
+	const int CH = h->conv_ch, DI = h->d_inner, DS = h->d_state, NH = h->ssm_heads;
+	const int hg = vk_mamba_heads(il), gdi = hg * h->ssm_head_dim;
 	float *z = s->zxbcdt, *xbc_in = s->zxbcdt + DI, *dtr = xbc_in + CH;
 	float *cs = s->conv[il];
-	float dt[256];
+	float dt[256], ss_g = 0, ss_c = 0, r;
+	mv_item it[4];
 	scan_job sj;
-	int c, i;
+	int c, i, n = 0;
 
-	mv1(&L->ssm_in, 0, s->xn, s->zxbcdt);
+	if (hg)
+		vk_mamba_submit(m, il, s->x, s->og, &ss_g);
+	if (hg < NH) {
+		rmsnorm(s->xn, s->x, L->attn_norm, h->n_embd, h->eps);
+		/* our rows of ssm_in: z, x for our heads; all of B, C; our dt */
+		it[n++] = mv_rows(&L->ssm_in, 0, s->xn, s->zxbcdt, gdi, DI, 0);
+		it[n++] = mv_rows(&L->ssm_in, 0, s->xn, s->zxbcdt, DI + gdi, 2 * DI + 2 * DS, 0);
+		it[n++] = mv_rows(&L->ssm_in, 0, s->xn, s->zxbcdt, 2 * DI + 2 * DS + hg,
+		    2 * DI + 2 * DS + NH, 0);
+		mv_cpu(it, n);
 
-	/* causal depthwise conv over [cs0, cs1, cs2, new], then shift */
-	for (c = 0; c < CH; c++) {
-		const float *w = L->conv_w + 4 * c;
-		float v = cs[c] * w[0] + cs[CH + c] * w[1] + cs[2 * CH + c] * w[2] +
-		    xbc_in[c] * w[3] + L->conv_b[c];
-		cs[c] = cs[CH + c];
-		cs[CH + c] = cs[2 * CH + c];
-		cs[2 * CH + c] = xbc_in[c];
-		s->xbc[c] = v;
-	}
-	v_silu(s->xbc, (size_t)CH);
-	for (i = 0; i < h->ssm_heads; i++)
-		dt[i] = softplus(dtr[i] + L->dt_b[i]);
+		/* causal depthwise conv over [cs0, cs1, cs2, new], then shift;
+		 * channels [gdi, CH) = our x channels, then B and C */
+		for (c = gdi; c < CH; c++) {
+			const float *w = L->conv_w + 4 * c;
+			float v = cs[c] * w[0] + cs[CH + c] * w[1] + cs[2 * CH + c] * w[2] +
+			    xbc_in[c] * w[3] + L->conv_b[c];
+			cs[c] = cs[CH + c];
+			cs[CH + c] = cs[2 * CH + c];
+			cs[2 * CH + c] = xbc_in[c];
+			s->xbc[c] = v;
+		}
+		v_silu(s->xbc + gdi, (size_t)(CH - gdi));
+		for (i = hg; i < NH; i++)
+			dt[i] = softplus(dtr[i] + L->dt_b[i]);
 
-	sj.m = m;
-	sj.L = L;
-	sj.s = s;
-	sj.dt = dt;
-	sj.next = 0;
-	{
+		sj.m = m;
+		sj.L = L;
+		sj.s = s;
+		sj.dt = dt;
+		sj.next = hg;
+		{
+			double t0 = pnow();
+			pool_run(scan_worker, &sj);
+			prof_t[PROF_SCAN] += pnow() - t0;
+		}
+
+		/* gate with silu(z); y*w and sum y^2 over our channels */
+		v_mul_silu(s->y + gdi, z + gdi, (size_t)(DI - gdi));
+		ss_c = v_dot(s->y + gdi, s->y + gdi, (size_t)(DI - gdi));
+		for (i = gdi; i < DI; i++)
+			s->y[i] *= L->ssm_norm[i];
+		it[0] = mv_rows(&L->ssm_out, 0, s->y, s->tmp, 0, 0, gdi);
+		mv_cpu(it, 1);
+	} else
+		memset(s->tmp, 0, sizeof(float) * (size_t)h->n_embd);
+	if (hg) {
 		double t0 = pnow();
-		pool_run(scan_worker, &sj);
-		prof_t[PROF_SCAN] += pnow() - t0;
+		vk_wait();
+		prof_t[PROF_GPU_MIXER] += pnow() - t0;
+		vk_prof_collect();
+		for (i = 0; i < h->n_embd; i++)
+			s->tmp[i] += s->og[i];
 	}
-
-	/* gate with silu(z), grouped (n_group = 1) rms norm */
-	v_mul_silu(s->y, z, (size_t)DI);
-	rmsnorm(s->y, s->y, L->ssm_norm, DI, h->eps);
-
-	mv1(&L->ssm_out, 0, s->y, s->tmp);
+	r = 1.0f / sqrtf((ss_g + ss_c) / (float)DI + h->eps);
+	for (i = 0; i < h->n_embd; i++)
+		s->tmp[i] *= r;
 }
 
 /* ---------------------------------------------------------------- */
@@ -649,9 +711,9 @@ attention(const model *m, const layer *L, state *s, int il)
 	mv_item it[3];
 	att_job aj;
 
-	it[0].w = &L->q; it[0].e = 0; it[0].x = s->xn; it[0].y = s->q;
-	it[1].w = &L->k; it[1].e = 0; it[1].x = s->xn; it[1].y = s->kc[il] + (size_t)s->pos * kvd;
-	it[2].w = &L->v; it[2].e = 0; it[2].x = s->xn; it[2].y = s->vc[il] + (size_t)s->pos * kvd;
+	it[0] = mv(&L->q, 0, s->xn, s->q);
+	it[1] = mv(&L->k, 0, s->xn, s->kc[il] + (size_t)s->pos * kvd);
+	it[2] = mv(&L->v, 0, s->xn, s->vc[il] + (size_t)s->pos * kvd);
 	mv_run(it, 3);
 
 	aj.m = m;
@@ -671,7 +733,7 @@ attention(const model *m, const layer *L, state *s, int il)
 /* mixture of experts + shared expert                               */
 
 static void
-moe(const model *m, const layer *L, state *s, int xq_on_gpu)
+moe(const model *m, const layer *L, state *s)
 {
 	const hparams *h = &m->hp;
 	const int E = h->n_embd, K = h->n_expert_used, FF = h->n_ff;
@@ -714,21 +776,20 @@ moe(const model *m, const layer *L, state *s, int xq_on_gpu)
 			any |= gk[k] = vk_moe_add(&L->gate_e, &L->up_e, &L->down_e, sel[k],
 			    s->eo + k * E) == 0;
 		if (any) {
-			if (!xq_on_gpu)
-				q8k_quantize(s->xn, s->xq, (size_t)E);
-			vk_moe_submit(xq_on_gpu ? NULL : s->xq, E);
+			q8k_quantize(s->xn, s->xq, (size_t)E);
+			vk_moe_submit(s->xq, E);
 		}
 	}
 
 	n = 0;
 	if (!gsh) {
-		it[n].w = &L->gate_s; it[n].e = 0; it[n].x = s->xn; it[n].y = s->hs_g; n++;
-		it[n].w = &L->up_s; it[n].e = 0; it[n].x = s->xn; it[n].y = s->hs_u; n++;
+		it[n++] = mv(&L->gate_s, 0, s->xn, s->hs_g);
+		it[n++] = mv(&L->up_s, 0, s->xn, s->hs_u);
 	}
 	for (k = 0; k < K; k++)
 		if (!gk[k]) {
-			it[n].w = &L->gate_e; it[n].e = sel[k]; it[n].x = s->xn; it[n].y = s->he_g + k * FF; n++;
-			it[n].w = &L->up_e; it[n].e = sel[k]; it[n].x = s->xn; it[n].y = s->he_u + k * FF; n++;
+			it[n++] = mv(&L->gate_e, sel[k], s->xn, s->he_g + k * FF);
+			it[n++] = mv(&L->up_e, sel[k], s->xn, s->he_u + k * FF);
 		}
 	if (n) {
 		mv_run_ex(it, n, 0);
@@ -739,12 +800,11 @@ moe(const model *m, const layer *L, state *s, int xq_on_gpu)
 				v_swiglu(s->he_g + k * FF, s->he_u + k * FF, (size_t)FF);
 		n = 0;
 		if (!gsh) {
-			it[n].w = &L->down_s; it[n].e = 0; it[n].x = s->hs_g; it[n].y = s->so; n++;
+			it[n++] = mv(&L->down_s, 0, s->hs_g, s->so);
 		}
 		for (k = 0; k < K; k++)
 			if (!gk[k]) {
-				it[n].w = &L->down_e; it[n].e = sel[k]; it[n].x = s->he_g + k * FF;
-				it[n].y = s->eo + k * E; n++;
+				it[n++] = mv(&L->down_e, sel[k], s->he_g + k * FF, s->eo + k * E);
 			}
 		mv_run_ex(it, n, 0);
 	}
@@ -752,6 +812,7 @@ moe(const model *m, const layer *L, state *s, int xq_on_gpu)
 		double t0 = pnow();
 		vk_wait();
 		prof_t[PROF_GPU_WAIT] += pnow() - t0;
+		vk_prof_collect();
 	}
 
 	memcpy(s->tmp, s->so, sizeof(float) * (size_t)E);
@@ -779,28 +840,17 @@ model_forward(const model *m, state *s, int tok, int want_logits)
 	for (il = 0; il < h->n_layer; il++) {
 		const layer *L = &m->L[il];
 
-		if (!L->attn && vk_mamba_ok(il)) {
-			/* whole mixer + residual + ffn_norm on the GPU */
-			double t0 = pnow();
-			vk_mamba_layer(m, il, s->x, s->xn);
-			prof_t[PROF_GPU_MIXER] += pnow() - t0;
-			tr("ffn_inp", il, s->x, E);
-			moe(m, L, s, 1);
-			v_axpy(s->x, h->res_scale, s->tmp, (size_t)E);
-			tr("l_out", il, s->x, E);
-			continue;
-		}
-		rmsnorm(s->xn, s->x, L->attn_norm, E, h->eps);
-		if (L->attn)
+		if (L->attn) {
+			rmsnorm(s->xn, s->x, L->attn_norm, E, h->eps);
 			attention(m, L, s, il);
-		else
+		} else
 			mamba2(m, L, s, il);
 		tr(L->attn ? "attn_out" : "mamba_out", il, s->tmp, E);
 		v_axpy(s->x, h->res_scale, s->tmp, (size_t)E);
 		tr("ffn_inp", il, s->x, E);
 
 		rmsnorm(s->xn, s->x, L->ffn_norm, E, h->eps);
-		moe(m, L, s, 0);
+		moe(m, L, s);
 		v_axpy(s->x, h->res_scale, s->tmp, (size_t)E);
 		tr("l_out", il, s->x, E);
 	}
@@ -809,7 +859,14 @@ model_forward(const model *m, state *s, int tok, int want_logits)
 		return NULL;
 
 	rmsnorm(s->xn, s->x, m->out_norm, E, h->eps);
-	mv1(&m->tok_embd, 0, s->xn, s->logits);
+	if (vk_lm()) {
+		/* leading rows on the GPU, the rest here, concurrently */
+		mv_item it[2];
+		it[0] = mv(vk_lm(), 0, s->xn, s->logits);
+		it[1] = mv_rows(&m->tok_embd, 0, s->xn, s->logits, vk_lm()->N, 0, 0);
+		mv_run(it, 2);
+	} else
+		mv1(&m->tok_embd, 0, s->xn, s->logits);
 	for (i = 0; i < h->n_vocab; i++)
 		s->logits[i] /= h->logit_scale;
 	return s->logits;

@@ -29,7 +29,9 @@ float silu(float v) { return v / (1.0 + exp(-v)); }
 
 #if OP == 1
 /* p: 0 a, 1 b, 2 scale bits, 3 n, 4 x_out, 5 w (W words), 6 eps bits,
- *    7 f_out, 8 q_out (words), 9 mode (0 add, 1 swiglu) */
+ *    7 f_out, 8 q_out (words), 9 mode (0 add, 1 swiglu), 10 ss_out
+ *    (sum of squares before the weights), 11 flags (1: weights only,
+ *    no 1/rms) */
 #define MAXK 12
 shared float red[16];
 shared int sq[256];
@@ -80,8 +82,15 @@ void main()
 		v[k] = a;
 		ss += a * a;
 	}
+	if (pc.p[5] != NONE || pc.p[10] != NONE) {
+		float tot = wg_sum(ss);
+		if (pc.p[10] != NONE && t == 0u)
+			A[pc.p[10]] = tot;
+		ss = tot;
+	}
 	if (pc.p[5] != NONE) {
-		float r = inversesqrt(wg_sum(ss) / float(n) + uintBitsToFloat(pc.p[6]));
+		float r = (pc.p[11] & 1u) != 0u ? 1.0 :
+		    inversesqrt(ss / float(n) + uintBitsToFloat(pc.p[6]));
 		for (uint k = 0u; k < nk; k++) {
 			uint i = 256u * k + t;
 			v[k] = i < n ? v[k] * r * wf(pc.p[5] + i) : 0.0;

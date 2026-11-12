@@ -52,6 +52,7 @@ usage(void)
 	    "  -c N           context size (default 4096)\n"
 	    "  -g MIB         GPU weight split in MiB (default 512, 0 = CPU only)\n"
 	    "  -d N           Vulkan device index\n"
+	    "  --split F      GPU share of Mamba2 heads and output rows (0.6)\n"
 	    "  --temp F       temperature (default 0 = greedy)\n"
 	    "  --top-k N      (default 40)  --top-p F (default 0.95)  --seed N\n"
 	    "  --ref          reference float kernels on the CPU\n"
@@ -107,6 +108,7 @@ parse(int argc, char **argv)
 		else if (!strcmp(a, "-c")) O.ctx = atoi(ARG());
 		else if (!strcmp(a, "-g")) O.gpu_mib = atoi(ARG());
 		else if (!strcmp(a, "-d")) O.device = atoi(ARG());
+		else if (!strcmp(a, "--split")) g_split = atof(ARG());
 		else if (!strcmp(a, "--temp")) O.temp = (float)atof(ARG());
 		else if (!strcmp(a, "--top-k")) O.top_k = atoi(ARG());
 		else if (!strcmp(a, "--top-p")) O.top_p = (float)atof(ARG());
@@ -371,10 +373,7 @@ check(void)
 			nr += (double)yr[r] * yr[r];
 			e_s += (double)(yk[r] - yr[r]) * (yk[r] - yr[r]);
 		}
-		it.w = w;
-		it.e = e;
-		it.x = x;
-		it.y = yk;
+		it = mv(w, e, x, yk);
 		t0 = now();
 		mv_run(&it, 1);
 		tc = now() - t0;

@@ -25,6 +25,9 @@
 #endif
 
 layout(local_size_x = 256) in;
+#ifndef RPS
+#define RPS 4u
+#endif
 
 /* the input vector, staged once per workgroup (K <= 4096) */
 #define XMAX (16u * 73u)
@@ -110,22 +113,24 @@ float unit(uint bw, uint l, uint xb)
 #define BW 44u
 #define QS 12u
 #endif
-void k4(uint bw, uint j, out int sc, out int mn)
+/* the 6-bit scales/mins as whole words (four per word); the word forms
+ * are the ones proved equal to the byte-wise unpacking (see kq.c) */
+void k4(uint bw, uint c, out int s0, out int m0, out int s1, out int m1)
 {
-	if (j < 4u) {
-		sc = int(bb(bw, 4u + j) & 63u);
-		mn = int(bb(bw, 8u + j) & 63u);
-	} else {
-		sc = int((bb(bw, 8u + j) & 15u) | ((bb(bw, j) >> 6) << 4));
-		mn = int((bb(bw, 8u + j) >> 4) | ((bb(bw, 4u + j) >> 6) << 4));
-	}
+	uint a0 = W[bw + 1u], a1 = W[bw + 2u], a2 = W[bw + 3u];
+	uint sc = c < 2u ? a0 & 0x3f3f3f3fu : (a2 & 0x0f0f0f0fu) | (((a0 >> 6) & 0x03030303u) << 4);
+	uint mn = c < 2u ? a1 & 0x3f3f3f3fu : ((a2 >> 4) & 0x0f0f0f0fu) | (((a1 >> 6) & 0x03030303u) << 4);
+	uint sh = 16u * (c & 1u);
+	s0 = int((sc >> sh) & 255u);
+	s1 = int((sc >> (sh + 8u)) & 255u);
+	m0 = int((mn >> sh) & 255u);
+	m1 = int((mn >> (sh + 8u)) & 255u);
 }
 float unit(uint bw, uint l, uint xb)
 {
 	uint c = l >> 2, l0 = (8u * l) & 31u;
 	int s0, m0, s1, m1, a0 = 0, a1 = 0, x0 = 0, x1 = 0;
-	k4(bw, 2u * c, s0, m0);
-	k4(bw, 2u * c + 1u, s1, m1);
+	k4(bw, c, s0, m0, s1, m1);
 	for (uint k = 0u; k < 2u; k++) {
 		uint q = W[bw + QS + 2u * l + k];
 		uint lo = q & 0x0f0f0f0fu, hi = (q >> 4) & 0x0f0f0f0fu;
@@ -185,18 +190,22 @@ void main()
 		xs[i] = X[pc.x_off + i];
 	barrier();
 
-	uint row = gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID;
-	if (row >= pc.N)
-		return;
+	/* RPS consecutive rows per subgroup: the staged x serves more rows */
 	uint lane = gl_SubgroupInvocationID;
 	uint nu = (pc.K >> 8) * 16u;
-	uint base = pc.w_off + row * pc.row_words;
-	float sum = 0.0;
-	for (uint i = lane; i < nu; i += gl_SubgroupSize) {
-		uint b = i >> 4, xb = 73u * b;
-		sum += uintBitsToFloat(xs[xb]) * unit(base + b * BW, i & 15u, xb);
+	uint row0 = (gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID) * RPS;
+	for (uint rr = 0u; rr < RPS; rr++) {
+		uint row = row0 + rr;
+		if (row >= pc.N)
+			return;
+		uint base = pc.w_off + row * pc.row_words;
+		float sum = 0.0;
+		for (uint i = lane; i < nu; i += gl_SubgroupSize) {
+			uint b = i >> 4, xb = 73u * b;
+			sum += uintBitsToFloat(xs[xb]) * unit(base + b * BW, i & 15u, xb);
+		}
+		sum = subgroupAdd(sum);
+		if (lane == 0u)
+			Y[pc.y_off + row] = sum;
 	}
-	sum = subgroupAdd(sum);
-	if (lane == 0u)
-		Y[pc.y_off + row] = sum;
 }

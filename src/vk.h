@@ -35,16 +35,20 @@ int vk_add(const wt *w, int e, const float *xkey, const q8k *xq, float *y);
 void vk_submit(void);
 void vk_wait(void);
 
-/* fused Mamba2 layer: x in/out (after the mixer residual add), xn =
- * ffn_norm(x); synchronous.  Only for layers with vk_mamba_ok. */
+/* split Mamba2 mixer: the GPU's heads (0 if none); vk_mamba_submit
+ * starts the GPU half, vk_wait delivers its partial ssm_out and its
+ * sum of squares */
 int vk_mamba_ok(int il);
-void vk_mamba_layer(const model *m, int il, float *x, float *xn);
-void vk_state_reset(void);
+int vk_mamba_heads(int il);
+void vk_mamba_submit(const model *m, int il, const float *x, float *out, float *ss);
+void vk_prof_collect(void);
 void vk_prof_report(void);
+void vk_state_reset(void);
+/* GPU rows [0, N) of the output projection, or NULL */
+const wt *vk_lm(void);
 
 /* MoE experts resident on the GPU (gate/up -> SwiGLU -> down each),
- * run asynchronously while the CPU does the rest; vk_wait collects.
- * xq NULL: use the q8k input the fused mixer left on the GPU. */
+ * run asynchronously while the CPU does the rest; vk_wait collects. */
 void vk_moe_begin(void);
 int vk_moe_add(const wt *gate, const wt *up, const wt *down, int e, float *out);
 void vk_moe_submit(const q8k *xq, int K);
