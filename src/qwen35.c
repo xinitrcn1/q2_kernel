@@ -460,8 +460,9 @@ qwen35_forward(const model *m, state *s, int tok, int want_logits)
 /* batched prompts (CPU): chunks of up to QB tokens per layer        */
 
 #include "kq.h"
+#include <time.h>
 
-#define QB 64
+#define QB 128
 
 static struct {
 	int ok;
@@ -756,10 +757,20 @@ qwen35_prefill(const model *m, state *s, const int *tok, int n)
 	}
 	/* all but the last token in chunks; the last one through the
 	 * single-token path, which also produces the logits */
-	while (done < n - 1) {
-		int T = n - 1 - done > QB ? QB : n - 1 - done;
-		pchunk(m, s, tok + done, T);
-		done += T;
+	{
+		extern double pf_t[8], vk_t_stage;
+		struct timespec a, b;
+		clock_gettime(CLOCK_MONOTONIC, &a);
+		while (done < n - 1) {
+			int T = n - 1 - done > QB ? QB : n - 1 - done;
+			pchunk(m, s, tok + done, T);
+			done += T;
+		}
+		clock_gettime(CLOCK_MONOTONIC, &b);
+		if (getenv("Q2K_PREFILL_PROF"))
+			fprintf(stderr, "prefill %d tok %.2f s: cpu matmul %.2f s, gpu wait after %.2f s, "
+			    "staging %.2f s\n", n - 1, (b.tv_sec - a.tv_sec) + (b.tv_nsec - a.tv_nsec) * 1e-9,
+			    pf_t[0], pf_t[7], vk_t_stage);
 	}
 	return qwen35_forward(m, s, tok[n - 1], 1);
 }

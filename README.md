@@ -107,14 +107,19 @@ with shifts and table shuffles (and have GPU kernels):
 
 (Every converted tensor dequantizes identically; the 27B file grows
 from 9.5 to 13.1 GB.)  Every matrix keeps the same leading fraction of
-its rows on the GPU.  On this host (CPU-bound, 6 threads):
+its rows on the GPU.  Prompts also stream the rest of each matrix's
+leading rows (`--stream 0.6`, default with a GPU) through a 64 MiB VRAM
+window, repacked by all threads into host staging and copied over PCIe
+per 128-token chunk; the CPU computes the remaining 40%.  On this host
+(CPU-bound, 6 threads):
 
 | Qwen3.8-27B | decode | prompt |
 |---|---|---|
 | llama.cpp CPU | 1.04 | |
 | original GGUF, CPU | 1.55 | 5.7 |
 | transcoded, CPU | 1.9-2.0 | 5.9 |
-| transcoded, `-g 1600 --vram 1800` | 2.2 | 6.4 |
+| transcoded, `-g 1600 --vram 1800 --stream 0` | 2.2 | 6.3 |
+| transcoded, `-g 1600 --vram 1800` (streaming) | 2.2 | 10.2 |
 
 ## Checking
 

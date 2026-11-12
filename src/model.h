@@ -156,5 +156,6 @@ extern double prof_t[PROF_N];
 /* compute settings */
 extern int g_ref;           /* reference float kernels on CPU */
 extern double g_split;      /* GPU share of split work (mixer heads, output rows) */
+extern double g_stream;     /* prompts: GPU share of each matrix's rows (streamed) */
 
 #endif

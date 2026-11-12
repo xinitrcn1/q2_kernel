@@ -34,6 +34,11 @@ void vk_plan_and_upload(model *m, int verbose);
 void vk_mm_begin(void);
 int vk_mm_add(const wt *w, const q8k *xq, int xs, int T, float *y, int ldy);
 void vk_mm_submit(void);
+/* prompts: rows [r0, r1) of a matrix copied to the GPU for this batch
+ * (vk_stream_bytes of VRAM set aside before vk_init) */
+extern size_t vk_stream_bytes;
+int vk_can_stream(uint32_t type);
+int vk_mm_add_stream(const wt *w, int r0, int r1, const q8k *xq, int xs, int T, float *y, int ldy);
 /* dense models (qwen35): the same leading fraction of every matrix's rows */
 void vk_plan_rows(model *m, int verbose);
 

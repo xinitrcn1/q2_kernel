@@ -98,6 +98,8 @@ mm_worker(void *arg, int ith, int nth)
 	}
 }
 
+double g_stream = -1; /* < 0: default per architecture */
+
 void
 mm_run(const mm_item *in, int n)
 {
@@ -108,17 +110,29 @@ mm_run(const mm_item *in, int n)
 
 	if (n == 0)
 		return;
-	/* matrices with a GPU row slice: those rows there, the rest here */
+	/* the GPU takes the leading rows: its resident slice, then (prompts
+	 * with --stream) rows copied over for this batch; the rest here */
 	memcpy(it, in, sizeof(*in) * (size_t)n);
 	if (vk_ready()) {
 		vk_mm_begin();
-		for (i = 0; i < n; i++)
-			if (it[i].w->gsplit && it[i].e == 0 && it[i].r0 == 0 && it[i].r1 == it[i].w->N &&
-			    vk_mm_add((const wt *)it[i].w->gsplit, (const q8k *)it[i].xq, it[i].xs, it[i].T,
-			    it[i].y, it[i].ldy) == 0) {
-				it[i].r0 = ((const wt *)it[i].w->gsplit)->N;
+		for (i = 0; i < n; i++) {
+			const wt *w = it[i].w;
+			int whole = it[i].e == 0 && it[i].r0 == 0 && it[i].r1 == w->N;
+			if (whole && w->gsplit && vk_mm_add((const wt *)w->gsplit, (const q8k *)it[i].xq,
+			    it[i].xs, it[i].T, it[i].y, it[i].ldy) == 0) {
+				it[i].r0 = ((const wt *)w->gsplit)->N;
 				ngpu++;
 			}
+			if (whole && g_stream > 0 && it[i].T > 1 && vk_can_stream(w->type)) {
+				int to = (int)(g_stream * w->N);
+				to -= to % 32;
+				if (to > it[i].r0 && vk_mm_add_stream(w, it[i].r0, to, (const q8k *)it[i].xq,
+				    it[i].xs, it[i].T, it[i].y + it[i].r0, it[i].ldy) == 0) {
+					it[i].r0 = to;
+					ngpu++;
+				}
+			}
+		}
 		if (ngpu)
 			vk_mm_submit();
 	}
@@ -142,8 +156,11 @@ mm_run(const mm_item *in, int n)
 		pf_t[0] += now() - t0;
 		pf_rows += (long)work;
 	}
-	if (ngpu)
+	if (ngpu) {
+		double t0 = now();
 		vk_wait();
+		pf_t[7] += now() - t0;
+	}
 }
 
 mm_item

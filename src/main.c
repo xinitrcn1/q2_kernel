@@ -55,6 +55,9 @@ usage(void)
 	    "  -d N           Vulkan device index\n"
 	    "  --split F      GPU share of Mamba2 heads and output rows (0.5)\n"
 	    "  --vram MIB     cap on all of our GPU memory (default 1280)\n"
+	    "  --stream F     prompts: GPU share of each matrix's rows, streaming\n"
+	    "                 what is not resident over PCIe (qwen35; 0.6, 0 = off)\n"
+	    "  --stream-mib M VRAM for streamed weights (default 64)\n"
 	    "  --temp F       temperature (default 0 = greedy)\n"
 	    "  --top-k N      (default 40)  --top-p F (default 0.95)  --seed N\n"
 	    "  --ref          reference float kernels on the CPU\n"
@@ -118,6 +121,8 @@ parse(int argc, char **argv)
 		else if (!strcmp(a, "-d")) O.device = atoi(ARG());
 		else if (!strcmp(a, "--split")) g_split = atof(ARG());
 		else if (!strcmp(a, "--vram")) vk_vram_limit = (size_t)atoi(ARG()) << 20;
+		else if (!strcmp(a, "--stream")) g_stream = atof(ARG());
+		else if (!strcmp(a, "--stream-mib")) vk_stream_bytes = (size_t)atoi(ARG()) << 20;
 		else if (!strcmp(a, "--temp")) O.temp = (float)atof(ARG());
 		else if (!strcmp(a, "--top-k")) O.top_k = atoi(ARG());
 		else if (!strcmp(a, "--top-p")) O.top_p = (float)atof(ARG());
@@ -645,6 +650,10 @@ main(int argc, char **argv)
 	}
 	kq_init();
 	pool_init(O.threads);
+	if (g_stream < 0)
+		g_stream = M.arch == ARCH_QWEN35 && O.gpu_mib > 0 ? 0.6 : 0;
+	if (g_stream > 0 && !vk_stream_bytes)
+		vk_stream_bytes = (size_t)64 << 20;
 	if (O.gpu_mib > 0 && !O.tokens && M.arch == ARCH_QWEN35) {
 		if (vk_init((size_t)O.gpu_mib << 20, 0, O.device, O.verbose) == 0)
 			vk_plan_rows(&M, O.verbose);

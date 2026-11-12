@@ -8,9 +8,10 @@
 #include <vulkan/vulkan.h>
 
 #include "gguf.h"
+#include "pool.h"
 #include "shaders.h"
 
-#define ACAP (3u << 20)          /* activation words per sequence */
+#define ACAP (6u << 20)          /* activation words per sequence */
 #define NSLOT 2                  /* command sequences in flight */
 #define ABUF (NSLOT * ACAP)
 #define Q8W ((uint32_t)(sizeof(q8k) / 4))
@@ -36,7 +37,7 @@ vnow(void)
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	return (double)ts.tv_sec + ts.tv_nsec * 1e-9;
 }
-double vk_t_wait, vk_t_sub;
+double vk_t_wait, vk_t_sub, vk_t_stage;
 long vk_n_sub;
 
 typedef struct {
@@ -44,6 +45,7 @@ typedef struct {
 } pushc;
 
 size_t vk_vram_limit = (size_t)1280 << 20;
+size_t vk_stream_bytes;         /* prompt weight streaming area (vk_mm_add_stream) */
 
 static struct {
 	int ok;
@@ -55,8 +57,10 @@ static struct {
 	char name[256];
 	VkPhysicalDeviceMemoryProperties mp;
 
-	VkBuffer wbuf, abuf, hbuf, ubuf, sbuf;
-	VkDeviceMemory wmem, amem, hmem, umem, smem;
+	VkBuffer wbuf, abuf, hbuf, ubuf, sbuf, stbuf;
+	VkDeviceMemory wmem, amem, hmem, umem, smem, stmem;
+	size_t scap_w;                /* streaming area at the end of the arena */
+	uint8_t *stmap;               /* its host staging buffer */
 	size_t scap, sused;           /* state buffer, floats */
 	size_t wcap, wused;
 	float *hmap;
@@ -363,7 +367,8 @@ vk_init(size_t budget, size_t state_bytes, int devidx, int verbose)
 	 * at most VK_VRAM_LIMIT, and the driver's budget for the heap when
 	 * VK_EXT_memory_budget reports it */
 	{
-		size_t limit = vk_vram_limit, other = (size_t)ABUF * 4 + state_bytes + ((size_t)32 << 20);
+		size_t limit = vk_vram_limit, other = (size_t)ABUF * 4 + state_bytes + vk_stream_bytes +
+		    ((size_t)32 << 20);
 		if (has_budget) {
 			VkPhysicalDeviceMemoryBudgetPropertiesEXT mb;
 			VkPhysicalDeviceMemoryProperties2 mp2;
@@ -392,9 +397,17 @@ vk_init(size_t budget, size_t state_bytes, int devidx, int verbose)
 		if (V.wcap < 4096)
 			V.wcap = 4096;
 	}
-	if (mkbuf(V.wcap, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+	/* the weight arena; streamed weights go to [wcap, wcap + stream) */
+	V.scap_w = vk_stream_bytes;
+	if (mkbuf(V.wcap + V.scap_w, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
 	    0, &V.wbuf, &V.wmem, NULL))
 		return -1;
+	if (V.scap_w) {
+		void *sp;
+		if (mkbuf(V.scap_w, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, 1, &V.stbuf, &V.stmem, &sp))
+			return -1;
+		V.stmap = sp;
+	}
 	if (mkbuf((VkDeviceSize)ABUF * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
 	    VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
 	    0, &V.abuf, &V.amem, NULL))
@@ -536,6 +549,8 @@ vk_shutdown(void)
 	if (V.hbuf) vkDestroyBuffer(V.dev, V.hbuf, NULL);
 	if (V.ubuf) vkDestroyBuffer(V.dev, V.ubuf, NULL);
 	if (V.sbuf) vkDestroyBuffer(V.dev, V.sbuf, NULL);
+	if (V.stbuf) vkDestroyBuffer(V.dev, V.stbuf, NULL);
+	if (V.stmem) vkFreeMemory(V.dev, V.stmem, NULL);
 	if (V.smem) vkFreeMemory(V.dev, V.smem, NULL);
 	free(V.lay);
 	if (V.wmem) vkFreeMemory(V.dev, V.wmem, NULL);
@@ -1268,13 +1283,46 @@ static struct {
 	const q8k *xq;
 	int xs, T, ldy;
 	float *y;
+	int r0, r1;             /* streamed rows of w (r1 > 0), else w is resident */
+	size_t soff;            /* their place in the streaming area */
 } MM[MOE_MAX];
 static int nmm;
+static size_t sused;
 
 void
 vk_mm_begin(void)
 {
 	nmm = 0;
+	sused = 0;
+}
+
+int
+vk_can_stream(uint32_t type)
+{
+	return V.ok && V.scap_w && V.pipe[type] && V.pipe[PIPE_MM + type] && type != GT_Q8_0;
+}
+
+/* rows [r0, r1) of w (expert 0), copied to the GPU for this batch only,
+ * over T tokens into y[t*ldy + (r - r0)] */
+int
+vk_mm_add_stream(const wt *w, int r0, int r1, const q8k *xq, int xs, int T, float *y, int ldy)
+{
+	size_t grb = w->row_bytes / ggml_type_bytes(w->type) * gpu_block_bytes(w->type);
+	size_t need = (size_t)(r1 - r0) * grb;
+	if (!vk_can_stream(w->type) || nmm >= MOE_MAX || r1 <= r0 || sused + need > V.scap_w)
+		return -1;
+	MM[nmm].w = w;
+	MM[nmm].xq = xq;
+	MM[nmm].xs = xs;
+	MM[nmm].T = T;
+	MM[nmm].y = y;
+	MM[nmm].ldy = ldy;
+	MM[nmm].r0 = r0;
+	MM[nmm].r1 = r1;
+	MM[nmm].soff = sused;
+	sused += (need + 255) & ~(size_t)255;
+	nmm++;
+	return 0;
 }
 
 /* rows [0, w->N) of w over T token vectors (xs q8k blocks each) into
@@ -1290,8 +1338,43 @@ vk_mm_add(const wt *w, const q8k *xq, int xs, int T, float *y, int ldy)
 	MM[nmm].T = T;
 	MM[nmm].y = y;
 	MM[nmm].ldy = ldy;
+	MM[nmm].r1 = 0;
 	nmm++;
 	return 0;
+}
+
+typedef struct {
+	int n, mi[MOE_MAX];
+	long cum[MOE_MAX + 1], next;
+} stage_job;
+
+static void
+stage_worker(void *arg, int ith, int nth)
+{
+	stage_job *j = arg;
+	long a, total = j->cum[j->n];
+	int k = 0;
+	(void)ith;
+	(void)nth;
+	while ((a = pool_take(&j->next, 64, total)) >= 0) {
+		long b = a + 64 < total ? a + 64 : total, r;
+		for (r = a; r < b; r++) {
+			const wt *w;
+			size_t sb, grb, rr;
+			int i;
+			while (r >= j->cum[k + 1])
+				k++;
+			while (r < j->cum[k])
+				k--;
+			i = j->mi[k];
+			w = MM[i].w;
+			sb = ggml_type_bytes(w->type);
+			grb = w->row_bytes / sb * gpu_block_bytes(w->type);
+			rr = (size_t)MM[i].r0 + (size_t)(r - j->cum[k]);
+			repack(w->type, w->data + rr * w->row_bytes,
+			    V.stmap + MM[i].soff + (rr - (size_t)MM[i].r0) * grb, w->row_bytes / sb);
+		}
+	}
 }
 
 void
@@ -1310,10 +1393,61 @@ vk_mm_submit(void)
 		xo[i] = k < i ? xo[k] : seq_put(MM[i].xq, (uint32_t)(MM[i].T * MM[i].xs) * Q8W);
 	}
 	seq_flush_up();
+	/* streamed rows: repack into the staging buffer (all threads), copy
+	 * them into the arena */
+	{
+		extern double vk_t_stage;
+		double t0s = vnow();
+		VkBufferCopy rg[MOE_MAX];
+		stage_job sj;
+		int nc = 0;
+		sj.n = 0;
+		for (i = 0; i < nmm; i++) {
+			const wt *w = MM[i].w;
+			size_t sb = ggml_type_bytes(w->type), grb;
+			if (!MM[i].r1)
+				continue;
+			grb = w->row_bytes / sb * gpu_block_bytes(w->type);
+			sj.mi[sj.n] = i;
+			sj.cum[sj.n + 1] = (sj.n ? sj.cum[sj.n] : 0) + (long)(MM[i].r1 - MM[i].r0);
+			sj.cum[0] = 0;
+			sj.n++;
+			rg[nc].srcOffset = MM[i].soff;
+			rg[nc].dstOffset = V.wcap + MM[i].soff;
+			rg[nc].size = (size_t)(MM[i].r1 - MM[i].r0) * grb;
+			nc++;
+		}
+		if (sj.n) {
+			sj.next = 0;
+			pool_run(stage_worker, &sj);
+		}
+		vk_t_stage += vnow() - t0s;
+		if (nc) {
+			vkCmdCopyBuffer(V.cb, V.stbuf, V.wbuf, (uint32_t)nc, rg);
+			barrier(VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+			    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+		}
+	}
 	for (i = 0; i < nmm; i++) {
-		const uint32_t N = (uint32_t)MM[i].w->N, T = (uint32_t)MM[i].T;
-		uint32_t y = seq_alloc(T * N);
-		seq_matmul(MM[i].w, 0, 0, N, (uint32_t)MM[i].w->K, xo[i], (uint32_t)MM[i].xs * Q8W, T, y, N);
+		static int slot0 = 0;
+		const uint32_t T = (uint32_t)MM[i].T;
+		wt tmp;
+		const wt *w = MM[i].w;
+		uint32_t N, y;
+		if (MM[i].r1) {
+			/* a temporary view of the streamed rows */
+			tmp = *w;
+			tmp.N = MM[i].r1 - MM[i].r0;
+			tmp.E = 1;
+			tmp.gpu_off = V.wcap + MM[i].soff;
+			tmp.gpu_row_bytes = w->row_bytes / ggml_type_bytes(w->type) * gpu_block_bytes(w->type);
+			tmp.gslot = &slot0;
+			tmp.gpu_n = 1;
+			w = &tmp;
+		}
+		N = (uint32_t)w->N;
+		y = seq_alloc(T * N);
+		seq_matmul(w, 0, 0, N, (uint32_t)w->K, xo[i], (uint32_t)MM[i].xs * Q8W, T, y, N);
 		seq_get_strided(y, T, N, MM[i].y, (uint32_t)MM[i].ldy);
 	}
 	seq_submit();
