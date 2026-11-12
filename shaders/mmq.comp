@@ -206,8 +206,14 @@ void dec(uint bw, uint l, out grp g)
  */
 #define TR 32u
 #define TK 32u
-shared uint su[TR * 64u];
-shared int ssa[TR * 16u], ssb[TR * 16u];
+/* su rows padded to 72 words, ssa/ssb rows to 17: the inner loop's
+ * reads of rows mr and mr + 2 fall on distinct banks (ucas memk under
+ * gt1030: degree 2 -> 1; the decode's writes 4 -> 2).  Padding keeps
+ * the reads' constant offsets foldable (an XOR swizzle measured slower) */
+#define SUW 72u
+#define SS 17u
+shared uint su[TR * SUW];
+shared int ssa[TR * SS], ssb[TR * SS];
 shared float sD[TR], sM[TR];
 shared uint sx[TK * 73u];
 
@@ -227,9 +233,9 @@ void main()
 				grp g;
 				dec(pc.w_off + row * pc.row_words + b * BW, u, g);
 				[[unroll]] for (uint j = 0u; j < 4u; j++) {
-					su[rl * 64u + (g.o[j] >> 2)] = g.q[j];
-					ssa[rl * 16u + (g.o[j] >> 4)] = g.sa[j];
-					ssb[rl * 16u + (g.o[j] >> 4)] = g.sb[j];
+					su[rl * SUW + (g.o[j] >> 2)] = g.q[j];
+					ssa[rl * SS + (g.o[j] >> 4)] = g.sa[j];
+					ssb[rl * SS + (g.o[j] >> 4)] = g.sb[j];
 				}
 				if (u == 0u) {
 					sD[rl] = g.D;
@@ -239,9 +245,9 @@ void main()
 				sD[rl] = 0.0;
 				sM[rl] = 0.0;
 				for (uint i = 0u; i < 64u; i++)
-					su[rl * 64u + i] = 0u;
+					su[rl * SUW + i] = 0u;
 				for (uint i = 0u; i < 16u; i++)
-					ssa[rl * 16u + i] = ssb[rl * 16u + i] = 0;
+					ssa[rl * SS + i] = ssb[rl * SS + i] = 0;
 			}
 		}
 		/* the tokens' q8k blocks (zero past the end) */
@@ -253,14 +259,14 @@ void main()
 
 		int ia[4] = int[4](0, 0, 0, 0), ib[4] = int[4](0, 0, 0, 0);
 		for (uint gq = 0u; gq < 16u; gq++) {
-			int sa0 = ssa[mr * 16u + gq], sa1 = ssa[(mr + 1u) * 16u + gq];
-			int sb0 = ssb[mr * 16u + gq], sb1 = ssb[(mr + 1u) * 16u + gq];
+			int sa0 = ssa[mr * SS + gq], sa1 = ssa[(mr + 1u) * SS + gq];
+			int sb0 = ssb[mr * SS + gq], sb1 = ssb[(mr + 1u) * SS + gq];
 			uint bs0 = sx[mt * 73u + 65u + (gq >> 1)], bs1 = sx[(mt + 1u) * 73u + 65u + (gq >> 1)];
 			int x0s = int(bs0 << (16u - 16u * (gq & 1u))) >> 16;
 			int x1s = int(bs1 << (16u - 16u * (gq & 1u))) >> 16;
 			int d00 = 0, d01 = 0, d10 = 0, d11 = 0;
 			[[unroll]] for (uint w = 0u; w < 4u; w++) {
-				uint u0 = su[mr * 64u + 4u * gq + w], u1 = su[(mr + 1u) * 64u + 4u * gq + w];
+				uint u0 = su[mr * SUW + 4u * gq + w], u1 = su[(mr + 1u) * SUW + 4u * gq + w];
 				uint x0 = sx[mt * 73u + 1u + 4u * gq + w], x1 = sx[(mt + 1u) * 73u + 1u + 4u * gq + w];
 				d00 += idot(u0, x0);
 				d01 += idot(u0, x1);
