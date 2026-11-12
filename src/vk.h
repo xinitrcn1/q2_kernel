@@ -46,6 +46,8 @@ void vk_mamba_submit(const model *m, int il, const q8k *xq, float *out, float *s
 void vk_prof_collect(void);
 void vk_prof_report(void);
 void vk_state_reset(void);
+/* GPU heads' state of layer il to (to_gpu=1) or from (0) the CPU arrays */
+void vk_state_sync(const model *m, state *s, int il, int to_gpu);
 /* GPU rows [0, N) of the output projection, or NULL */
 const wt *vk_lm(void);
 

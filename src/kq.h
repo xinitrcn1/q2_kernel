@@ -23,6 +23,11 @@ void q8k_quantize(const float *x, q8k *y, size_t n);
 /* dot of one weight row of type t (n elements) with quantized x */
 float kq_dot(uint32_t t, const void *row, const q8k *x, size_t n);
 
+/* one row against T token vectors (x + t*xs, T <= 64): out[t*ostride];
+ * returns 0 if t has no multi-token kernel */
+int kq_dotT(uint32_t t, const void *row, const q8k *x, size_t xs, int T, size_t n,
+    float *out, size_t ostride);
+
 /* scalar integer path, always built (for self-tests) */
 float kq_dot_scalar(uint32_t t, const void *row, const q8k *x, size_t n);
 

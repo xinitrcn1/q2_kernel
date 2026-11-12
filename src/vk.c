@@ -1178,6 +1178,70 @@ vk_state_reset(void)
 	}
 }
 
+/* move the GPU heads' conv/SSM state of layer il between the GPU and
+ * the CPU state arrays (to_gpu = 0: fetch, 1: store) */
+void
+vk_state_sync(const model *m, state *st, int il, int to_gpu)
+{
+	const hparams *h = &m->hp;
+	const struct lay *ly;
+	size_t CH, DI, gdi, gch, nconv, nssm, k, c;
+	float *cs, *ss, *hp;
+	VkCommandBufferBeginInfo bi;
+	VkBufferCopy rg[2];
+
+	if (!vk_mamba_ok(il))
+		return;
+	ly = &V.lay[il];
+	CH = (size_t)h->conv_ch;
+	DI = (size_t)h->d_inner;
+	gdi = (size_t)ly->hg * (size_t)h->ssm_head_dim;
+	gch = gdi + 2 * (size_t)h->d_state;
+	nconv = 3 * gch;
+	nssm = gdi * (size_t)h->d_state;
+	if ((nconv + nssm) > ABUF)
+		return;
+	cs = st->conv[il];
+	ss = st->ssm[il];
+	hp = V.hmap;
+	vk_wait();
+	if (to_gpu) {
+		for (k = 0; k < 3; k++)
+			for (c = 0; c < gch; c++)
+				hp[k * gch + c] = cs[k * CH + (c < gdi ? c : DI + (c - gdi))];
+		memcpy(hp + nconv, ss, nssm * sizeof(float));
+	}
+	memset(&bi, 0, sizeof(bi));
+	bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+	bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+	vkBeginCommandBuffer(V.cb, &bi);
+	rg[0].size = nconv * 4;
+	rg[1].size = nssm * 4;
+	if (to_gpu) {
+		rg[0].srcOffset = 0;
+		rg[0].dstOffset = (VkDeviceSize)ly->sconv * 4;
+		rg[1].srcOffset = nconv * 4;
+		rg[1].dstOffset = (VkDeviceSize)ly->sssm * 4;
+		vkCmdCopyBuffer(V.cb, V.hbuf, V.sbuf, 2, rg);
+	} else {
+		rg[0].srcOffset = (VkDeviceSize)ly->sconv * 4;
+		rg[0].dstOffset = 0;
+		rg[1].srcOffset = (VkDeviceSize)ly->sssm * 4;
+		rg[1].dstOffset = nconv * 4;
+		vkCmdCopyBuffer(V.cb, V.sbuf, V.hbuf, 2, rg);
+		barrier(VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT,
+		    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT);
+	}
+	vkEndCommandBuffer(V.cb);
+	submit_wait();
+	if (!to_gpu) {
+		for (k = 0; k < 3; k++)
+			for (c = 0; c < gch; c++)
+				cs[k * CH + (c < gdi ? c : DI + (c - gdi))] = hp[k * gch + c];
+		memcpy(ss, hp + nconv, nssm * sizeof(float));
+	}
+}
+
 int
 vk_mamba_heads(int il)
 {

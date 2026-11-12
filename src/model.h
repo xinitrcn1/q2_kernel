@@ -82,6 +82,9 @@ void state_free(state *s, const model *m);
 /* device memory the fused Mamba2 path needs for recurrent state */
 size_t model_gpu_state_bytes(const model *m);
 
+/* consume n prompt tokens (batched on the CPU); last token's logits */
+const float *model_prefill(const model *m, state *s, const int *tok, int n);
+
 /* consume one token at s->pos; returns logits if want_logits */
 const float *model_forward(const model *m, state *s, int tok, int want_logits);
 

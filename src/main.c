@@ -20,7 +20,7 @@
 typedef struct {
 	const char *model, *prompt, *system, *dump;
 	int n_predict, threads, ctx, gpu_mib, device, chat, raw, info, tokens;
-	int bench, check, kbench, top_k, verbose, show_special, logits;
+	int bench, check, kbench, top_k, verbose, show_special, logits, noprefill;
 	float temp, top_p;
 	unsigned long seed;
 } opts;
@@ -65,6 +65,7 @@ usage(void)
 	    "  --bench        time prompt processing and generation\n"
 	    "  --check        compare CPU/GPU kernels against the reference\n"
 	    "  --kbench       single-thread CPU kernel throughput per type\n"
+	    "  --no-batch     feed prompts token by token (no batched prefill)\n"
 	    "  -v             verbose\n");
 	exit(2);
 }
@@ -124,6 +125,7 @@ parse(int argc, char **argv)
 		else if (!strcmp(a, "--bench")) O.bench = 1;
 		else if (!strcmp(a, "--check")) O.check = 1;
 		else if (!strcmp(a, "--kbench")) O.kbench = 1;
+		else if (!strcmp(a, "--no-batch")) O.noprefill = 1;
 		else if (!strcmp(a, "-v")) O.verbose = 1;
 		else if (a[0] == '-') usage();
 		else O.prompt = a;
@@ -222,16 +224,20 @@ encode(const char *s, int special, int *n)
 static const float *
 feed(const int *ids, int n)
 {
-	const float *lg = NULL;
-	int i;
-	for (i = 0; i < n; i++) {
-		if (S.pos >= S.ctx) {
-			fprintf(stderr, "\n[context full]\n");
-			return NULL;
-		}
-		lg = model_forward(&M, &S, ids[i], i == n - 1);
+	if (n <= 0)
+		return NULL;
+	if (S.pos + n > S.ctx) {
+		fprintf(stderr, "\n[context full]\n");
+		return NULL;
 	}
-	return lg;
+	if (O.noprefill) {
+		const float *lg = NULL;
+		int i;
+		for (i = 0; i < n; i++)
+			lg = model_forward(&M, &S, ids[i], i == n - 1);
+		return lg;
+	}
+	return model_prefill(&M, &S, ids, n);
 }
 
 static void
@@ -390,6 +396,29 @@ check(void)
 			for (r = 0; r < w->N; r++)
 				e_g += (double)(yg[r] - yr[r]) * (yg[r] - yr[r]);
 		}
+		{
+			/* multi-token kernel vs kq_dot, 5 tokens, first 64 rows */
+			q8k *x5 = malloc(sizeof(q8k) * (size_t)(w->K / 256) * 5);
+			float o5[5], md = 0, mr = 0;
+			int t5, rr;
+			for (t5 = 0; t5 < 5; t5++)
+				q8k_quantize(x + t5 * 7, x5 + t5 * (w->K / 256), (size_t)w->K);
+			for (rr = 0; rr < 64 && rr < w->N; rr++) {
+				const uint8_t *row = w->data + ((size_t)e * w->N + rr) * w->row_bytes;
+				if (!kq_dotT(w->type, row, x5, (size_t)(w->K / 256), 5, (size_t)w->K, o5, 1))
+					break;
+				for (t5 = 0; t5 < 5; t5++) {
+					float ref = kq_dot(w->type, row, x5 + t5 * (w->K / 256), (size_t)w->K);
+					if (fabsf(o5[t5] - ref) > md)
+						md = fabsf(o5[t5] - ref);
+					if (fabsf(ref) > mr)
+						mr = fabsf(ref);
+				}
+			}
+			if (rr)
+				printf("[dotT max|diff| %.2e of %.2e] ", md, mr);
+			free(x5);
+		}
 		printf("%-32s %-5s %10.2e %10.2e ", w->name, ggml_type_name(w->type),
 		    sqrt(e_s / nr), sqrt(e_k / nr));
 		if (w->gpu_n)
@@ -441,6 +470,26 @@ kbench(void)
 			for (r = 0; r < hot_rows; r++)
 				y[r] += kq_dot(w->type, w->data + r * w->row_bytes, xq, (size_t)w->K);
 		th = now() - t0;
+		{
+			/* multi-token kernel, T = 64, cache-hot rows */
+			static q8k x64[64 * 16];
+			static float o64[64];
+			int tt, KT = getenv("KB_T") ? atoi(getenv("KB_T")) : 64;
+			double td;
+			for (tt = 0; tt < 64; tt++)
+				memcpy(x64 + tt * (w->K / 256), xq, sizeof(q8k) * (size_t)(w->K / 256));
+			if (kq_dotT(w->type, w->data, x64, (size_t)(w->K / 256), 64, (size_t)w->K, o64, 1)) {
+				int rr = hot_rows < 64 ? hot_rows : 64;
+				t0 = now();
+				for (it = 0; it < 20; it++)
+					for (r = 0; r < rr; r++)
+						kq_dotT(w->type, w->data + r * w->row_bytes, x64,
+						    (size_t)(w->K / 256), KT, (size_t)w->K, o64, 1);
+				td = now() - t0;
+				printf("  %s dotT(%d): %.2f ns per 256 weights x token\n", ggml_type_name(w->type),
+				    KT, td / (20.0 * rr * KT * (w->K / 256)) * 1e9);
+			}
+		}
 		nbytes = w->row_bytes * (size_t)w->N * (size_t)(w->E > 4 ? 4 : w->E);
 		t0 = now();
 		for (r = 0; (size_t)r * w->row_bytes < nbytes; r++)
