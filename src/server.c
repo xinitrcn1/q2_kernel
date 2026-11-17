@@ -751,7 +751,21 @@ run(int fd, int kind, const jv *body, int *ptok, int pn, int reasoning, int clos
 	if (cache && cn > 0 && cn < pn && q2k_s->pos == cn &&
 	    !memcmp(ctoks, ptok, sizeof(int) * (size_t)cn))
 		start = cn;
-	else {
+	else if (cache && cn > 0 && q2k_s->pos == cn && q2k_m->arch == ARCH_LLAMA) {
+		/* pure attention: the KV rows past the common prefix are just
+		 * overwritten, so roll back to it (a chat whose re-rendered
+		 * history differs from what was generated, an edited earlier
+		 * turn) instead of feeding the whole prompt again; at least
+		 * one token is fed for the logits */
+		int l = 0;
+		while (l < cn && l < pn - 1 && ctoks[l] == ptok[l])
+			l++;
+		q2k_s->pos = l;
+		cn = l;
+		start = l;
+		if (!l)
+			state_reset(q2k_s, q2k_m);
+	} else {
 		state_reset(q2k_s, q2k_m);
 		cn = 0;
 	}

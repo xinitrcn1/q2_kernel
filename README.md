@@ -161,7 +161,12 @@ On the GPU, Q8_0 is stored per 256 as d[8] qs[256] (no padding) and has
 its own tiled GEMM (128-bit shared loads; tokens in pairs at an odd
 stride, conflict degree 2 per ucas `banks`), so prompts stream it like
 the other types.  Attention reads each K/V row once per GQA group
-(decode: split over 256-position chunks, merged per head).  For llama,
+(decode: split over 256-position chunks, merged per head; prompts:
+tiles of 16 tokens over 64-key blocks with an online softmax, so a row
+is read once per tile, not per token), with fused kernels that load a
+row once for all 8 heads of a group (`v_dotn`, `v_wsumn`).  The KV cache
+of qwen35/llama is f16, as llama.cpp's default (half the traffic; logits
+moved closer to the oracle: KL 1.2e-2 -> 7.3e-3 at 3104 tokens).  For llama,
 `-g` defaults to the whole `--vram` cap and `--stream` to 0.65.
 
 Decode is bound by the CPU's share of the weights (it reads ~24 GB/s,
@@ -189,7 +194,7 @@ kernels: 3.6%, the rest is the 256-wide activation quantization).
 |---|---|
 | `POST /completion` | native: `prompt` (string, token ids or both), `n_predict`, `temperature`, `top_k`, `top_p`, `seed`, `stop`, `stream`, `cache_prompt`, `return_tokens`; result with `content`, `stop_type`, `timings` |
 | `POST /v1/completions` | OpenAI text completions (`max_tokens`), SSE with `data: [DONE]` |
-| `POST /v1/chat/completions` | OpenAI chat; the model's template written out in C (`messages` with string or text-part content, `reasoning_content`, `tool` results); thinking via `chat_template_kwargs.enable_thinking` (default `--think`), the think block returned as `reasoning_content` (`reasoning_format: "none"` keeps it inline) |
+| `POST /v1/chat/completions` | OpenAI chat; the model's template written out in C (`messages` with string or text-part content, `reasoning_content`, `tool` results); thinking via `chat_template_kwargs.enable_thinking` (default `--think`), the think block returned as `reasoning_content` (`reasoning_format: "none"` keeps it inline); MiniCPM5: `tools`, returned as `tool_calls` (below) |
 | `POST /tokenize`, `/detokenize`, `/apply-template` | |
 | `GET /health`, `/props`, `/v1/models`, `/slots` | |
 
@@ -199,11 +204,24 @@ drafts).  There is one sequence state, so requests run one at a time;
 idle keep-alive connections are multiplexed with poll(), streams use
 chunked SSE, `Expect: 100-continue` and chunked request bodies work, and
 a client that disconnects stops its generation.  Recurrent states
-cannot rewind, so a prompt reuses the previous state only when that
-state's tokens (prompt + generated) are a strict prefix of it, as in a
-chat that resends its history (`timings.cache_n`).  Not implemented:
-tools/function calls, grammars/`response_format`, logprobs, `n > 1`,
-multimodal content.
+cannot rewind, so for Granite and Qwen a prompt reuses the previous
+state only when that state's tokens (prompt + generated) are a strict
+prefix of it, as in a chat that resends its history
+(`timings.cache_n`).  llama (MiniCPM5) is pure attention: the state
+rolls back to the longest common prefix, so a history that re-renders
+differently from what was generated, or an edited earlier turn, only
+re-feeds what follows the first difference.
+
+Tools (MiniCPM5): `tools` go into the system turn as the GGUF template
+writes them, an assistant's `tool_calls` are written back as
+`<function name=".."><param name="..">..</param></function>` (once:
+the template itself would emit them twice), and generated calls are
+parsed into OpenAI `tool_calls` (parameters whose schema type is not
+`string` become JSON values), streamed as one delta, with
+`finish_reason: "tool_calls"`; `tool_choice: "none"` turns parsing off.
+The markup is control tokens, which otherwise end generation.  Not
+implemented: grammars/`response_format`, logprobs, `n > 1`, multimodal
+content.
 
 ## Checking
 
