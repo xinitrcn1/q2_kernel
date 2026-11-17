@@ -1,7 +1,8 @@
 # q2k
 
 A small C99 inference kernel and CLI for GGUF models, built with BSD
-make: Granite 4.0-H (`granitehybrid`) and Qwen3.5-style hybrids
+make: dense `llama`-architecture models (MiniCPM5, the reference model),
+Granite 4.0-H (`granitehybrid`) and Qwen3.5-style hybrids
 (`qwen35`, e.g. Qwen3.8-27B).  The model file is
 mmapped read-only; nothing is copied at load except what goes to the GPU.
 Requires clang 23 or newer (`CC=clang23`) and an x86-64 with AVX2, FMA
@@ -13,9 +14,10 @@ else at compile time.
     ./q2k -i                                         # chat (model template)
     ./q2k -g 0 ...                                   # CPU only
     ./q2k --bench -p "..."                           # speed + time breakdown
+    ./q2k --server -c 8192                           # HTTP API on 127.0.0.1:8080
 
-Default model: `~/mb/granite-4.0-h-tiny-UD-Q2_K_XL.gguf` (or `-m`,
-`$Q2K_MODEL`).  Dependencies: libc, pthreads, the Vulkan loader and
+Default (reference) model: `/tank/models/MiniCPM5-2B-Q8_0.gguf` (or
+`-m`, `$Q2K_MODEL`).  Dependencies: libc, pthreads, the Vulkan loader and
 headers, and glslangValidator at build time.
 
 ## Layout
@@ -141,6 +143,49 @@ single-token paths round differently, so near-ties can flip).  The MTP
 layer's own KV is filled for every confirmed position, prompts included.
 Decode is memory bound (~21 of ~28 GB/s on this host), so the gain is
 the tokens per pass: 1.8-3.5 depending on the text.
+
+## MiniCPM5 (llama)
+
+The reference model, `MiniCPM5-2B-Q8_0.gguf`, is a plain `llama`
+transformer (42 layers, embd 2048, 16 query / 2 KV heads of 128, SwiGLU
+6144, RoPE base 5e6 on adjacent pairs, untied output, all Q8_0).  It
+runs through `src/qwen35.c` as the all-attention special case: no
+output gate, no q/k norms, `ffn_norm` before the FFN.  Rope scaling and
+MoE `llama` files are rejected at load.  The `minicpm5` pre-tokenizer is
+llama3's expression run separately on the pieces between
+`\p{N}{1,3}` digit groups (matches `llama-tokenize`).  Q8_0 has a
+multi-token CPU kernel (`dotT`: `maddubs(|w|, sign(x, w))` per 32 with
+its float scale); prompt weight streaming does not handle Q8_0 yet, so
+only the resident rows (`-g`) run on the GPU in prompts.
+
+Last-token logits vs llama.cpp's CPU build: top 2-3 identical; relative
+L2 ~3% on a short prompt, ~6-7% on 246 chat tokens (f32 `--ref`
+kernels: 3.6%, the rest is the 256-wide activation quantization).
+
+## Server
+
+`--server` speaks llama-server's HTTP protocol (`--host`, default
+127.0.0.1; `--port`, default 8080; `--alias NAME`; `--api-key KEY`):
+
+| endpoint | |
+|---|---|
+| `POST /completion` | native: `prompt` (string, token ids or both), `n_predict`, `temperature`, `top_k`, `top_p`, `seed`, `stop`, `stream`, `cache_prompt`, `return_tokens`; result with `content`, `stop_type`, `timings` |
+| `POST /v1/completions` | OpenAI text completions (`max_tokens`), SSE with `data: [DONE]` |
+| `POST /v1/chat/completions` | OpenAI chat; the model's template written out in C (`messages` with string or text-part content, `reasoning_content`, `tool` results); thinking via `chat_template_kwargs.enable_thinking` (default `--think`), the think block returned as `reasoning_content` (`reasoning_format: "none"` keeps it inline) |
+| `POST /tokenize`, `/detokenize`, `/apply-template` | |
+| `GET /health`, `/props`, `/v1/models`, `/slots` | |
+
+`-n`, `--temp`, `--top-k`, `--top-p` are the defaults (`n_predict` -1:
+until the context is full; `--temp 0`, greedy, keeps qwen35's MTP
+drafts).  There is one sequence state, so requests run one at a time;
+idle keep-alive connections are multiplexed with poll(), streams use
+chunked SSE, `Expect: 100-continue` and chunked request bodies work, and
+a client that disconnects stops its generation.  Recurrent states
+cannot rewind, so a prompt reuses the previous state only when that
+state's tokens (prompt + generated) are a strict prefix of it, as in a
+chat that resends its history (`timings.cache_n`).  Not implemented:
+tools/function calls, grammars/`response_format`, logprobs, `n > 1`,
+multimodal content.
 
 ## Checking
 

@@ -1,4 +1,4 @@
-/* q2k: command line front end for the Granite 4.0-H GGUF kernel. */
+/* q2k: command line front end and server for the GGUF kernel. */
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,14 +11,16 @@
 #include "model.h"
 #include "pool.h"
 #include "quant.h"
+#include "server.h"
 #include "tok.h"
 #include "vk.h"
 
-#define DEFAULT_MODEL "~/mb/granite-4.0-h-tiny-UD-Q2_K_XL.gguf"
+#define DEFAULT_MODEL "/tank/models/MiniCPM5-2B-Q8_0.gguf"
 #define DEFAULT_SYSTEM "You are a helpful assistant. Please ensure responses are professional, accurate, and safe."
 
 typedef struct {
-	const char *model, *prompt, *system, *dump, *transcode;
+	const char *model, *prompt, *system, *dump, *transcode, *host, *alias, *api_key;
+	int server, port, n_given;
 	int n_predict, threads, ctx, gpu_mib, device, chat, raw, info, tokens;
 	int bench, check, kbench, top_k, verbose, show_special, logits, noprefill, think, sys_given, nomtp, ndraft;
 	float temp, top_p;
@@ -76,6 +78,12 @@ usage(void)
 	    "  --draft-p P    chain another draft while its probability >= P (0.5)\n"
 	    "  --transcode F  write the model to F with the codebook i-quants in\n"
 	    "                 q2k's faster lossless layouts (X2/X3/X1), then exit\n"
+	    "  --server       serve the llama.cpp HTTP API (/completion,\n"
+	    "                 /v1/chat/completions, ...); -n, --temp etc. are defaults\n"
+	    "  --host H       listen address (default 127.0.0.1)\n"
+	    "  --port N       listen port (default 8080)\n"
+	    "  --alias NAME   model name reported to clients\n"
+	    "  --api-key KEY  require \"Authorization: Bearer KEY\"\n"
 	    "  -v             verbose\n");
 	exit(2);
 }
@@ -111,6 +119,8 @@ parse(int argc, char **argv)
 	O.top_p = 0.95f;
 	O.seed = (unsigned long)time(NULL);
 	O.system = DEFAULT_SYSTEM;
+	O.host = "127.0.0.1";
+	O.port = 8080;
 	for (i = 1; i < argc; i++) {
 		const char *a = argv[i];
 #define ARG() (i + 1 < argc ? argv[++i] : (usage(), ""))
@@ -118,7 +128,12 @@ parse(int argc, char **argv)
 		else if (!strcmp(a, "-p")) O.prompt = ARG();
 		else if (!strcmp(a, "-s")) { O.system = ARG(); O.sys_given = 1; }
 		else if (!strcmp(a, "--think")) O.think = 1;
-		else if (!strcmp(a, "-n")) O.n_predict = atoi(ARG());
+		else if (!strcmp(a, "-n")) { O.n_predict = atoi(ARG()); O.n_given = 1; }
+		else if (!strcmp(a, "--server")) O.server = 1;
+		else if (!strcmp(a, "--host")) O.host = ARG();
+		else if (!strcmp(a, "--port")) O.port = atoi(ARG());
+		else if (!strcmp(a, "--alias")) O.alias = ARG();
+		else if (!strcmp(a, "--api-key")) O.api_key = ARG();
 		else if (!strcmp(a, "-t")) O.threads = atoi(ARG());
 		else if (!strcmp(a, "-c")) O.ctx = atoi(ARG());
 		else if (!strcmp(a, "-g")) O.gpu_mib = atoi(ARG());
@@ -261,13 +276,15 @@ feed(const int *ids, int n)
 	return model_prefill(&M, &S, ids, n);
 }
 
-static void
-emit(int id)
+static int
+emit(int id, void *u)
 {
 	char buf[256];
 	int k = tok_piece(&T, id, O.show_special, buf, sizeof(buf));
+	(void)u;
 	fwrite(buf, 1, (size_t)k, stdout);
 	fflush(stdout);
+	return 0;
 }
 
 static int
@@ -279,12 +296,14 @@ is_stop(int id)
 static long mtp_steps, mtp_acc, mtp_drafted;
 static double mtp_t[4];  /* draft, verify, accept, reject */
 
+#define FED(t) do { if (fed) fed[(*nfed)++] = (t); } while (0)
+
 /* greedy with the MTP block (qwen35): per step one draft and a 2-token
  * verify; the output is the greedy sequence (the verify's row 0 is the
  * model's own prediction, the draft only decides whether row 1 is
  * usable) */
 static int
-generate_mtp(const float *lg, int n, double *secs)
+generate_mtp(const float *lg, int n, q2k_emit cb, void *u, int *fed, int *nfed, double *secs)
 {
 	const int V = M.hp.n_vocab;
 	double t0 = now();
@@ -295,12 +314,14 @@ generate_mtp(const float *lg, int n, double *secs)
 		int d[MTP_KMAX], a, k, c, j;
 		if (is_stop(x))
 			break;
-		emit(x);
 		i++;
-		if (i >= n || S.pos + 2 >= S.ctx || !qwen35_mtp_ok(&M, &S)) {
+		if (cb(x, u))
+			break;
+		if (i >= n || S.pos + MTP_KMAX + 1 >= S.ctx || !qwen35_mtp_ok(&M, &S)) {
 			if (S.pos >= S.ctx)
 				break;
 			lg = model_forward(&M, &S, x, 1);
+			FED(x);
 			if (i >= n || !lg)
 				break;
 			x = sample(lg, V);
@@ -314,6 +335,7 @@ generate_mtp(const float *lg, int n, double *secs)
 			l2 = qwen35_verify(&M, &S, x, d, k);
 			mtp_t[1] += now() - ta;
 		}
+		FED(x);
 		/* the longest run of drafts the model agrees with */
 		for (c = 0; c < k; c++) {
 			a = sample(l2 + (size_t)c * V, V);
@@ -328,12 +350,16 @@ generate_mtp(const float *lg, int n, double *secs)
 			qwen35_settle(&M, &S, d, k, c);
 			mtp_t[2] += now() - ta;
 		}
+		for (j = 0; j < c; j++)
+			FED(d[j]);
 		for (j = 0; j < c && i < n; j++) {
-			emit(d[j]);
 			i++;
+			if (cb(d[j], u))
+				goto out;
 		}
 		x = sample(l2 + (size_t)c * V, V);
 	}
+out:
 	if (secs)
 		*secs = now() - t0;
 	return i;
@@ -341,24 +367,88 @@ generate_mtp(const float *lg, int n, double *secs)
 
 /* generate up to n tokens after logits lg; returns count */
 static int
-generate(const float *lg, int n, double *secs)
+generate_cb(const float *lg, int n, q2k_emit cb, void *u, int *fed, int *nfed, double *secs)
 {
 	double t0 = now();
 	int i;
+	if (nfed)
+		*nfed = 0;
 	if (lg && M.arch == ARCH_QWEN35 && O.temp <= 0 && qwen35_mtp_ok(&M, &S))
-		return generate_mtp(lg, n, secs);
+		return generate_mtp(lg, n, cb, u, fed, nfed, secs);
 	for (i = 0; i < n && lg; i++) {
 		int id = sample(lg, M.hp.n_vocab);
 		if (is_stop(id))
 			break;
-		emit(id);
-		if (S.pos >= S.ctx)
+		if (cb(id, u)) {
+			i++;
 			break;
+		}
+		if (S.pos >= S.ctx) {
+			i++;
+			break;
+		}
 		lg = model_forward(&M, &S, id, 1);
+		FED(id);
 	}
 	if (secs)
 		*secs = now() - t0;
 	return i;
+}
+
+#undef FED
+
+static int
+generate(const float *lg, int n, double *secs)
+{
+	return generate_cb(lg, n, emit, NULL, NULL, NULL, secs);
+}
+
+/* ---------------------------------------------------------------- */
+/* for the server                                                   */
+
+model *const q2k_m = &M;
+tokenizer *const q2k_t = &T;
+state *const q2k_s = &S;
+
+void
+q2k_set_sampling(float temp, int top_k, float top_p, unsigned long seed)
+{
+	O.temp = temp;
+	O.top_k = top_k;
+	O.top_p = top_p;
+	rng = seed * 2654435761ull + 1;
+}
+
+void
+q2k_get_sampling(float *temp, int *top_k, float *top_p)
+{
+	*temp = O.temp;
+	*top_k = O.top_k;
+	*top_p = O.top_p;
+}
+
+int *
+q2k_encode(const char *s, int special, int *n)
+{
+	return encode(s, special, n);
+}
+
+const float *
+q2k_feed(const int *ids, int n)
+{
+	return feed(ids, n);
+}
+
+int
+q2k_is_stop(int id)
+{
+	return is_stop(id);
+}
+
+int
+q2k_generate(const float *lg, int n, q2k_emit cb, void *u, int *fed, int *nfed, double *secs)
+{
+	return generate_cb(lg, n, cb, u, fed, nfed, secs);
 }
 
 static void
@@ -393,7 +483,12 @@ info(void)
 
 	for (i = 0; i < h->n_layer; i++)
 		nattn += M.L[i].attn;
-	if (M.arch == ARCH_QWEN35) {
+	if (M.arch == ARCH_LLAMA) {
+		printf("llama: %d layers, embd %d, vocab %d, ffn %d\n", h->n_layer, h->n_embd,
+		    h->n_vocab, h->n_ff);
+		printf("  attention: %d heads x %d, %d kv heads, rope %d dims base %g\n",
+		    h->n_head, h->head_dim, h->n_head_kv, h->rope_dim, h->rope_base);
+	} else if (M.arch == ARCH_QWEN35) {
 		printf("qwen35: %d layers (%d gated delta net, %d gated attention), embd %d, vocab %d\n",
 		    h->n_layer, h->n_layer - nattn, nattn, h->n_embd, h->n_vocab);
 		printf("  attention: %d heads x %d, %d kv heads, rope %d dims base %g\n",
@@ -682,10 +777,13 @@ chat(void)
 		}
 		cap = strlen(line) + strlen(O.system) + 256;
 		msg = malloc(cap);
-		if (M.arch == ARCH_QWEN35)
-			/* ChatML; no default system message */
-			snprintf(msg, cap, "%s%s%s<|im_start|>user\n%s<|im_end|>\n"
+		if (ARCH_DENSE(M.arch))
+			/* ChatML; no default system message (llama/MiniCPM5:
+			 * the template starts with the bos token) */
+			snprintf(msg, cap, "%.*s%s%s%s<|im_start|>user\n%s<|im_end|>\n"
 			    "<|im_start|>assistant\n%s",
+			    first && M.arch == ARCH_LLAMA && T.bos >= 0 ? (int)T.text[T.bos].len : 0,
+			    T.bos >= 0 ? T.text[T.bos].p : "",
 			    first && O.sys_given ? "<|im_start|>system\n" : "",
 			    first && O.sys_given ? O.system : "",
 			    first && O.sys_given ? "<|im_end|>\n" : "", line,
@@ -704,7 +802,7 @@ chat(void)
 		gen = generate(lg, O.n_predict, &secs);
 		/* close the assistant turn in the cache */
 		{
-			int end = tok_find(&T, M.arch == ARCH_QWEN35 ? "<|im_end|>" : "<|end_of_text|>"),
+			int end = tok_find(&T, ARCH_DENSE(M.arch) ? "<|im_end|>" : "<|end_of_text|>"),
 			    nl[4], k;
 			k = tok_encode(&T, "\n", 1, 0, nl, 4);
 			if (end >= 0)
@@ -746,13 +844,15 @@ main(int argc, char **argv)
 	/* greedy runs keep the MTP block in step from the prompt on */
 	if (getenv("Q2K_DRAFT_V"))
 		g_draft_vocab = atoi(getenv("Q2K_DRAFT_V"));
-	g_mtp = M.arch == ARCH_QWEN35 && M.mtp && O.temp <= 0 && !O.nomtp && O.ndraft > 0 &&
+	/* (a server decides per request) */
+	g_mtp = M.arch == ARCH_QWEN35 && M.mtp && (O.temp <= 0 || O.server) && !O.nomtp &&
+	    O.ndraft > 0 &&
 	    !O.check && !O.kbench;
 	if (g_stream < 0)
-		g_stream = M.arch == ARCH_QWEN35 && O.gpu_mib > 0 ? 0.5 : 0;
+		g_stream = ARCH_DENSE(M.arch) && O.gpu_mib > 0 ? 0.5 : 0;
 	if (g_stream > 0 && !vk_stream_bytes)
 		vk_stream_bytes = (size_t)64 << 20;
-	if (O.gpu_mib > 0 && !O.tokens && M.arch == ARCH_QWEN35) {
+	if (O.gpu_mib > 0 && !O.tokens && ARCH_DENSE(M.arch)) {
 		if (vk_init((size_t)O.gpu_mib << 20, 0, O.device, O.verbose) == 0)
 			vk_plan_rows(&M, O.verbose);
 		else
@@ -808,7 +908,27 @@ main(int argc, char **argv)
 		fprintf(stderr, "q2k: out of memory\n");
 		return 1;
 	}
-	if (O.chat) {
+	if (O.server) {
+		server_opts so;
+		int r;
+		memset(&so, 0, sizeof(so));
+		so.host = O.host;
+		so.port = O.port;
+		so.alias = O.alias;
+		so.api_key = O.api_key;
+		so.model_path = expand_home(O.model);
+		/* like llama-server: until the context is full by default */
+		so.n_predict = O.n_given ? O.n_predict : -1;
+		so.think = O.think;
+		so.verbose = O.verbose;
+		r = server_run(&so);
+		free(ids);
+		vk_shutdown();
+		pool_free();
+		tok_free(&T);
+		model_free(&M);
+		return r ? 1 : 0;
+	} else if (O.chat) {
 		chat();
 	} else if (O.prompt && n > 0) {
 		const float *lg;
