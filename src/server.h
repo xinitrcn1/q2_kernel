@@ -19,6 +19,10 @@ int *q2k_encode(const char *s, int special, int *n);
 /* consume n tokens; logits of the last (NULL if they do not fit) */
 const float *q2k_feed(const int *ids, int n);
 int q2k_is_stop(int id);
+/* control tokens that generation outputs instead of stopping on (n = 0
+ * clears); q2k_kept tells whether id is one */
+void q2k_keep_tokens(const int *ids, int n);
+int q2k_kept(int id);
 
 /* generate up to n tokens after logits lg.  cb gets every token (not
  * the stop token) and returns nonzero to stop; fed (if not NULL, room

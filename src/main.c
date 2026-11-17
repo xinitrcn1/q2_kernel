@@ -289,10 +289,14 @@ emit(int id, void *u)
 	return 0;
 }
 
+/* control tokens that are output, not a stop (the server's tool-call
+ * markup); NULL when none */
+static unsigned char *keep_tok;
+
 static int
 is_stop(int id)
 {
-	return id == T.eos || (T.type[id] == 3 && id != T.bos);
+	return id == T.eos || (T.type[id] == 3 && id != T.bos && !(keep_tok && keep_tok[id]));
 }
 
 static long mtp_steps, mtp_acc, mtp_drafted;
@@ -445,6 +449,24 @@ int
 q2k_is_stop(int id)
 {
 	return is_stop(id);
+}
+
+void
+q2k_keep_tokens(const int *ids, int n)
+{
+	int i;
+	if (!keep_tok)
+		keep_tok = calloc((size_t)T.n_vocab, 1);
+	memset(keep_tok, 0, (size_t)T.n_vocab);
+	for (i = 0; i < n; i++)
+		if (ids[i] >= 0 && ids[i] < T.n_vocab)
+			keep_tok[ids[i]] = 1;
+}
+
+int
+q2k_kept(int id)
+{
+	return keep_tok && id >= 0 && id < T.n_vocab && keep_tok[id];
 }
 
 int

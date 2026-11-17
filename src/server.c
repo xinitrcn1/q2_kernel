@@ -9,6 +9,7 @@
  * (prompt + generated) only feeds the new suffix; anything else resets
  * the recurrent state and feeds the whole prompt. */
 #include <errno.h>
+#include <math.h>
 #include <netdb.h>
 #include <poll.h>
 #include <signal.h>
@@ -216,7 +217,16 @@ typedef struct {
 	char id[48];
 	long created;
 	int role_sent;
+	const jv *tools;        /* chat with tools: parse <function> calls */
+	int in_calls;           /* content from the first "<function" on... */
+	sbuf calls;             /* ...is held here, not sent */
+	sbuf calls_json;        /* the parsed calls: OpenAI tool_calls items */
+	sbuf calls_delta;       /* the same with "index", for the stream */
+	int ncalls;
 } task;
+
+static void gen_id(char *buf, size_t n, const char *prefix);
+static const jv *req_tools(const jv *body);
 
 static size_t
 memfind(const char *h, size_t hn, const char *n, size_t nn)
@@ -321,6 +331,9 @@ flush(task *t, int final)
 		if (t->reasoning && !t->think_done &&
 		    (k = partial(t->text.p, t->text.n, "</think>")) > hold)
 			hold = k;
+		if (t->tools && !t->in_calls &&
+		    (k = partial(t->text.p, t->text.n, "<function")) > hold)
+			hold = k;
 		end -= hold;
 		end -= utf8_tail(t->text.p, end);
 	}
@@ -346,6 +359,19 @@ flush(task *t, int final)
 		if (t->done < end)
 			t->content_started = 1;
 	}
+	if (t->tools && !t->in_calls) {
+		size_t p = memfind(t->text.p + t->done, end - t->done, "<function", 9);
+		if (p != (size_t)-1) {
+			put(t, t->done, t->done + p, 0);
+			t->done += p;
+			t->in_calls = 1;
+		}
+	}
+	if (t->in_calls) {
+		sb_add(&t->calls, t->text.p + t->done, end - t->done);
+		t->done = end;
+		return;
+	}
 	put(t, t->done, end, 0);
 	if (end > t->done)
 		t->done = end;
@@ -357,7 +383,7 @@ on_token(int id, void *u)
 	task *t = u;
 	char buf[512];
 	size_t old = t->text.n;
-	int k = tok_piece(q2k_t, id, 0, buf, sizeof(buf)), i;
+	int k = tok_piece(q2k_t, id, q2k_kept(id), buf, sizeof(buf)), i;
 
 	t->toks[t->ntok++] = id;
 	sb_add(&t->text, buf, (size_t)k);
@@ -378,6 +404,158 @@ on_token(int id, void *u)
 		return 1;
 	}
 	return 0;
+}
+
+/* the JSON schema type of a tool's parameter, or NULL */
+static const char *
+param_type(const jv *tools, const char *fn, size_t fnl, const char *pn, size_t pnl)
+{
+	const jv *k, *p;
+	for (k = tools->kid; k; k = k->next) {
+		const jv *f = json_get(k, "function");
+		const char *name = json_str(f ? f : k, "name", "");
+		if (strlen(name) != fnl || memcmp(name, fn, fnl))
+			continue;
+		p = json_get(json_get(f ? f : k, "parameters"), "properties");
+		for (p = p && p->t == J_OBJ ? p->kid : NULL; p; p = p->next)
+			if (strlen(p->key) == pnl && !memcmp(p->key, pn, pnl))
+				return json_str(p, "type", NULL);
+	}
+	return NULL;
+}
+
+/* s starts with lit? then skip it */
+static int
+eat(const char **s, const char *e, const char *lit)
+{
+	size_t l = strlen(lit);
+	if ((size_t)(e - *s) < l || memcmp(*s, lit, l))
+		return 0;
+	*s += l;
+	return 1;
+}
+
+/* parse the held <function name="F"><param name="P">V</param>...
+ * </function> calls into OpenAI tool_calls items; a value is a JSON
+ * value when the tool's schema gives the parameter a non-string type
+ * and it parses, else a string.  Stops at the first malformed call. */
+static void
+parse_calls(task *t)
+{
+	const char *s = t->calls.p, *e = s + t->calls.n;
+	sbuf args = { 0 }, item = { 0 };
+	while (s < e) {
+		const char *fn, *fe;
+		char cid[40];
+		while (s < e && strchr(" \t\r\n", *s))
+			s++;
+		if (s == e || !eat(&s, e, "<function name=\""))
+			break;
+		fn = s;
+		if (!(fe = memchr(s, '"', (size_t)(e - s))))
+			break;
+		s = fe + 1;
+		if (!eat(&s, e, ">"))
+			break;
+		args.n = 0;
+		sb_puts(&args, "{");
+		for (;;) {
+			const char *pn, *pe, *v, *ve;
+			size_t vl;
+			while (s < e && strchr(" \t\r\n", *s))
+				s++;
+			if (eat(&s, e, "</function>"))
+				break;
+			if (!eat(&s, e, "<param name=\""))
+				goto done;
+			pn = s;
+			if (!(pe = memchr(s, '"', (size_t)(e - s))))
+				goto done;
+			s = pe + 1;
+			if (!eat(&s, e, ">"))
+				goto done;
+			if (eat(&s, e, "<![CDATA[")) {
+				v = s;
+				if ((vl = memfind(s, (size_t)(e - s), "]]>", 3)) == (size_t)-1)
+					goto done;
+				ve = v + vl;
+				s = ve + 3;
+				if (!eat(&s, e, "</param>"))
+					goto done;
+			} else {
+				v = s;
+				if ((vl = memfind(s, (size_t)(e - s), "</param>", 8)) == (size_t)-1)
+					goto done;
+				ve = v + vl;
+				s = ve + 8;
+			}
+			if (args.n > 1)
+				sb_puts(&args, ",");
+			sb_jstr(&args, pn, (size_t)(pe - pn));
+			sb_puts(&args, ":");
+			{
+				const char *ty = param_type(t->tools, fn, (size_t)(fe - fn), pn,
+				    (size_t)(pe - pn));
+				jv *pj = NULL;
+				char err[64];
+				if (ty && strcmp(ty, "string") && ve > v)
+					pj = json_parse(v, (size_t)(ve - v), err, sizeof(err));
+				if (pj) {
+					sb_json(&args, pj);
+					json_free(pj);
+				} else
+					sb_jstr(&args, v, (size_t)(ve - v));
+			}
+		}
+		sb_puts(&args, "}");
+		gen_id(cid, sizeof(cid), "call_");
+		sb_printf(&item, "\"type\":\"function\",\"function\":{\"name\":");
+		sb_jstr(&item, fn, (size_t)(fe - fn));
+		sb_puts(&item, ",\"arguments\":");
+		sb_jstr(&item, args.p, args.n);
+		sb_printf(&item, "},\"id\":\"%s\"}", cid);
+		sb_puts(&t->calls_json, t->ncalls ? ",{" : "{");
+		sb_add(&t->calls_json, item.p, item.n);
+		sb_printf(&t->calls_delta, "%s{\"index\":%d,", t->ncalls ? "," : "", t->ncalls);
+		sb_add(&t->calls_delta, item.p, item.n);
+		item.n = 0;
+		t->ncalls++;
+	}
+done:
+	sb_free(&args);
+	sb_free(&item);
+}
+
+/* after generation: the held calls become tool_calls, or content when
+ * none parse */
+static void
+finish_calls(task *t)
+{
+	if (!t->in_calls)
+		return;
+	parse_calls(t);
+	if (t->ncalls) {
+		/* the whitespace before the first call is not content */
+		while (t->cnt.n && strchr(" \t\r\n", t->cnt.p[t->cnt.n - 1]))
+			t->cnt.p[--t->cnt.n] = 0;
+		if (t->stream && !t->dead) {
+			/* one chunk with every call, each with an index */
+			sbuf b = { 0 };
+			sb_puts(&b, "{\"choices\":[{\"finish_reason\":null,\"index\":0,"
+			    "\"delta\":{\"tool_calls\":[");
+			sb_add(&b, t->calls_delta.p, t->calls_delta.n);
+			sb_printf(&b, "]}}],\"created\":%ld,\"id\":\"%s\",\"model\":", t->created, t->id);
+			sb_jstr(&b, model_name, strlen(model_name));
+			sb_puts(&b, ",\"system_fingerprint\":\"q2k\",\"object\":\"chat.completion.chunk\"}");
+			if (sse_send(t->fd, b.p, b.n))
+				t->dead = 1;
+			sb_free(&b);
+		}
+	} else {
+		sb_add(&t->cnt, t->calls.p, t->calls.n);
+		if (t->stream)
+			send_delta(t, t->calls.p, t->calls.n, 0);
+	}
 }
 
 static void
@@ -404,7 +582,7 @@ usage_obj(sbuf *b, const task *t)
 static const char *
 finish_reason(const task *t)
 {
-	return t->stop_type == STOP_LIMIT ? "length" : "stop";
+	return t->ncalls ? "tool_calls" : t->stop_type == STOP_LIMIT ? "length" : "stop";
 }
 
 /* the final object (stream: the last chunk) */
@@ -456,6 +634,11 @@ final_obj(sbuf *b, const task *t, int return_tokens, float temp, int top_k, floa
 		if (t->reasoning && t->rsn.n) {
 			sb_puts(b, ",\"reasoning_content\":");
 			sb_jstr(b, t->rsn.p, t->rsn.n);
+		}
+		if (t->ncalls) {
+			sb_puts(b, ",\"tool_calls\":[");
+			sb_add(b, t->calls_json.p, t->calls_json.n);
+			sb_puts(b, "]");
 		}
 		sb_puts(b, "}");
 	}
@@ -546,6 +729,17 @@ run(int fd, int kind, const jv *body, int *ptok, int pn, int reasoning, int clos
 	t.created = (long)time(NULL);
 	gen_id(t.id, sizeof(t.id), kind == K_OAI_CHAT ? "chatcmpl-" : "cmpl-");
 	get_stops(body, &t);
+	if (kind == K_OAI_CHAT && strcmp(json_str(body, "tool_choice", "auto"), "none"))
+		t.tools = req_tools(body);
+	if (t.tools) {
+		/* MiniCPM5's call markup is control tokens: output, not stops */
+		static const char *const mk[] = { "<function", "</function>", "<param", "</param>" };
+		int ids[4], nk = 0, i2;
+		for (i2 = 0; i2 < 4; i2++)
+			if ((ids[nk] = tok_find(q2k_t, mk[i2])) >= 0)
+				nk++;
+		q2k_keep_tokens(ids, nk);
+	}
 
 	n = q2k_s->ctx - pn;
 	if (n_predict >= 0 && n_predict < n)
@@ -608,7 +802,10 @@ run(int fd, int kind, const jv *body, int *ptok, int pn, int reasoning, int clos
 		cn = 0;         /* lost track: reset next time */
 	if (t.stop_type == STOP_NONE)
 		t.stop_type = t.ntok >= n ? STOP_LIMIT : STOP_EOS;
+	if (t.tools)
+		q2k_keep_tokens(NULL, 0);  /* (also at out:, for early exits) */
 	flush(&t, 1);
+	finish_calls(&t);
 
 	fprintf(stderr, "q2k server: prompt %d tok (%d cached) %.2f s, %.1f tok/s; "
 		    "gen %d tok %.2f s, %.2f tok/s%s\n", t.prompt_n, t.cached_n, t.t_prompt,
@@ -632,12 +829,17 @@ run(int fd, int kind, const jv *body, int *ptok, int pn, int reasoning, int clos
 		sb_free(&b);
 	}
 out:
+	if (t.tools)
+		q2k_keep_tokens(NULL, 0);
 	free(t.toks);
 	free(fed);
 	free(t.stop);
 	sb_free(&t.text);
 	sb_free(&t.rsn);
 	sb_free(&t.cnt);
+	sb_free(&t.calls);
+	sb_free(&t.calls_json);
+	sb_free(&t.calls_delta);
 	return r;
 }
 
@@ -749,8 +951,133 @@ role_of(const jv *m)
 	return json_str(m, "role", "");
 }
 
+/* a number the way Python prints it: shortest repr that round-trips */
+static void
+py_num(sbuf *b, double v)
+{
+	char buf[40];
+	int p;
+	if (isfinite(v) && v == (double)(long long)v && fabs(v) < 1e15) {
+		sb_printf(b, "%lld", (long long)v);
+		return;
+	}
+	for (p = 15; p <= 17; p++) {
+		snprintf(buf, sizeof(buf), "%.*g", p, v);
+		if (strtod(buf, NULL) == v)
+			break;
+	}
+	sb_puts(b, buf);
+}
+
+/* Jinja's tojson (json.dumps): ", " and ": " separators, UTF-8 kept */
+static void
+py_json(sbuf *b, const jv *v)
+{
+	const jv *k;
+	switch (v->t) {
+	case J_NULL: sb_puts(b, "null"); break;
+	case J_BOOL: sb_puts(b, v->n ? "true" : "false"); break;
+	case J_NUM: py_num(b, v->n); break;
+	case J_STR: sb_jstr(b, v->s, v->len); break;
+	default:
+		sb_add(b, v->t == J_OBJ ? "{" : "[", 1);
+		for (k = v->kid; k; k = k->next) {
+			if (k != v->kid)
+				sb_puts(b, ", ");
+			if (v->t == J_OBJ) {
+				sb_jstr(b, k->key, strlen(k->key));
+				sb_puts(b, ": ");
+			}
+			py_json(b, k);
+		}
+		sb_add(b, v->t == J_OBJ ? "}" : "]", 1);
+	}
+}
+
+/* the non-empty "tools" array of a request, else NULL */
+static const jv *
+req_tools(const jv *body)
+{
+	const jv *t = json_get(body, "tools");
+	return t && t->t == J_ARR && t->kid ? t : NULL;
+}
+
+/* MiniCPM5's tool block (the template's tool_definitions) */
+static void
+minicpm_tool_defs(sbuf *b, const jv *tools)
+{
+	const jv *k;
+	sb_puts(b, "# Tools\n\nYou are provided with function signatures within <tools></tools> "
+	    "XML tags:\n<tools>");
+	for (k = tools->kid; k; k = k->next) {
+		sb_puts(b, "\n");
+		py_json(b, k);
+	}
+	sb_puts(b, "\n</tools>\n\nTool usage guidelines:\n- You may call zero or more functions. "
+	    "If no function calls are needed, just answer normally and do not include any "
+	    "<function ... </function>.\n- When calling a function, return an XML object within "
+	    "<function ... </function> using:\n<function name=\"function-name\"><param "
+	    "name=\"param-name\">param-value</param></function>\n- param-value may be multi-line. "
+	    "If it contains <, & or newline characters, wrap it in a CDATA block: <param "
+	    "name=\"param-name\"><![CDATA[...multi-line value...]]></param>");
+}
+
+/* an assistant message's tool_calls as MiniCPM5 XML.  The GGUF template
+ * would emit every call twice (its <tool_sep> pass appends them to the
+ * content, then the has_tool_sep pass, with that variable never set,
+ * appends them again); we emit them once. */
+static void
+minicpm_calls(sbuf *out, const jv *calls, int had_content)
+{
+	const jv *tc;
+	int first = 1;
+	for (tc = calls && calls->t == J_ARR ? calls->kid : NULL; tc; tc = tc->next) {
+		const jv *fn = json_get(tc, "function"), *a, *pv;
+		jv *parsed = NULL;
+		if (!fn)
+			fn = tc;
+		if (!first || had_content)
+			sb_puts(out, "\n");
+		first = 0;
+		sb_puts(out, "<function name=\"");
+		sb_puts(out, json_str(fn, "name", ""));
+		sb_puts(out, "\">");
+		/* OpenAI clients send the arguments as a JSON string; the
+		 * template iterates them as a mapping */
+		a = json_get(fn, "arguments");
+		if (a && a->t == J_STR) {
+			char err[64];
+			a = parsed = json_parse(a->s, a->len, err, sizeof(err));
+		}
+		for (pv = a && a->t == J_OBJ ? a->kid : NULL; pv; pv = pv->next) {
+			sb_printf(out, "<param name=\"%s\">", pv->key);
+			if (pv->t == J_STR) {
+				int cd = memchr(pv->s, '<', pv->len) || memchr(pv->s, '&', pv->len) ||
+				    memchr(pv->s, '\n', pv->len);
+				if (cd)
+					sb_puts(out, "<![CDATA[");
+				sb_add(out, pv->s, pv->len);
+				if (cd)
+					sb_puts(out, "]]>");
+			} else if (pv->t == J_BOOL)
+				sb_puts(out, pv->n ? "True" : "False");
+			else if (pv->t == J_NULL)
+				sb_puts(out, "None");
+			else if (pv->t == J_NUM)
+				py_num(out, pv->n);
+			else
+				py_json(out, pv);
+			sb_puts(out, "</param>");
+		}
+		sb_puts(out, "</function>");
+		if (parsed)
+			json_free(parsed);
+	}
+}
+
 /* the model's chat template (hand-written per architecture, following
- * the GGUF's Jinja template without tools/vision); 0 on success */
+ * the GGUF's Jinja template; tools only for MiniCPM5, no vision); 0 on
+ * success */
 static int
 apply_template(const jv *body, sbuf *out, int *think, const char **err)
 {
@@ -853,12 +1180,42 @@ apply_template(const jv *body, sbuf *out, int *think, const char **err)
 		sb_puts(out, "<|im_start|>assistant\n");
 		sb_puts(out, *think ? "<think>\n" : "<think>\n\n</think>\n\n");
 	} else if (q2k_m->arch == ARCH_LLAMA) {
-		/* MiniCPM5: ChatML, bos first, system only from messages[0] */
-		const jv *pv = NULL;
+		/* MiniCPM5: ChatML, bos first; with tools the system turn is
+		 * messages[0] (if a system message) plus the tool block */
+		const jv *pv = NULL, *tools = req_tools(body);
 		char bos[64];
 		int k = tok_piece(q2k_t, q2k_t->bos, 1, bos, sizeof(bos) - 1);
 		sb_add(out, bos, (size_t)k);
-		for (m = msgs->kid; m; pv = m, m = m->next) {
+		m = msgs->kid;
+		if (tools) {
+			sbuf defs = { 0 };
+			minicpm_tool_defs(&defs, tools);
+			sb_puts(out, "<|im_start|>system\n");
+			if (!strcmp(role_of(m), "system")) {
+				const char *s, *q;
+				c.n = 0;
+				content_text(&c, json_get(m, "content"), "");
+				s = c.p ? c.p : "";
+				if (strstr(s, "<tool_def_sep>")) {
+					while ((q = strstr(s, "<tool_def_sep>"))) {
+						sb_add(out, s, (size_t)(q - s));
+						sb_add(out, defs.p, defs.n);
+						s = q + 14;
+					}
+					sb_puts(out, s);
+				} else {
+					sb_add(out, c.p ? c.p : "", c.n);
+					sb_puts(out, "\n\n");
+					sb_add(out, defs.p, defs.n);
+				}
+				pv = m;
+				m = m->next;
+			} else
+				sb_add(out, defs.p, defs.n);
+			sb_puts(out, "<|im_end|>\n");
+			sb_free(&defs);
+		}
+		for (; m; pv = m, m = m->next) {
 			const char *r = role_of(m);
 			const jv *cv = json_get(m, "content");
 			c.n = 0;
@@ -873,7 +1230,7 @@ apply_template(const jv *body, sbuf *out, int *think, const char **err)
 				sb_add(out, c.p, c.n);
 				sb_puts(out, "<|im_end|>\n");
 			} else if (!strcmp(r, "assistant")) {
-				const jv *rv = json_get(m, "reasoning_content");
+				const jv *rv = json_get(m, "reasoning_content"), *calls;
 				sbuf rs = { 0 }, ct = { 0 };
 				const char *e = c.n ? strstr(c.p, "</think>") : NULL;
 				if (rv && rv->t == J_STR) {
@@ -905,6 +1262,9 @@ apply_template(const jv *body, sbuf *out, int *think, const char **err)
 					sb_add(&ct, c.p, c.n);
 				if (!ct.p)
 					sb_add(&ct, "", 0);
+				calls = json_get(m, "tool_calls");
+				if (calls && (calls->t != J_ARR || !calls->kid))
+					calls = NULL;
 				if (rs.n) {
 					sb_puts(out, "<|im_start|>assistant\n<think>\n");
 					{
@@ -927,6 +1287,8 @@ apply_template(const jv *body, sbuf *out, int *think, const char **err)
 					sb_puts(out, "<|im_start|>assistant\n");
 					sb_add(out, ct.p, ct.n);
 				}
+				if (calls)
+					minicpm_calls(out, calls, ct.n > 0);
 				sb_puts(out, "<|im_end|>\n");
 				sb_free(&rs);
 				sb_free(&ct);
