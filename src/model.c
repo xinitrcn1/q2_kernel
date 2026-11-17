@@ -368,12 +368,16 @@ state_free(state *s, const model *m)
 		free(s->ssm[i]);
 		free(s->kc[i]);
 		free(s->vc[i]);
+		if (s->kh) {
+			free(s->kh[i]);
+			free(s->vh[i]);
+		}
 		if (s->ssm_bak)
 			free(s->ssm_bak[i]);
 		if (s->conv_bak)
 			free(s->conv_bak[i]);
 	}
-	free(s->conv); free(s->ssm); free(s->kc); free(s->vc); free(s->ssm_bak); free(s->conv_bak);
+	free(s->conv); free(s->ssm); free(s->kc); free(s->vc); free(s->kh); free(s->vh); free(s->ssm_bak); free(s->conv_bak);
 	free(s->hl); free(s->hnew); free(s->cat); free(s->lgd); free(s->lg2); free(s->h2); free(s->hch);
 	free(s->x); free(s->xn); free(s->tmp); free(s->zxbcdt); free(s->xbc);
 	free(s->y); free(s->q); free(s->k); free(s->v); free(s->att); free(s->ao);

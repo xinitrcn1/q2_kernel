@@ -87,6 +87,7 @@ typedef struct {
 	float **conv;           /* per layer [d_conv-1][conv_ch] */
 	float **ssm;            /* per layer [heads][head_dim][d_state] */
 	float **kc, **vc;       /* per layer [ctx][n_head_kv*head_dim] */
+	uint16_t **kh, **vh;    /* the same in f16 (qwen35/llama: kc, vc unused) */
 	float *q, *k, *v, *att, *ao;
 	float *rl;              /* router logits */
 	float *hs_g, *hs_u, *he_g, *he_u, *eo, *so;

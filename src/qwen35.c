@@ -288,10 +288,12 @@ qwen35_state_init(state *s, const model *m, int ctx)
 	s->ssm = calloc((size_t)h->n_layer + 1, sizeof(float *));
 	s->kc = calloc((size_t)h->n_layer + 1, sizeof(float *));
 	s->vc = calloc((size_t)h->n_layer + 1, sizeof(float *));
+	s->kh = calloc((size_t)h->n_layer + 1, sizeof(uint16_t *));
+	s->vh = calloc((size_t)h->n_layer + 1, sizeof(uint16_t *));
 	s->ssm_bak = calloc((size_t)h->n_layer + 1, sizeof(float *));
 	s->conv_bak = calloc((size_t)h->n_layer + 1, sizeof(float *));
-	if (!s->conv || !s->ssm || !s->kc || !s->vc || !s->logits || !s->att || !s->ssm_bak ||
-	    !s->conv_bak)
+	if (!s->conv || !s->ssm || !s->kc || !s->vc || !s->kh || !s->vh || !s->logits || !s->att ||
+	    !s->ssm_bak || !s->conv_bak)
 		return -1;
 	if (m->mtp) {
 		s->hl = model_falloc((size_t)h->n_embd);
@@ -301,17 +303,17 @@ qwen35_state_init(state *s, const model *m, int ctx)
 		s->lg2 = model_falloc((size_t)(MTP_KMAX + 1) * (size_t)h->n_vocab);
 		s->h2 = model_falloc((size_t)(MTP_KMAX + 1) * (size_t)h->n_embd);
 		s->hch = model_falloc((size_t)h->n_embd);
-		s->kc[h->n_layer] = model_falloc((size_t)ctx * kvd);
-		s->vc[h->n_layer] = model_falloc((size_t)ctx * kvd);
+		s->kh[h->n_layer] = (uint16_t *)model_falloc(((size_t)ctx * kvd + 1) / 2);
+		s->vh[h->n_layer] = (uint16_t *)model_falloc(((size_t)ctx * kvd + 1) / 2);
 		if (!s->hl || !s->hnew || !s->cat || !s->lgd || !s->lg2 || !s->h2 || !s->hch ||
-		    !s->kc[h->n_layer] || !s->vc[h->n_layer])
+		    !s->kh[h->n_layer] || !s->vh[h->n_layer])
 			return -1;
 	}
 	for (i = 0; i < h->n_layer; i++) {
 		if (m->L[i].attn) {
-			s->kc[i] = model_falloc((size_t)ctx * kvd);
-			s->vc[i] = model_falloc((size_t)ctx * kvd);
-			if (!s->kc[i] || !s->vc[i])
+			s->kh[i] = (uint16_t *)model_falloc(((size_t)ctx * kvd + 1) / 2);
+			s->vh[i] = (uint16_t *)model_falloc(((size_t)ctx * kvd + 1) / 2);
+			if (!s->kh[i] || !s->vh[i])
 				return -1;
 		} else {
 			s->conv[i] = model_falloc((size_t)(h->d_conv - 1) * (size_t)h->dn_qkv);
@@ -563,7 +565,7 @@ at_worker(void *arg, int ith, int nth)
 	const hparams *h = &j->m->hp;
 	const int hd = h->head_dim, kvd = h->n_head_kv * hd, grp = h->n_head / h->n_head_kv;
 	const int qs = h->q_gate ? 2 * hd : hd;
-	const float *kc = j->s->kc[j->il], *vc = j->s->vc[j->il];
+	const uint16_t *kc = j->s->kh[j->il], *vc = j->s->vh[j->il];
 	float sc[AT_GRP][AT_CH];
 	long w;
 
@@ -575,10 +577,11 @@ at_worker(void *arg, int ith, int nth)
 		float *pp = j->part + (size_t)w * (size_t)grp * (size_t)(hd + 2);
 		int t, hh;
 		for (t = t0; t < t1; t++) {
-			const float *k = kc + (size_t)t * kvd + g * hd;
+			float dd[AT_GRP];
+			v_dotn(dd, j->s->q + (size_t)g * grp * qs, (size_t)qs, grp,
+			    kc + (size_t)t * kvd + g * hd, (size_t)hd);
 			for (hh = 0; hh < grp; hh++)
-				sc[hh][t - t0] = v_dot(j->s->q + (size_t)(g * grp + hh) * qs, k, (size_t)hd) *
-				    h->attn_scale;
+				sc[hh][t - t0] = dd[hh] * h->attn_scale;
 		}
 		for (hh = 0; hh < grp; hh++) {
 			float *a = sc[hh], mx = -INFINITY, sum = 0, *o = pp + (size_t)hh * (hd + 2) + 2;
@@ -594,11 +597,8 @@ at_worker(void *arg, int ith, int nth)
 			pp[(size_t)hh * (hd + 2) + 1] = sum;
 			memset(o, 0, sizeof(float) * (size_t)hd);
 		}
-		for (t = t0; t < t1; t++) {
-			const float *v = vc + (size_t)t * kvd + g * hd;
-			for (hh = 0; hh < grp; hh++)
-				v_axpy(pp + (size_t)hh * (hd + 2) + 2, sc[hh][t - t0], v, (size_t)hd);
-		}
+		v_wsumn(pp + 2, (size_t)(hd + 2), sc[0], AT_CH, grp, vc + (size_t)t0 * kvd + g * hd,
+		    (size_t)kvd, nt, (size_t)hd);
 	}
 }
 
@@ -638,7 +638,7 @@ attention(const model *m, const layer *L, state *s, int il)
 {
 	const hparams *h = &m->hp;
 	const int hd = h->head_dim, kvd = h->n_head_kv * hd;
-	float *kd = s->kc[il] + (size_t)s->pos * kvd, *vd = s->vc[il] + (size_t)s->pos * kvd;
+	float *kd = s->k, *vd = s->v;
 	mv_item it[3];
 	at_job aj;
 	int i;
@@ -658,6 +658,8 @@ attention(const model *m, const layer *L, state *s, int il)
 			v_rmsnorm(kd + i * hd, kd + i * hd, L->k_norm, (size_t)hd, h->eps);
 		rope(kd + i * hd, h->rope_dim, s->pos, h->rope_base, h->rope_norm);
 	}
+	v_to_f16(s->kh[il] + (size_t)s->pos * kvd, kd, (size_t)kvd);
+	v_to_f16(s->vh[il] + (size_t)s->pos * kvd, vd, (size_t)kvd);
 	aj.m = m;
 	aj.s = s;
 	aj.il = il;
@@ -822,6 +824,7 @@ qwen35_forward(const model *m, state *s, int tok, int want_logits)
 static struct {
 	int ok;
 	float *x, *xn, *qkv, *z, *beta, *alpha, *y, *tmp, *fg, *fu, *q, *ao;
+	float *kf, *vf;         /* the chunk's K and V rows before f16 */
 	float *h, *cat;         /* output-normed hiddens; MTP input pairs */
 	q8k *xq, *yq, *fq, *cq;
 	int ckpt;               /* verify: checkpoint the recurrent state after token 0 */
@@ -840,6 +843,7 @@ pbufs(const hparams *h)
 	A(P.y, T * (size_t)(h->d_inner > h->n_head * h->head_dim ? h->d_inner : h->n_head * h->head_dim));
 	A(P.fg, T * (size_t)h->n_ff); A(P.fu, T * (size_t)h->n_ff);
 	A(P.q, T * (size_t)((h->q_gate ? 2 : 1) * h->n_head * h->head_dim)); A(P.ao, T * (size_t)(h->n_head * h->head_dim));
+	A(P.kf, T * (size_t)(h->n_head_kv * h->head_dim)); A(P.vf, T * (size_t)(h->n_head_kv * h->head_dim));
 	A(P.xq, T * E / 256); A(P.yq, T * (size_t)(h->d_inner > h->n_head * h->head_dim ?
 	    h->d_inner : h->n_head * h->head_dim) / 256);
 	A(P.fq, T * (size_t)h->n_ff / 256);
@@ -989,8 +993,14 @@ typedef struct {
 	long next;
 } paj;
 
-/* work items are (token, KV head): the K and V rows are read once for
- * all the query heads of the group */
+/* work items are (tile of PA_TQ tokens, KV head), with an online softmax
+ * over blocks of PA_KB keys: each K and V row is read once per tile for
+ * all its tokens and all the query heads of the group (per token it was
+ * once per token, so deep prompts streamed the whole KV from DRAM for
+ * every token) */
+#define PA_TQ 16
+#define PA_KB 64
+
 static void
 patt(void *arg, int ith, int nth)
 {
@@ -998,52 +1008,94 @@ patt(void *arg, int ith, int nth)
 	const hparams *h = &j->m->hp;
 	const int hd = h->head_dim, kvd = h->n_head_kv * hd, grp = h->n_head / h->n_head_kv;
 	const int qs = h->q_gate ? 2 * hd : hd;
-	const float *kc = j->s->kc[j->il], *vc = j->s->vc[j->il];
-	const size_t na = (size_t)(j->pos + j->T);
-	float *a = malloc(sizeof(float) * na * (size_t)grp);
+	const uint16_t *kc = j->s->kh[j->il], *vc = j->s->vh[j->il];
+	const int ntile = (j->T + PA_TQ - 1) / PA_TQ, R = PA_TQ * grp;
+	float *sc = malloc(sizeof(float) * (size_t)R * PA_KB);
+	float *mx = malloc(sizeof(float) * (size_t)R), *l = malloc(sizeof(float) * (size_t)R);
+	int *lim = malloc(sizeof(int) * (size_t)R);
 	long w;
 	(void)ith;
 	(void)nth;
-	if (!a)
-		return;
-	while ((w = pool_take(&j->next, 1, (long)j->T * h->n_head_kv)) >= 0) {
-		const int t = (int)(w / h->n_head_kv), g = (int)(w % h->n_head_kv), n = j->pos + t + 1;
-		const float *q0 = P.q + (size_t)t * h->n_head * qs + (size_t)g * grp * qs;
-		float *o0 = P.ao + (size_t)t * h->n_head * hd + (size_t)g * grp * hd;
-		int k, hh, d;
-		for (k = 0; k < n; k++) {
-			const float *kr = kc + (size_t)k * kvd + g * hd;
-			for (hh = 0; hh < grp; hh++)
-				a[(size_t)hh * na + k] = v_dot(q0 + (size_t)hh * qs, kr, (size_t)hd) * h->attn_scale;
+	if (!sc || !mx || !l || !lim)
+		goto out;
+	while ((w = pool_take(&j->next, 1, (long)ntile * h->n_head_kv)) >= 0) {
+		const int tile = (int)(w / h->n_head_kv), g = (int)(w % h->n_head_kv);
+		const int t0 = tile * PA_TQ, t1 = t0 + PA_TQ < j->T ? t0 + PA_TQ : j->T;
+		const int nr = (t1 - t0) * grp, kend = j->pos + t1;
+		int r, k0, kk, d;
+#define QROW(r) (P.q + (size_t)(t0 + (r) / grp) * h->n_head * qs + (size_t)(g * grp + (r) % grp) * qs)
+#define OROW(r) (P.ao + (size_t)(t0 + (r) / grp) * h->n_head * hd + (size_t)(g * grp + (r) % grp) * hd)
+		for (r = 0; r < nr; r++) {
+			mx[r] = -INFINITY;
+			l[r] = 0;
+			memset(OROW(r), 0, sizeof(float) * (size_t)hd);
 		}
-		for (hh = 0; hh < grp; hh++) {
-			float *ah = a + (size_t)hh * na, mx = -INFINITY, sum = 0, r;
-			for (k = 0; k < n; k++)
-				if (ah[k] > mx)
-					mx = ah[k];
-			for (k = 0; k < n; k++)
-				ah[k] -= mx;
-			v_exp(ah, ah, (size_t)n);
-			for (k = 0; k < n; k++)
-				sum += ah[k];
-			r = 1.0f / sum;
-			for (k = 0; k < n; k++)
-				ah[k] *= r;
-			memset(o0 + (size_t)hh * hd, 0, sizeof(float) * (size_t)hd);
+		for (k0 = 0; k0 < kend; k0 += PA_KB) {
+			const int kn = kend - k0 < PA_KB ? kend - k0 : PA_KB;
+			/* row r (token t0 + r / grp) sees keys [0, pos + t + 1) */
+			for (r = 0; r < nr; r++) {
+				int n = j->pos + t0 + r / grp + 1 - k0;
+				lim[r] = n < 0 ? 0 : n > kn ? kn : n;
+			}
+			for (kk = 0; kk < kn; kk++) {
+				const uint16_t *kr = kc + (size_t)(k0 + kk) * kvd + g * hd;
+				float dd[AT_GRP];
+				int hh;
+				/* a token's grp rows share lim */
+				for (r = 0; r < nr; r += grp) {
+					if (kk >= lim[r])
+						continue;
+					v_dotn(dd, QROW(r), (size_t)qs, grp, kr, (size_t)hd);
+					for (hh = 0; hh < grp; hh++)
+						sc[(size_t)(r + hh) * PA_KB + kk] = dd[hh] * h->attn_scale;
+				}
+			}
+			for (r = 0; r < nr; r++) {
+				float *a = sc + (size_t)r * PA_KB, bm = mx[r], f, sum = 0;
+				const int n = lim[r];
+				if (!n)
+					continue;
+				for (kk = 0; kk < n; kk++)
+					if (a[kk] > bm)
+						bm = a[kk];
+				for (kk = 0; kk < n; kk++)
+					a[kk] -= bm;
+				v_exp(a, a, (size_t)n);
+				for (kk = 0; kk < n; kk++)
+					sum += a[kk];
+				if (bm != mx[r]) {
+					float *o = OROW(r);
+					f = expf(mx[r] - bm);   /* 0 on the first block */
+					l[r] *= f;
+					for (d = 0; d < hd; d++)
+						o[d] *= f;
+					mx[r] = bm;
+				}
+				l[r] += sum;
+			}
+			for (r = 0; r < nr; r += grp)
+				if (lim[r])
+					v_wsumn(OROW(r), (size_t)hd, sc + (size_t)r * PA_KB, PA_KB, grp,
+					    vc + (size_t)k0 * kvd + g * hd, (size_t)kvd, lim[r], (size_t)hd);
 		}
-		for (k = 0; k < n; k++) {
-			const float *vr = vc + (size_t)k * kvd + g * hd;
-			for (hh = 0; hh < grp; hh++)
-				v_axpy(o0 + (size_t)hh * hd, a[(size_t)hh * na + k], vr, (size_t)hd);
-		}
-		for (hh = 0; h->q_gate && hh < grp; hh++) {
-			const float *gate = q0 + (size_t)hh * qs + hd;
-			float *o = o0 + (size_t)hh * hd;
+		for (r = 0; r < nr; r++) {
+			float *o = OROW(r), inv = 1.0f / l[r];
 			for (d = 0; d < hd; d++)
-				o[d] *= sigmoidf(gate[d]);
+				o[d] *= inv;
+			if (h->q_gate) {
+				const float *gate = QROW(r) + hd;
+				for (d = 0; d < hd; d++)
+					o[d] *= sigmoidf(gate[d]);
+			}
 		}
+#undef QROW
+#undef OROW
 	}
-	free(a);
+out:
+	free(sc);
+	free(mx);
+	free(l);
+	free(lim);
 }
 
 static void
@@ -1053,7 +1105,7 @@ pattention(const model *m, const layer *L, state *s, int il, int T)
 	const int E = h->n_embd, hd = h->head_dim, kvd = h->n_head_kv * hd;
 	const int QD = (h->q_gate ? 2 : 1) * h->n_head * hd;
 	const int AD = h->n_head * hd;
-	float *kd = s->kc[il] + (size_t)s->pos * kvd, *vd = s->vc[il] + (size_t)s->pos * kvd;
+	float *kd = P.kf, *vd = P.vf;
 	mm_item it[3];
 	paj j;
 	int t, i;
@@ -1076,6 +1128,8 @@ pattention(const model *m, const layer *L, state *s, int il, int T)
 			rope(k, h->rope_dim, s->pos + t, h->rope_base, h->rope_norm);
 		}
 	}
+	v_to_f16(s->kh[il] + (size_t)s->pos * kvd, kd, (size_t)T * kvd);
+	v_to_f16(s->vh[il] + (size_t)s->pos * kvd, vd, (size_t)T * kvd);
 	j.m = m;
 	j.s = s;
 	j.il = il;

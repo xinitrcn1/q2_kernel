@@ -163,6 +163,121 @@ v_axpy(float *y, float a, const float *x, size_t n)
 }
 
 void
+v_to_f16(uint16_t *d, const float *s, size_t n)
+{
+	size_t i = 0;
+	for (; i + 8 <= n; i += 8)
+		_mm_storeu_si128((__m128i *)(d + i),
+		    _mm256_cvtps_ph(_mm256_loadu_ps(s + i), _MM_FROUND_TO_NEAREST_INT));
+	for (; i < n; i++)
+		d[i] = _cvtss_sh(s[i], _MM_FROUND_TO_NEAREST_INT);
+}
+
+static void
+f16_row(float *d, const uint16_t *s, size_t n)
+{
+	size_t i = 0;
+	for (; i + 8 <= n; i += 8)
+		_mm256_storeu_ps(d + i, _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(s + i))));
+	for (; i < n; i++)
+		d[i] = _cvtsh_ss(s[i]);
+}
+
+#define LDH(p) _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(p)))
+
+/* out[h] = dot(q + h*qs, k) for h < nq, k f16: k is loaded once for all
+ * the heads; 8 heads reduce together (one hadd tree, no per-dot hsum) */
+void
+v_dotn(float *out, const float *q, size_t qs, int nq, const uint16_t *k, size_t n)
+{
+	size_t i;
+	int h;
+	if (nq != 8 || n % 8 || n > 1024) {
+		float kf[1024];
+		size_t c;
+		for (c = 0; c < n; c += 1024) {
+			size_t m = n - c < 1024 ? n - c : 1024;
+			f16_row(kf, k + c, m);
+			for (h = 0; h < nq; h++)
+				out[h] = (c ? out[h] : 0) + v_dot(q + (size_t)h * qs + c, kf, m);
+		}
+		return;
+	}
+	{
+		__m256 a0 = _mm256_setzero_ps(), a1 = a0, a2 = a0, a3 = a0;
+		__m256 a4 = a0, a5 = a0, a6 = a0, a7 = a0, t0, t1, t2, t3;
+		for (i = 0; i < n; i += 8) {
+			const __m256 kv = LDH(k + i);
+			a0 = _mm256_fmadd_ps(_mm256_loadu_ps(q + i), kv, a0);
+			a1 = _mm256_fmadd_ps(_mm256_loadu_ps(q + qs + i), kv, a1);
+			a2 = _mm256_fmadd_ps(_mm256_loadu_ps(q + 2 * qs + i), kv, a2);
+			a3 = _mm256_fmadd_ps(_mm256_loadu_ps(q + 3 * qs + i), kv, a3);
+			a4 = _mm256_fmadd_ps(_mm256_loadu_ps(q + 4 * qs + i), kv, a4);
+			a5 = _mm256_fmadd_ps(_mm256_loadu_ps(q + 5 * qs + i), kv, a5);
+			a6 = _mm256_fmadd_ps(_mm256_loadu_ps(q + 6 * qs + i), kv, a6);
+			a7 = _mm256_fmadd_ps(_mm256_loadu_ps(q + 7 * qs + i), kv, a7);
+		}
+		t0 = _mm256_hadd_ps(a0, a1);
+		t1 = _mm256_hadd_ps(a2, a3);
+		t2 = _mm256_hadd_ps(a4, a5);
+		t3 = _mm256_hadd_ps(a6, a7);
+		t0 = _mm256_hadd_ps(t0, t1);    /* lanes: h0..h3 | h0..h3 */
+		t2 = _mm256_hadd_ps(t2, t3);    /* lanes: h4..h7 | h4..h7 */
+		_mm256_storeu_ps(out, _mm256_add_ps(_mm256_permute2f128_ps(t0, t2, 0x20),
+		    _mm256_permute2f128_ps(t0, t2, 0x31)));
+	}
+}
+
+/* o + h*os += sum_t w[h*ws + t] * v[t*vs] for h < nq, t < nt (f16 rows
+ * of n): per block of 8 columns the nq outputs stay in registers over
+ * all the rows */
+void
+v_wsumn(float *o, size_t os, const float *w, size_t ws, int nq, const uint16_t *v, size_t vs,
+    int nt, size_t n)
+{
+	size_t d;
+	int t, h;
+	if (nq != 8 || n % 8 || n > 1024) {
+		float vf[1024];
+		size_t c;
+		for (t = 0; t < nt; t++)
+			for (c = 0; c < n; c += 1024) {
+				size_t m = n - c < 1024 ? n - c : 1024;
+				f16_row(vf, v + (size_t)t * vs + c, m);
+				for (h = 0; h < nq; h++)
+					v_axpy(o + (size_t)h * os + c, w[(size_t)h * ws + t], vf, m);
+			}
+		return;
+	}
+	for (d = 0; d < n; d += 8) {
+		__m256 a0 = _mm256_loadu_ps(o + d), a1 = _mm256_loadu_ps(o + os + d);
+		__m256 a2 = _mm256_loadu_ps(o + 2 * os + d), a3 = _mm256_loadu_ps(o + 3 * os + d);
+		__m256 a4 = _mm256_loadu_ps(o + 4 * os + d), a5 = _mm256_loadu_ps(o + 5 * os + d);
+		__m256 a6 = _mm256_loadu_ps(o + 6 * os + d), a7 = _mm256_loadu_ps(o + 7 * os + d);
+		const uint16_t *vp = v + d;
+		for (t = 0; t < nt; t++, vp += vs) {
+			const __m256 vv = LDH(vp);
+			a0 = _mm256_fmadd_ps(_mm256_broadcast_ss(w + t), vv, a0);
+			a1 = _mm256_fmadd_ps(_mm256_broadcast_ss(w + ws + t), vv, a1);
+			a2 = _mm256_fmadd_ps(_mm256_broadcast_ss(w + 2 * ws + t), vv, a2);
+			a3 = _mm256_fmadd_ps(_mm256_broadcast_ss(w + 3 * ws + t), vv, a3);
+			a4 = _mm256_fmadd_ps(_mm256_broadcast_ss(w + 4 * ws + t), vv, a4);
+			a5 = _mm256_fmadd_ps(_mm256_broadcast_ss(w + 5 * ws + t), vv, a5);
+			a6 = _mm256_fmadd_ps(_mm256_broadcast_ss(w + 6 * ws + t), vv, a6);
+			a7 = _mm256_fmadd_ps(_mm256_broadcast_ss(w + 7 * ws + t), vv, a7);
+		}
+		_mm256_storeu_ps(o + d, a0);
+		_mm256_storeu_ps(o + os + d, a1);
+		_mm256_storeu_ps(o + 2 * os + d, a2);
+		_mm256_storeu_ps(o + 3 * os + d, a3);
+		_mm256_storeu_ps(o + 4 * os + d, a4);
+		_mm256_storeu_ps(o + 5 * os + d, a5);
+		_mm256_storeu_ps(o + 6 * os + d, a6);
+		_mm256_storeu_ps(o + 7 * os + d, a7);
+	}
+}
+
+void
 v_copy_nt(float *dst, const float *src, size_t n)
 {
 	size_t i;
