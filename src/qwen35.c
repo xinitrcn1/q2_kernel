@@ -466,24 +466,70 @@ delta_net(const model *m, const layer *L, state *s, int il)
 /* ---------------------------------------------------------------- */
 /* gated attention                                                   */
 
+/* cos/sin of pos * base^(-2i/rd) per position, filled on first use:
+ * every head of every layer (and the MTP layer) at a position shares a
+ * row, so a token costs rd/2 sincos instead of rd/2 per head and layer.
+ * The entries are the same expressions as before, so bit-identical. */
+static struct {
+	float base;
+	int rd, n, cap;
+	float *invf, *cs;       /* cs[pos * rd + 2i] = cos, + 1 = sin */
+} RT;
+
+static const float *
+rope_row(int pos, int rd, float base)
+{
+	int i, half = rd / 2;
+	if (RT.rd != rd || RT.base != base) {
+		free(RT.invf);
+		RT.invf = malloc(sizeof(float) * (size_t)half);
+		for (i = 0; RT.invf && i < half; i++)
+			RT.invf[i] = powf(base, -2.0f * (float)i / (float)rd);
+		RT.rd = rd;
+		RT.base = base;
+		RT.n = 0;
+	}
+	if (pos >= RT.cap) {
+		int cap = RT.cap ? RT.cap : 1024;
+		float *p;
+		while (cap <= pos)
+			cap *= 2;
+		p = realloc(RT.cs, sizeof(float) * (size_t)cap * (size_t)rd);
+		if (!p || !RT.invf) {
+			fprintf(stderr, "q2k: out of memory (rope table)\n");
+			exit(1);
+		}
+		RT.cs = p;
+		RT.cap = cap;
+	}
+	for (; RT.n <= pos; RT.n++) {
+		float *r = RT.cs + (size_t)RT.n * (size_t)rd;
+		for (i = 0; i < half; i++) {
+			float th = (float)RT.n * RT.invf[i];
+			r[2 * i] = cosf(th);
+			r[2 * i + 1] = sinf(th);
+		}
+	}
+	return RT.cs + (size_t)pos * (size_t)rd;
+}
+
 /* RoPE on the first rd dims: NeoX pairs (i, i + rd/2), or with norm
  * (llama) adjacent pairs (2i, 2i + 1) */
 static void
 rope(float *x, int rd, int pos, float base, int norm)
 {
+	const float *cs = rope_row(pos, rd, base);
 	int i, half = rd / 2;
 	if (norm) {
 		for (i = 0; i < half; i++) {
-			float th = (float)pos * powf(base, -2.0f * (float)i / (float)rd);
-			float c = cosf(th), sn = sinf(th), a = x[2 * i], b = x[2 * i + 1];
+			float c = cs[2 * i], sn = cs[2 * i + 1], a = x[2 * i], b = x[2 * i + 1];
 			x[2 * i] = a * c - b * sn;
 			x[2 * i + 1] = a * sn + b * c;
 		}
 		return;
 	}
 	for (i = 0; i < half; i++) {
-		float th = (float)pos * powf(base, -2.0f * (float)i / (float)rd);
-		float c = cosf(th), sn = sinf(th), a = x[i], b = x[i + half];
+		float c = cs[2 * i], sn = cs[2 * i + 1], a = x[i], b = x[i + half];
 		x[i] = a * c - b * sn;
 		x[i + half] = a * sn + b * c;
 	}
