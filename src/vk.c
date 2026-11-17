@@ -569,6 +569,10 @@ vk_shutdown(void)
 static size_t
 gpu_block_bytes(uint32_t t)
 {
+	/* Q8_0 is repacked per 8 blocks (d[8] then qs[256], 272 B): no
+	 * padding, the 256-group is 4-byte aligned */
+	if (t == GT_Q8_0)
+		return 34;
 	return (ggml_type_bytes(t) + 3) & ~(size_t)3;
 }
 
@@ -598,19 +602,25 @@ repack(uint32_t t, const uint8_t *src, uint8_t *dst, size_t n)
 		}
 		return;
 	}
+	if (t == GT_Q8_0) {
+		/* per 8 blocks (rows are whole 256-groups, so n % 8 == 0):
+		 * the 8 scales, then the 8 x 32 quants (shaders' BW 68) */
+		for (i = 0; i < n; i += 8, src += 8 * sb, dst += 8 * db) {
+			size_t j;
+			for (j = 0; j < 8; j++) {
+				memcpy(dst + 2 * j, src + sb * j, 2);
+				memcpy(dst + 16 + 32 * j, src + sb * j + 2, 32);
+			}
+		}
+		return;
+	}
 	if (sb == db) {
 		memcpy(dst, src, n * sb);
 		return;
 	}
 	for (i = 0; i < n; i++, src += sb, dst += db) {
-		if (t == GT_Q8_0) {
-			memcpy(dst, src + 2, 32);    /* qs first */
-			memcpy(dst + 32, src, 2);    /* then d */
-			dst[34] = dst[35] = 0;
-		} else {
-			memcpy(dst, src, sb);
-			memset(dst + sb, 0, db - sb);
-		}
+		memcpy(dst, src, sb);
+		memset(dst + sb, 0, db - sb);
 	}
 }
 
@@ -1136,25 +1146,11 @@ seq_matmul(const wt *w, int e, uint32_t r0, uint32_t n, uint32_t kel, uint32_t x
 	pc.y_stride = ys;
 	/* big single-token matrices: 4 rows per subgroup amortize staging */
 	pc.rps = T == 1 ? 4 : 1;
-	if (T > 1 && w->type != GT_Q8_0) {
+	if (T > 1) {
 		/* tiled GEMM: 32 rows x 32 tokens per workgroup */
 		seq_pipe(PIPE_MM + w->type);
 		vkCmdPushConstants(V.cb, V.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
 		vkCmdDispatch(V.cb, (n + 31) / 32, (T + 31) / 32, 1);
-		return;
-	}
-	if (T > 1) {
-		/* Q8_0 has no GEMM variant: one matvec per token */
-		uint32_t t;
-		pc.T = 1;
-		pc.rps = 4;
-		seq_pipe(w->type);
-		for (t = 0; t < T; t++) {
-			pc.x_off = xq + t * xs;
-			pc.y_off = y + t * ys;
-			vkCmdPushConstants(V.cb, V.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-			vkCmdDispatch(V.cb, (n + V.sg_per_wg * 4 - 1) / (V.sg_per_wg * 4), 1, 1);
-		}
 		return;
 	}
 	per = V.sg_per_wg * pc.rps;
@@ -1299,7 +1295,7 @@ vk_mm_begin(void)
 int
 vk_can_stream(uint32_t type)
 {
-	return V.ok && V.scap_w && V.pipe[type] && V.pipe[PIPE_MM + type] && type != GT_Q8_0;
+	return V.ok && V.scap_w && V.pipe[type] && V.pipe[PIPE_MM + type];
 }
 
 /* rows [r0, r1) of w (expert 0), copied to the GPU for this batch only,

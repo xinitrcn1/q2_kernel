@@ -12,6 +12,7 @@
  *   Q4_K 144 B: d dmin sc[12] qs[128]
  *   Q5_K 176 B: d dmin sc[12] qh[32] qs[128]
  *   Q6_K 212 B: ql[128] qh[64] sc[16] d pad
+ *   Q8_0 272 B per 8 blocks: d[8] qs[256]
  */
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
@@ -172,15 +173,16 @@ void dec(uint bw, uint l, out grp g)
 	g.D = d;
 	g.M = d;
 }
-#elif QT == 8 /* Q8_0: w = d*q (signed) */
-#define BW 72u
+#elif QT == 8 /* Q8_0: w = d*q (signed), d per 32 (D below) */
+#define BW 68u
 #define BE 256u
 void dec(uint bw, uint l, out grp g)
 {
-	uint qb = bw + 9u * (l >> 1), base = 4u * (l & 1u);
-	float d = unpackHalf2x16(W[qb + 8u]).x;
+	uint qb = bw + 4u + 4u * l, j = l >> 1;
+	vec2 d2 = unpackHalf2x16(W[bw + (j >> 1)]);
+	float d = (j & 1u) != 0u ? d2.y : d2.x;
 	[[unroll]] for (uint k = 0u; k < 4u; k++) {
-		g.q[k] = W[qb + base + k];
+		g.q[k] = W[qb + k];
 		g.o[k] = 16u * l + 4u * k;
 		g.sa[k] = 1;
 		g.sb[k] = 0;
@@ -202,7 +204,9 @@ void dec(uint bw, uint l, out grp g)
  * thread then accumulates a 2x2 micro-tile with DP4A.  The B term uses
  * the activations' 16-group sums (bsums), not a dot with ones:
  *   y = sum_blocks xd * (D * sum_g sa_g dot(u_g, x_g) + M * sum_g sb_g bsum_g)
- * (Q8_0 has one d per 32 and no B term: not built for MMQ.)
+ * Q8_0 has a float d per 32 and no B term: the tile keeps sDq (8 per
+ * row) in place of the integer scales, and each 32-group's dots are
+ * converted and scaled by its d; x's scale goes on once per 256.
  */
 #define TR 32u
 #define TK 32u
@@ -215,6 +219,11 @@ void dec(uint bw, uint l, out grp g)
 shared uint su[TR * SUW];
 shared int ssa[TR * SS], ssb[TR * SS];
 shared float sD[TR], sM[TR];
+#if QT == 8
+/* rows of 8: the inner loop's rows mr, mr + 1 (mr even, 2 per warp)
+ * and the decode's 16 consecutive writes are conflict-free (ucas banks) */
+shared float sDq[TR * 8u];
+#endif
 shared uint sx[TK * 73u];
 
 void main()
@@ -234,9 +243,15 @@ void main()
 				dec(pc.w_off + row * pc.row_words + b * BW, u, g);
 				[[unroll]] for (uint j = 0u; j < 4u; j++) {
 					su[rl * SUW + (g.o[j] >> 2)] = g.q[j];
+#if QT != 8
 					ssa[rl * SS + (g.o[j] >> 4)] = g.sa[j];
 					ssb[rl * SS + (g.o[j] >> 4)] = g.sb[j];
+#endif
 				}
+#if QT == 8
+				if ((u & 1u) == 0u)
+					sDq[rl * 8u + (u >> 1)] = g.D;
+#endif
 				if (u == 0u) {
 					sD[rl] = g.D;
 					sM[rl] = g.M;
@@ -248,6 +263,10 @@ void main()
 					su[rl * SUW + i] = 0u;
 				for (uint i = 0u; i < 16u; i++)
 					ssa[rl * SS + i] = ssb[rl * SS + i] = 0;
+#if QT == 8
+				for (uint i = 0u; i < 8u; i++)
+					sDq[rl * 8u + i] = 0.0;
+#endif
 			}
 		}
 		/* the tokens' q8k blocks (zero past the end) */
@@ -257,6 +276,28 @@ void main()
 		}
 		barrier();
 
+#if QT == 8
+		float f[4] = float[4](0.0, 0.0, 0.0, 0.0);
+		for (uint sq = 0u; sq < 8u; sq++) {
+			int d00 = 0, d01 = 0, d10 = 0, d11 = 0;
+			[[unroll]] for (uint w = 0u; w < 8u; w++) {
+				uint u0 = su[mr * SUW + 8u * sq + w], u1 = su[(mr + 1u) * SUW + 8u * sq + w];
+				uint x0 = sx[mt * 73u + 1u + 8u * sq + w], x1 = sx[(mt + 1u) * 73u + 1u + 8u * sq + w];
+				d00 += idot(u0, x0);
+				d01 += idot(u0, x1);
+				d10 += idot(u1, x0);
+				d11 += idot(u1, x1);
+			}
+			float D0 = sDq[mr * 8u + sq], D1 = sDq[(mr + 1u) * 8u + sq];
+			f[0] += D0 * float(d00); f[1] += D0 * float(d01);
+			f[2] += D1 * float(d10); f[3] += D1 * float(d11);
+		}
+		{
+			float xd0 = uintBitsToFloat(sx[mt * 73u]), xd1 = uintBitsToFloat(sx[(mt + 1u) * 73u]);
+			acc[0] += xd0 * f[0]; acc[1] += xd1 * f[1];
+			acc[2] += xd0 * f[2]; acc[3] += xd1 * f[3];
+		}
+#else
 		int ia[4] = int[4](0, 0, 0, 0), ib[4] = int[4](0, 0, 0, 0);
 		for (uint gq = 0u; gq < 16u; gq++) {
 			int sa0 = ssa[mr * SS + gq], sa1 = ssa[(mr + 1u) * SS + gq];
@@ -284,6 +325,7 @@ void main()
 			acc[2] += xd0 * (D1 * float(ia[2]) + M1 * float(ib[2]));
 			acc[3] += xd1 * (D1 * float(ia[3]) + M1 * float(ib[3]));
 		}
+#endif
 		barrier();
 	}
 	[[unroll]] for (uint q = 0u; q < 4u; q++) {

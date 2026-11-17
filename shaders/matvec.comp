@@ -16,7 +16,7 @@
  *   Q4_K 144 B: d dmin sc[12] qs[128]
  *   Q5_K 176 B: d dmin sc[12] qh[32] qs[128]
  *   Q6_K 212 B: ql[128] qh[64] sc[16] d pad
- *   Q8_0  36 B: qs[32] d pad          (8 blocks per 256)
+ *   Q8_0 272 B per 8 blocks: d[8] qs[256]  (no padding)
  */
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
@@ -176,14 +176,15 @@ float unit(uint bw, uint l, uint xb)
 	return unpackHalf2x16(W[bw + 52u]).x * float(is);
 }
 #elif QT == 8 /* Q8_0 */
-#define BW 72u
+#define BW 68u
 float unit(uint bw, uint l, uint xb)
 {
-	uint qb = bw + 9u * (l >> 1), base = 4u * (l & 1u);
+	uint qb = bw + 4u + 4u * l, j = l >> 1;
 	int is = 0;
 	for (uint k = 0u; k < 4u; k++)
-		is += idot(W[qb + base + k], xw(xb, 16u * l + 4u * k));
-	return unpackHalf2x16(W[qb + 8u]).x * float(is);
+		is += idot(W[qb + k], xw(xb, 16u * l + 4u * k));
+	vec2 d2 = unpackHalf2x16(W[bw + (j >> 1)]);
+	return ((j & 1u) != 0u ? d2.y : d2.x) * float(is);
 }
 #elif QT >= 100 || QT == 23 /* transcoded types, IQ4_XS (xdec.glsl) */
 #include "xdec.glsl"
