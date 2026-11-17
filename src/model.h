@@ -139,6 +139,7 @@ void qwen35_settle(const model *m, state *s, const int *d, int k, int c);
 int model_get_wt(model *m, wt *w, const char *name, int need, char *err, size_t errlen);
 const float *model_get_f32(model *m, const char *name, uint64_t n, char *err, size_t errlen);
 float *model_falloc(size_t n);
+void *model_ualloc(size_t bytes);
 
 /* consume n prompt tokens (batched on the CPU); last token's logits */
 const float *model_prefill(const model *m, state *s, const int *tok, int n);

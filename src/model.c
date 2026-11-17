@@ -286,6 +286,18 @@ model_falloc(size_t n)
 	return fa(n);
 }
 
+/* not zeroed: pages are only touched when written (a KV cache, whose
+ * positions are written before they are read, then costs memory for
+ * the context in use, not for -c) */
+void *
+model_ualloc(size_t bytes)
+{
+	void *p = NULL;
+	if (posix_memalign(&p, 64, bytes ? bytes : 1))
+		return NULL;
+	return p;
+}
+
 int
 state_init(state *s, const model *m, int ctx)
 {

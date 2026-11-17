@@ -303,16 +303,16 @@ qwen35_state_init(state *s, const model *m, int ctx)
 		s->lg2 = model_falloc((size_t)(MTP_KMAX + 1) * (size_t)h->n_vocab);
 		s->h2 = model_falloc((size_t)(MTP_KMAX + 1) * (size_t)h->n_embd);
 		s->hch = model_falloc((size_t)h->n_embd);
-		s->kh[h->n_layer] = (uint16_t *)model_falloc(((size_t)ctx * kvd + 1) / 2);
-		s->vh[h->n_layer] = (uint16_t *)model_falloc(((size_t)ctx * kvd + 1) / 2);
+		s->kh[h->n_layer] = model_ualloc((size_t)ctx * kvd * sizeof(uint16_t));
+		s->vh[h->n_layer] = model_ualloc((size_t)ctx * kvd * sizeof(uint16_t));
 		if (!s->hl || !s->hnew || !s->cat || !s->lgd || !s->lg2 || !s->h2 || !s->hch ||
 		    !s->kh[h->n_layer] || !s->vh[h->n_layer])
 			return -1;
 	}
 	for (i = 0; i < h->n_layer; i++) {
 		if (m->L[i].attn) {
-			s->kh[i] = (uint16_t *)model_falloc(((size_t)ctx * kvd + 1) / 2);
-			s->vh[i] = (uint16_t *)model_falloc(((size_t)ctx * kvd + 1) / 2);
+			s->kh[i] = model_ualloc((size_t)ctx * kvd * sizeof(uint16_t));
+			s->vh[i] = model_ualloc((size_t)ctx * kvd * sizeof(uint16_t));
 			if (!s->kh[i] || !s->vh[i])
 				return -1;
 		} else {
