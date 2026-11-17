@@ -1245,6 +1245,39 @@ dotT(uint32_t t, const void *row, const void *x, size_t esz, size_t oq, size_t o
 	    t == GT_IQ3_S || t == GT_IQ1_S || t == GT_IQ4_XS || t == GT_X2 || t == GT_X3 ||
 	    t == GT_X3S || t == GT_X1;
 
+	if (t == GT_Q8_0 && T <= 64) {
+		/* per 32: maddubs(|w|, sign(x, w)) (the x + 128 form would
+		 * saturate the 16-bit pair sums with 8-bit weights), times d_w;
+		 * the sub-block scales are floats, so x's scale goes on last */
+		const __m256i ones = _mm256_set1_epi16(1);
+		for (tt = 0; tt < T; tt++)
+			acc[tt] = _mm256_setzero_ps();
+		for (i = 0; i < n / 256; i++, b += 8 * 34) {
+			__m256i w[8], aw[8];
+			__m256 d[8];
+			for (j = 0; j < 8; j++) {
+				w[j] = _mm256_loadu_si256((const __m256i *)(b + 34 * j + 2));
+				aw[j] = _mm256_sign_epi8(w[j], w[j]);
+				d[j] = _mm256_set1_ps(h16f(b + 34 * j));
+			}
+			for (tt = 0; tt < T; tt++) {
+				const int8_t *xq = XB(oq, int8_t);
+				const float xd = *XB(od, float);
+				__m256 sm = _mm256_setzero_ps();
+				for (j = 0; j < 8; j++) {
+					__m256i xv = _mm256_loadu_si256((const __m256i *)(xq + 32 * j));
+					if (x_u)
+						xv = _mm256_xor_si256(xv, h);
+					sm = _mm256_fmadd_ps(d[j], _mm256_cvtepi32_ps(_mm256_madd_epi16(
+					    _mm256_maddubs_epi16(aw[j], _mm256_sign_epi8(xv, w[j])), ones)), sm);
+				}
+				acc[tt] = _mm256_fmadd_ps(_mm256_set1_ps(xd), sm, acc[tt]);
+			}
+		}
+		for (tt = 0; tt < T; tt++)
+			out[(size_t)tt * ostride] = hsumf(acc[tt]);
+		return 1;
+	}
 	if (T > 64 || (!iq && t != GT_Q2_K && t != GT_Q3_K && t != GT_Q4_K && t != GT_Q5_K &&
 	    t != GT_Q6_K))
 		return 0;

@@ -17,6 +17,10 @@
  * Gated attention: W_q gives per head [query | gate]; q and k get an
  * RMS norm per head and RoPE (NeoX pairs) on the first rope_dim dims;
  * out = W_o (softmax(q k^T / sqrt(d)) v * sigmoid(gate)).
+ *
+ * llama (e.g. MiniCPM5) is the special case with every layer plain
+ * attention: no gate, no q/k norms, RoPE on adjacent pairs, and
+ * ffn_norm in place of post_attention_norm.
  */
 #include <math.h>
 #include <stdio.h>
@@ -83,6 +87,85 @@ load_layer(model *m, int i, int attn, char *err, size_t errlen)
 }
 
 int
+llama_load(model *m, char *err, size_t errlen)
+{
+	hparams *h = &m->hp;
+	char nm[96];
+	uint32_t u;
+	int i;
+
+#define U32(k, dst) do { if (gguf_get_u32(&m->g, "llama." k, &u)) { \
+	snprintf(err, errlen, "missing key llama.%s", k); return -1; } (dst) = (int)u; } while (0)
+	U32("embedding_length", h->n_embd);
+	U32("block_count", h->n_layer);
+	U32("attention.head_count", h->n_head);
+	U32("feed_forward_length", h->n_ff);
+#undef U32
+	h->n_head_kv = h->n_head;
+	if (gguf_get_arr_u32(&m->g, "llama.attention.head_count_kv", 0, &u) == 0)
+		h->n_head_kv = (int)u;
+	h->head_dim = h->n_embd / h->n_head;
+	if (gguf_get_u32(&m->g, "llama.attention.key_length", &u) == 0)
+		h->head_dim = (int)u;
+	h->rope_dim = h->head_dim;
+	if (gguf_get_u32(&m->g, "llama.rope.dimension_count", &u) == 0)
+		h->rope_dim = (int)u;
+	h->rope_norm = 1;
+	h->eps = 1e-5f;
+	h->rope_base = 10000.0f;
+	gguf_get_f32(&m->g, "llama.attention.layer_norm_rms_epsilon", &h->eps);
+	gguf_get_f32(&m->g, "llama.rope.freq_base", &h->rope_base);
+	h->attn_scale = 1.0f / sqrtf((float)h->head_dim);
+	if (gguf_find(&m->g, "llama.rope.scaling.type") || gguf_find(&m->g, "llama.expert_count") ||
+	    h->n_head % h->n_head_kv || h->rope_dim > h->head_dim || h->rope_dim % 2 ||
+	    h->n_embd % 256 || h->n_ff % 256 || (h->n_head * h->head_dim) % 256) {
+		snprintf(err, errlen, "unsupported llama shape (rope scaling, MoE or sizes)");
+		return -1;
+	}
+	if (model_get_wt(m, &m->tok_embd, "token_embd.weight", 1, err, errlen))
+		return -1;
+	h->n_vocab = m->tok_embd.N;
+	if (!(m->out_norm = model_get_f32(m, "output_norm.weight", (uint64_t)h->n_embd, err, errlen)))
+		return -1;
+	if (model_get_wt(m, &m->output, "output.weight", 0, err, errlen))
+		return -1;
+	if (!m->output.data)
+		m->output = m->tok_embd;
+	m->output.heat = 1;
+	if (!(m->L = calloc((size_t)h->n_layer, sizeof(*m->L)))) {
+		snprintf(err, errlen, "out of memory");
+		return -1;
+	}
+	for (i = 0; i < h->n_layer; i++) {
+		layer *L = &m->L[i];
+		const int E = h->n_embd;
+#define T(field, s) (snprintf(nm, sizeof(nm), "blk.%d." s, i), \
+	model_get_wt(m, &L->field, nm, 1, err, errlen))
+#define F(field, s, n) do { snprintf(nm, sizeof(nm), "blk.%d." s, i); \
+	if (!(L->field = model_get_f32(m, nm, (uint64_t)(n), err, errlen))) return -1; } while (0)
+		L->attn = 1;
+		F(attn_norm, "attn_norm.weight", E);
+		F(post_norm, "ffn_norm.weight", E);
+		if (T(q, "attn_q.weight") || T(k, "attn_k.weight") || T(v, "attn_v.weight") ||
+		    T(o, "attn_output.weight") || T(ffn_gate, "ffn_gate.weight") ||
+		    T(ffn_up, "ffn_up.weight") || T(ffn_down, "ffn_down.weight"))
+			return -1;
+		if (L->q.N != h->n_head * h->head_dim || L->k.N != h->n_head_kv * h->head_dim ||
+		    L->v.N != L->k.N || L->o.K != L->q.N || L->ffn_gate.N != h->n_ff) {
+			snprintf(err, errlen, "llama: shape mismatch in layer %d", i);
+			return -1;
+		}
+		L->q.heat = L->k.heat = L->v.heat = L->o.heat = 1;
+		L->ffn_gate.heat = L->ffn_up.heat = L->ffn_down.heat = 1;
+#undef T
+#undef F
+	}
+	if (m->n_all < (int)(sizeof(m->all) / sizeof(m->all[0])) && m->output.data != m->tok_embd.data)
+		m->all[m->n_all++] = &m->output;
+	return 0;
+}
+
+int
 qwen35_load(model *m, char *err, size_t errlen)
 {
 	hparams *h = &m->hp;
@@ -117,6 +200,7 @@ qwen35_load(model *m, char *err, size_t errlen)
 	gguf_get_f32(&m->g, KEY("attention.layer_norm_rms_epsilon"), &h->eps);
 	gguf_get_f32(&m->g, KEY("rope.freq_base"), &h->rope_base);
 	h->attn_scale = 1.0f / sqrtf((float)h->head_dim);
+	h->q_gate = 1;
 	h->dn_qkv = 2 * h->dn_kh * h->dn_dim + h->dn_vh * h->dn_dim;
 	if (h->d_inner != h->dn_vh * h->dn_dim || h->dn_vh % h->dn_kh || h->d_conv != 4 ||
 	    h->n_head % h->n_head_kv || h->rope_dim > h->head_dim || h->dn_dim % 8) {
@@ -190,7 +274,7 @@ qwen35_state_init(state *s, const model *m, int ctx)
 	    h->n_head * h->head_dim));
 	s->beta = model_falloc((size_t)h->dn_vh);
 	s->alpha = model_falloc((size_t)h->dn_vh);
-	s->q = model_falloc((size_t)(2 * h->n_head * h->head_dim));
+	s->q = model_falloc((size_t)((h->q_gate ? 2 : 1) * h->n_head * h->head_dim));
 	s->k = model_falloc(kvd);
 	s->v = model_falloc(kvd);
 	s->att = model_falloc((size_t)h->n_head * (size_t)ctx);
@@ -382,11 +466,21 @@ delta_net(const model *m, const layer *L, state *s, int il)
 /* ---------------------------------------------------------------- */
 /* gated attention                                                   */
 
-/* NeoX RoPE on the first rd dims: pairs (i, i + rd/2) */
+/* RoPE on the first rd dims: NeoX pairs (i, i + rd/2), or with norm
+ * (llama) adjacent pairs (2i, 2i + 1) */
 static void
-rope(float *x, int rd, int pos, float base)
+rope(float *x, int rd, int pos, float base, int norm)
 {
 	int i, half = rd / 2;
+	if (norm) {
+		for (i = 0; i < half; i++) {
+			float th = (float)pos * powf(base, -2.0f * (float)i / (float)rd);
+			float c = cosf(th), sn = sinf(th), a = x[2 * i], b = x[2 * i + 1];
+			x[2 * i] = a * c - b * sn;
+			x[2 * i + 1] = a * sn + b * c;
+		}
+		return;
+	}
 	for (i = 0; i < half; i++) {
 		float th = (float)pos * powf(base, -2.0f * (float)i / (float)rd);
 		float c = cosf(th), sn = sinf(th), a = x[i], b = x[i + half];
@@ -414,7 +508,8 @@ at_worker(void *arg, int ith, int nth)
 	(void)ith;
 	(void)nth;
 	while ((hh = pool_take(&j->next, 1, h->n_head)) >= 0) {
-		const float *q = j->s->q + hh * 2 * hd, *gate = q + hd;
+		const int qs = h->q_gate ? 2 * hd : hd;
+		const float *q = j->s->q + hh * qs, *gate = q + hd;
 		const int off = (int)(hh / grp) * hd;
 		float *a = j->s->att + (size_t)hh * (size_t)j->s->ctx;
 		float *o = j->s->ao + hh * hd, mx = -INFINITY, sum = 0;
@@ -432,7 +527,7 @@ at_worker(void *arg, int ith, int nth)
 		memset(o, 0, sizeof(float) * (size_t)hd);
 		for (t = 0; t < j->n; t++)
 			v_axpy(o, a[t] / sum, vc + (size_t)t * kvd + off, (size_t)hd);
-		for (d = 0; d < hd; d++)
+		for (d = 0; h->q_gate && d < hd; d++)
 			o[d] *= sigmoidf(gate[d]);
 	}
 }
@@ -452,13 +547,15 @@ attention(const model *m, const layer *L, state *s, int il)
 	it[2] = mv(&L->v, 0, s->xn, vd);
 	mv_run(it, 3);
 	for (i = 0; i < h->n_head; i++) {
-		float *q = s->q + i * 2 * hd;
-		v_rmsnorm(q, q, L->q_norm, (size_t)hd, h->eps);
-		rope(q, h->rope_dim, s->pos, h->rope_base);
+		float *q = s->q + i * (h->q_gate ? 2 : 1) * hd;
+		if (L->q_norm)
+			v_rmsnorm(q, q, L->q_norm, (size_t)hd, h->eps);
+		rope(q, h->rope_dim, s->pos, h->rope_base, h->rope_norm);
 	}
 	for (i = 0; i < h->n_head_kv; i++) {
-		v_rmsnorm(kd + i * hd, kd + i * hd, L->k_norm, (size_t)hd, h->eps);
-		rope(kd + i * hd, h->rope_dim, s->pos, h->rope_base);
+		if (L->k_norm)
+			v_rmsnorm(kd + i * hd, kd + i * hd, L->k_norm, (size_t)hd, h->eps);
+		rope(kd + i * hd, h->rope_dim, s->pos, h->rope_base, h->rope_norm);
 	}
 	aj.m = m;
 	aj.s = s;
@@ -621,13 +718,13 @@ pbufs(const hparams *h)
 	const size_t T = QB, E = (size_t)h->n_embd;
 	if (P.ok)
 		return 0;
-#define A(p, n) if (!((p) = calloc((n), sizeof(*(p))))) return -1
+#define A(p, n) if (!((p) = calloc((n) ? (n) : 1, sizeof(*(p))))) return -1
 	A(P.x, T * E); A(P.xn, T * E); A(P.tmp, T * E);
 	A(P.qkv, T * (size_t)h->dn_qkv); A(P.z, T * (size_t)h->d_inner);
 	A(P.beta, T * (size_t)h->dn_vh); A(P.alpha, T * (size_t)h->dn_vh);
 	A(P.y, T * (size_t)(h->d_inner > h->n_head * h->head_dim ? h->d_inner : h->n_head * h->head_dim));
 	A(P.fg, T * (size_t)h->n_ff); A(P.fu, T * (size_t)h->n_ff);
-	A(P.q, T * (size_t)(2 * h->n_head * h->head_dim)); A(P.ao, T * (size_t)(h->n_head * h->head_dim));
+	A(P.q, T * (size_t)((h->q_gate ? 2 : 1) * h->n_head * h->head_dim)); A(P.ao, T * (size_t)(h->n_head * h->head_dim));
 	A(P.xq, T * E / 256); A(P.yq, T * (size_t)(h->d_inner > h->n_head * h->head_dim ?
 	    h->d_inner : h->n_head * h->head_dim) / 256);
 	A(P.fq, T * (size_t)h->n_ff / 256);
@@ -792,7 +889,8 @@ patt(void *arg, int ith, int nth)
 		return;
 	while ((w = pool_take(&j->next, 1, (long)j->T * h->n_head)) >= 0) {
 		int t = (int)(w / h->n_head), hh = (int)(w % h->n_head), n = j->pos + t + 1, k, d;
-		const float *q = P.q + (size_t)t * 2 * h->n_head * hd + (size_t)hh * 2 * hd, *gate = q + hd;
+		const int qs = h->q_gate ? 2 * hd : hd;
+		const float *q = P.q + (size_t)t * h->n_head * qs + (size_t)hh * qs, *gate = q + hd;
 		const int off = (hh / grp) * hd;
 		float *o = P.ao + (size_t)t * h->n_head * hd + (size_t)hh * hd, mx = -INFINITY, sum = 0;
 		for (k = 0; k < n; k++) {
@@ -808,7 +906,7 @@ patt(void *arg, int ith, int nth)
 		memset(o, 0, sizeof(float) * (size_t)hd);
 		for (k = 0; k < n; k++)
 			v_axpy(o, a[k] / sum, vc + (size_t)k * kvd + off, (size_t)hd);
-		for (d = 0; d < hd; d++)
+		for (d = 0; h->q_gate && d < hd; d++)
 			o[d] *= sigmoidf(gate[d]);
 	}
 	free(a);
@@ -818,7 +916,8 @@ static void
 pattention(const model *m, const layer *L, state *s, int il, int T)
 {
 	const hparams *h = &m->hp;
-	const int E = h->n_embd, hd = h->head_dim, kvd = h->n_head_kv * hd, QD = 2 * h->n_head * hd;
+	const int E = h->n_embd, hd = h->head_dim, kvd = h->n_head_kv * hd;
+	const int QD = (h->q_gate ? 2 : 1) * h->n_head * hd;
 	const int AD = h->n_head * hd;
 	float *kd = s->kc[il] + (size_t)s->pos * kvd, *vd = s->vc[il] + (size_t)s->pos * kvd;
 	mm_item it[3];
@@ -831,14 +930,16 @@ pattention(const model *m, const layer *L, state *s, int il, int T)
 	mm_run(it, 3);
 	for (t = 0; t < T; t++) {
 		for (i = 0; i < h->n_head; i++) {
-			float *q = P.q + (size_t)t * QD + i * 2 * hd;
-			v_rmsnorm(q, q, L->q_norm, (size_t)hd, h->eps);
-			rope(q, h->rope_dim, s->pos + t, h->rope_base);
+			float *q = P.q + (size_t)t * QD + i * (QD / h->n_head);
+			if (L->q_norm)
+				v_rmsnorm(q, q, L->q_norm, (size_t)hd, h->eps);
+			rope(q, h->rope_dim, s->pos + t, h->rope_base, h->rope_norm);
 		}
 		for (i = 0; i < h->n_head_kv; i++) {
 			float *k = kd + (size_t)t * kvd + i * hd;
-			v_rmsnorm(k, k, L->k_norm, (size_t)hd, h->eps);
-			rope(k, h->rope_dim, s->pos + t, h->rope_base);
+			if (L->k_norm)
+				v_rmsnorm(k, k, L->k_norm, (size_t)hd, h->eps);
+			rope(k, h->rope_dim, s->pos + t, h->rope_base, h->rope_norm);
 		}
 	}
 	j.m = m;

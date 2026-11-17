@@ -205,6 +205,8 @@ tok_load(tokenizer *t, const gguf *g, char *err, size_t errlen)
 		gstr pre;
 		if (gguf_get_str(g, "tokenizer.ggml.pre", &pre) == 0 && gstr_eq(pre, "qwen35"))
 			t->pre = 1;
+		else if (gguf_get_str(g, "tokenizer.ggml.pre", &pre) == 0 && gstr_eq(pre, "minicpm5"))
+			t->pre = 2;
 	}
 	t->bos = t->eos = -1;
 	if (gguf_get_u32(g, "tokenizer.ggml.bos_token_id", &u) == 0)
@@ -442,6 +444,36 @@ done:
 	return n;
 }
 
+/* minicpm5 (pre 2): llama.cpp first splits at \p{N}{1,3} and runs the
+ * llama3 expression on each piece, so a digit ends the text for the
+ * whitespace lookahead (\s+(?!\S)) */
+static int
+pretok_seg(const tokenizer *t, const uint8_t *s, size_t len, int *out, int cap, int n)
+{
+	size_t i = 0, start = 0;
+	if (t->pre != 2)
+		return pretok(t, s, len, out, cap, n);
+	while (i < len) {
+		size_t a, j, nd = 0;
+		uint32_t c = utf8_get(s + i, len - i, &a);
+		if (c == 0xFFFFFFFEu || !(ucd_flags(c) & UC_N)) {
+			i += a;
+			continue;
+		}
+		n = pretok(t, s + start, i - start, out, cap, n);
+		/* up to three digits */
+		for (j = i; j < len && nd < 3; nd++) {
+			c = utf8_get(s + j, len - j, &a);
+			if (c == 0xFFFFFFFEu || !(ucd_flags(c) & UC_N))
+				break;
+			j += a;
+		}
+		n = pretok(t, s + i, j - i, out, cap, n);
+		i = start = j;
+	}
+	return pretok(t, s + start, len - start, out, cap, n);
+}
+
 int
 tok_encode(const tokenizer *t, const char *str, size_t len, int parse_special,
     int *out, int cap)
@@ -465,12 +497,12 @@ tok_encode(const tokenizer *t, const char *str, size_t len, int parse_special,
 			i++;
 			continue;
 		}
-		n = pretok(t, s + start, i - start, out, cap, n);
+		n = pretok_seg(t, s + start, i - start, out, cap, n);
 		n = put(out, cap, n, hit);
 		i += t->text[hit].len;
 		start = i;
 	}
-	return pretok(t, s + start, len - start, out, cap, n);
+	return pretok_seg(t, s + start, len - start, out, cap, n);
 }
 
 int

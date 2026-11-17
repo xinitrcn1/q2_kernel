@@ -829,7 +829,7 @@ model_prefill(const model *m, state *s, const int *tok, int n)
 	const hparams *h = &m->hp;
 	int done = 0, il;
 
-	if (m->arch == ARCH_QWEN35 && n > 1 && !g_ref)
+	if (ARCH_DENSE(m->arch) && n > 1 && !g_ref)
 		return qwen35_prefill(m, s, tok, n);
 	if (n <= 1 || g_ref || m->arch != ARCH_GRANITE || bufs(h) != 0) {
 		const float *lg = NULL;

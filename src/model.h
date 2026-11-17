@@ -44,7 +44,9 @@ typedef struct {
 	wt wqkv, wz, wbeta, walpha;
 } layer;
 
-enum { ARCH_GRANITE, ARCH_QWEN35 };
+enum { ARCH_GRANITE, ARCH_QWEN35, ARCH_LLAMA };
+/* qwen35.c runs both: llama is its all-attention special case */
+#define ARCH_DENSE(a) ((a) == ARCH_QWEN35 || (a) == ARCH_LLAMA)
 
 typedef struct {
 	int n_embd, n_layer, n_vocab, n_head, n_head_kv, head_dim;
@@ -52,7 +54,9 @@ typedef struct {
 	int d_conv, d_inner, d_state, ssm_heads, ssm_head_dim, conv_ch, d_in_proj;
 	float eps, emb_scale, res_scale, logit_scale, attn_scale;
 	/* qwen35 */
-	int rope_dim;           /* rotated dims per head (NeoX pairs) */
+	int rope_dim;           /* rotated dims per head */
+	int rope_norm;          /* llama: adjacent pairs (2i, 2i+1), else NeoX */
+	int q_gate;             /* qwen35: W_q gives [query | gate] per head */
 	float rope_base;
 	int dn_kh, dn_vh, dn_dim;   /* delta net: key heads, value heads, head dim */
 	int dn_qkv;             /* conv channels: q, k (dn_kh*dn_dim each), v */
@@ -112,6 +116,7 @@ size_t model_gpu_state_bytes(const model *m);
 
 /* qwen35.c */
 int qwen35_load(model *m, char *err, size_t errlen);
+int llama_load(model *m, char *err, size_t errlen);
 int qwen35_state_init(state *s, const model *m, int ctx);
 void qwen35_state_reset(state *s, const model *m);
 const float *qwen35_forward(const model *m, state *s, int tok, int want_logits);

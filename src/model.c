@@ -84,8 +84,12 @@ model_load(model *m, const char *path, char *err, size_t errlen)
 		m->arch = ARCH_QWEN35;
 		return qwen35_load(m, err, errlen);
 	}
+	if (gguf_get_str(&m->g, "general.architecture", &arch) == 0 && gstr_eq(arch, "llama")) {
+		m->arch = ARCH_LLAMA;
+		return llama_load(m, err, errlen);
+	}
 	if (gguf_get_str(&m->g, "general.architecture", &arch) || !gstr_eq(arch, "granitehybrid")) {
-		snprintf(err, errlen, "unsupported architecture (granitehybrid, qwen35)");
+		snprintf(err, errlen, "unsupported architecture (granitehybrid, qwen35, llama)");
 		return -1;
 	}
 	m->arch = ARCH_GRANITE;
@@ -289,7 +293,7 @@ state_init(state *s, const model *m, int ctx)
 	int i, kvd = h->n_head_kv * h->head_dim;
 	size_t big = (size_t)(h->d_in_proj > h->n_vocab ? h->d_in_proj : h->n_vocab);
 
-	if (m->arch == ARCH_QWEN35)
+	if (ARCH_DENSE(m->arch))
 		return qwen35_state_init(s, m, ctx);
 	memset(s, 0, sizeof(*s));
 	s->ctx = ctx;
@@ -343,7 +347,7 @@ state_reset(state *s, const model *m)
 	int i;
 	s->pos = 0;
 	vk_state_reset();
-	if (m->arch == ARCH_QWEN35) {
+	if (ARCH_DENSE(m->arch)) {
 		qwen35_state_reset(s, m);
 		return;
 	}
@@ -919,7 +923,7 @@ moe(const model *m, const layer *L, state *s)
 const float *
 model_forward(const model *m, state *s, int tok, int want_logits)
 {
-	if (m->arch == ARCH_QWEN35)
+	if (ARCH_DENSE(m->arch))
 		return qwen35_forward(m, s, tok, want_logits);
 	const hparams *h = &m->hp;
 	const int E = h->n_embd;
