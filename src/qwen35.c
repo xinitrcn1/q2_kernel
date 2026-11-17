@@ -117,7 +117,8 @@ llama_load(model *m, char *err, size_t errlen)
 	gguf_get_f32(&m->g, "llama.rope.freq_base", &h->rope_base);
 	h->attn_scale = 1.0f / sqrtf((float)h->head_dim);
 	if (gguf_find(&m->g, "llama.rope.scaling.type") || gguf_find(&m->g, "llama.expert_count") ||
-	    h->n_head % h->n_head_kv || h->rope_dim > h->head_dim || h->rope_dim % 2 ||
+	    h->n_head % h->n_head_kv || h->n_head / h->n_head_kv > 32 ||
+	    h->rope_dim > h->head_dim || h->rope_dim % 2 ||
 	    h->n_embd % 256 || h->n_ff % 256 || (h->n_head * h->head_dim) % 256) {
 		snprintf(err, errlen, "unsupported llama shape (rope scaling, MoE or sizes)");
 		return -1;
@@ -203,7 +204,8 @@ qwen35_load(model *m, char *err, size_t errlen)
 	h->q_gate = 1;
 	h->dn_qkv = 2 * h->dn_kh * h->dn_dim + h->dn_vh * h->dn_dim;
 	if (h->d_inner != h->dn_vh * h->dn_dim || h->dn_vh % h->dn_kh || h->d_conv != 4 ||
-	    h->n_head % h->n_head_kv || h->rope_dim > h->head_dim || h->dn_dim % 8) {
+	    h->n_head % h->n_head_kv || h->n_head / h->n_head_kv > 32 ||   /* AT_GRP */
+	    h->rope_dim > h->head_dim || h->dn_dim % 8) {
 		snprintf(err, errlen, "unsupported qwen35 shape");
 		return -1;
 	}
@@ -535,12 +537,24 @@ rope(float *x, int rd, int pos, float base, int norm)
 	}
 }
 
+/* Decode attention, flash-decoding style: work items are (KV head,
+ * chunk of positions); each reads its K and V rows once for all the
+ * query heads of the group (GQA) and leaves, per head, its max score, its
+ * sum of exp and its unnormalized output; at_merge combines the chunks.
+ * (Per query head, every head of a group re-read the same rows.) */
+#define AT_CH 256
+#define AT_GRP 32
+
 typedef struct {
 	const model *m;
 	state *s;
-	int il, n;
+	int il, n, nck;
+	float *part;            /* per item and head: max, sum, o[hd] */
 	long next;
 } at_job;
+
+static float *at_part;
+static size_t at_part_cap;
 
 static void
 at_worker(void *arg, int ith, int nth)
@@ -548,33 +562,74 @@ at_worker(void *arg, int ith, int nth)
 	at_job *j = arg;
 	const hparams *h = &j->m->hp;
 	const int hd = h->head_dim, kvd = h->n_head_kv * hd, grp = h->n_head / h->n_head_kv;
+	const int qs = h->q_gate ? 2 * hd : hd;
 	const float *kc = j->s->kc[j->il], *vc = j->s->vc[j->il];
-	long hh;
+	float sc[AT_GRP][AT_CH];
+	long w;
 
 	(void)ith;
 	(void)nth;
-	while ((hh = pool_take(&j->next, 1, h->n_head)) >= 0) {
-		const int qs = h->q_gate ? 2 * hd : hd;
-		const float *q = j->s->q + hh * qs, *gate = q + hd;
-		const int off = (int)(hh / grp) * hd;
-		float *a = j->s->att + (size_t)hh * (size_t)j->s->ctx;
-		float *o = j->s->ao + hh * hd, mx = -INFINITY, sum = 0;
-		int t, d;
-		for (t = 0; t < j->n; t++) {
-			a[t] = v_dot(q, kc + (size_t)t * kvd + off, (size_t)hd) * h->attn_scale;
-			if (a[t] > mx)
-				mx = a[t];
+	while ((w = pool_take(&j->next, 1, (long)h->n_head_kv * j->nck)) >= 0) {
+		const int g = (int)(w / j->nck), c = (int)(w % j->nck);
+		const int t0 = c * AT_CH, t1 = t0 + AT_CH < j->n ? t0 + AT_CH : j->n, nt = t1 - t0;
+		float *pp = j->part + (size_t)w * (size_t)grp * (size_t)(hd + 2);
+		int t, hh;
+		for (t = t0; t < t1; t++) {
+			const float *k = kc + (size_t)t * kvd + g * hd;
+			for (hh = 0; hh < grp; hh++)
+				sc[hh][t - t0] = v_dot(j->s->q + (size_t)(g * grp + hh) * qs, k, (size_t)hd) *
+				    h->attn_scale;
 		}
-		for (t = 0; t < j->n; t++)
-			a[t] -= mx;
-		v_exp(a, a, (size_t)j->n);
-		for (t = 0; t < j->n; t++)
-			sum += a[t];
+		for (hh = 0; hh < grp; hh++) {
+			float *a = sc[hh], mx = -INFINITY, sum = 0, *o = pp + (size_t)hh * (hd + 2) + 2;
+			for (t = 0; t < nt; t++)
+				if (a[t] > mx)
+					mx = a[t];
+			for (t = 0; t < nt; t++)
+				a[t] -= mx;
+			v_exp(a, a, (size_t)nt);
+			for (t = 0; t < nt; t++)
+				sum += a[t];
+			pp[(size_t)hh * (hd + 2)] = mx;
+			pp[(size_t)hh * (hd + 2) + 1] = sum;
+			memset(o, 0, sizeof(float) * (size_t)hd);
+		}
+		for (t = t0; t < t1; t++) {
+			const float *v = vc + (size_t)t * kvd + g * hd;
+			for (hh = 0; hh < grp; hh++)
+				v_axpy(pp + (size_t)hh * (hd + 2) + 2, sc[hh][t - t0], v, (size_t)hd);
+		}
+	}
+}
+
+/* per head: o = sum_c e^(m_c - M) o_c / sum_c e^(m_c - M) l_c, gated */
+static void
+at_merge(const hparams *h, state *s, const float *part, int nck)
+{
+	const int hd = h->head_dim, grp = h->n_head / h->n_head_kv, qs = h->q_gate ? 2 * hd : hd;
+	int hh, c, d;
+	for (hh = 0; hh < h->n_head; hh++) {
+		const int g = hh / grp, r = hh % grp;
+		float *o = s->ao + (size_t)hh * hd, M = -INFINITY, L = 0;
+		for (c = 0; c < nck; c++) {
+			const float *pp = part + ((size_t)(g * nck + c) * grp + r) * (hd + 2);
+			if (pp[0] > M)
+				M = pp[0];
+		}
 		memset(o, 0, sizeof(float) * (size_t)hd);
-		for (t = 0; t < j->n; t++)
-			v_axpy(o, a[t] / sum, vc + (size_t)t * kvd + off, (size_t)hd);
-		for (d = 0; h->q_gate && d < hd; d++)
-			o[d] *= sigmoidf(gate[d]);
+		for (c = 0; c < nck; c++) {
+			const float *pp = part + ((size_t)(g * nck + c) * grp + r) * (hd + 2);
+			float f = expf(pp[0] - M);
+			L += f * pp[1];
+			v_axpy(o, f, pp + 2, (size_t)hd);
+		}
+		for (d = 0; d < hd; d++)
+			o[d] /= L;
+		if (h->q_gate) {
+			const float *gate = s->q + (size_t)hh * qs + hd;
+			for (d = 0; d < hd; d++)
+				o[d] *= sigmoidf(gate[d]);
+		}
 	}
 }
 
@@ -607,8 +662,22 @@ attention(const model *m, const layer *L, state *s, int il)
 	aj.s = s;
 	aj.il = il;
 	aj.n = s->pos + 1;
+	aj.nck = (aj.n + AT_CH - 1) / AT_CH;
+	{
+		size_t need = (size_t)h->n_head * (size_t)aj.nck * (size_t)(hd + 2);
+		if (need > at_part_cap) {
+			free(at_part);
+			if (!(at_part = malloc(sizeof(float) * need))) {
+				fprintf(stderr, "q2k: out of memory\n");
+				exit(1);
+			}
+			at_part_cap = need;
+		}
+	}
+	aj.part = at_part;
 	aj.next = 0;
 	pool_run(at_worker, &aj);
+	at_merge(h, s, at_part, aj.nck);
 
 	it[0] = mv(&L->o, 0, s->ao, s->tmp);
 	mv_run(it, 1);
@@ -920,40 +989,59 @@ typedef struct {
 	long next;
 } paj;
 
+/* work items are (token, KV head): the K and V rows are read once for
+ * all the query heads of the group */
 static void
 patt(void *arg, int ith, int nth)
 {
 	paj *j = arg;
 	const hparams *h = &j->m->hp;
 	const int hd = h->head_dim, kvd = h->n_head_kv * hd, grp = h->n_head / h->n_head_kv;
+	const int qs = h->q_gate ? 2 * hd : hd;
 	const float *kc = j->s->kc[j->il], *vc = j->s->vc[j->il];
-	float *a = malloc(sizeof(float) * (size_t)(j->pos + j->T));
+	const size_t na = (size_t)(j->pos + j->T);
+	float *a = malloc(sizeof(float) * na * (size_t)grp);
 	long w;
 	(void)ith;
 	(void)nth;
 	if (!a)
 		return;
-	while ((w = pool_take(&j->next, 1, (long)j->T * h->n_head)) >= 0) {
-		int t = (int)(w / h->n_head), hh = (int)(w % h->n_head), n = j->pos + t + 1, k, d;
-		const int qs = h->q_gate ? 2 * hd : hd;
-		const float *q = P.q + (size_t)t * h->n_head * qs + (size_t)hh * qs, *gate = q + hd;
-		const int off = (hh / grp) * hd;
-		float *o = P.ao + (size_t)t * h->n_head * hd + (size_t)hh * hd, mx = -INFINITY, sum = 0;
+	while ((w = pool_take(&j->next, 1, (long)j->T * h->n_head_kv)) >= 0) {
+		const int t = (int)(w / h->n_head_kv), g = (int)(w % h->n_head_kv), n = j->pos + t + 1;
+		const float *q0 = P.q + (size_t)t * h->n_head * qs + (size_t)g * grp * qs;
+		float *o0 = P.ao + (size_t)t * h->n_head * hd + (size_t)g * grp * hd;
+		int k, hh, d;
 		for (k = 0; k < n; k++) {
-			a[k] = v_dot(q, kc + (size_t)k * kvd + off, (size_t)hd) * h->attn_scale;
-			if (a[k] > mx)
-				mx = a[k];
+			const float *kr = kc + (size_t)k * kvd + g * hd;
+			for (hh = 0; hh < grp; hh++)
+				a[(size_t)hh * na + k] = v_dot(q0 + (size_t)hh * qs, kr, (size_t)hd) * h->attn_scale;
 		}
-		for (k = 0; k < n; k++)
-			a[k] -= mx;
-		v_exp(a, a, (size_t)n);
-		for (k = 0; k < n; k++)
-			sum += a[k];
-		memset(o, 0, sizeof(float) * (size_t)hd);
-		for (k = 0; k < n; k++)
-			v_axpy(o, a[k] / sum, vc + (size_t)k * kvd + off, (size_t)hd);
-		for (d = 0; h->q_gate && d < hd; d++)
-			o[d] *= sigmoidf(gate[d]);
+		for (hh = 0; hh < grp; hh++) {
+			float *ah = a + (size_t)hh * na, mx = -INFINITY, sum = 0, r;
+			for (k = 0; k < n; k++)
+				if (ah[k] > mx)
+					mx = ah[k];
+			for (k = 0; k < n; k++)
+				ah[k] -= mx;
+			v_exp(ah, ah, (size_t)n);
+			for (k = 0; k < n; k++)
+				sum += ah[k];
+			r = 1.0f / sum;
+			for (k = 0; k < n; k++)
+				ah[k] *= r;
+			memset(o0 + (size_t)hh * hd, 0, sizeof(float) * (size_t)hd);
+		}
+		for (k = 0; k < n; k++) {
+			const float *vr = vc + (size_t)k * kvd + g * hd;
+			for (hh = 0; hh < grp; hh++)
+				v_axpy(o0 + (size_t)hh * hd, a[(size_t)hh * na + k], vr, (size_t)hd);
+		}
+		for (hh = 0; h->q_gate && hh < grp; hh++) {
+			const float *gate = q0 + (size_t)hh * qs + hd;
+			float *o = o0 + (size_t)hh * hd;
+			for (d = 0; d < hd; d++)
+				o[d] *= sigmoidf(gate[d]);
+		}
 	}
 	free(a);
 }
