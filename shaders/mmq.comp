@@ -204,12 +204,94 @@ void dec(uint bw, uint l, out grp g)
  * thread then accumulates a 2x2 micro-tile with DP4A.  The B term uses
  * the activations' 16-group sums (bsums), not a dot with ones:
  *   y = sum_blocks xd * (D * sum_g sa_g dot(u_g, x_g) + M * sum_g sb_g bsum_g)
- * Q8_0 has a float d per 32 and no B term: the tile keeps sDq (8 per
- * row) in place of the integer scales, and each 32-group's dots are
- * converted and scaled by its d; x's scale goes on once per 256.
+ * (Q8_0 has a float d per 32 and no B term: its own main below.)
  */
 #define TR 32u
 #define TK 32u
+#if QT == 8
+/*
+ * Q8_0: the same 32 x 32 tile and 2 x 2 micro-tiles, with 128-bit shared
+ * loads (8 per 32-group instead of 32).  Weights: rows of 18 uvec4 (64
+ * words + pad); tokens in pairs (2p, 2p + 1) of 33 uvec4, so the 16
+ * micro-tiles' x reads hit conflict degree 2, the least 16 x 16 B can
+ * (ucas banks, gt1030: an even token stride gives 4); weight reads are
+ * broadcasts.  d per row per 32 in sDq, x's d per token in sxd.
+ */
+#define SU4 18u
+#define SP4 33u
+shared uvec4 su4[TR * SU4];
+shared float sDq[TR * 8u];
+shared uvec4 sx4[(TK / 2u) * SP4];
+shared float sxd[TK];
+
+void main()
+{
+	const uint tid = gl_LocalInvocationID.x;
+	const uint r0 = gl_WorkGroupID.x * TR, k0 = gl_WorkGroupID.y * TK;
+	const uint nb = pc.K >> 8;
+	const uint mr = (tid >> 4) * 2u, mp = tid & 15u;    /* rows mr, mr+1; tokens 2mp, 2mp+1 */
+	float acc[4] = float[4](0.0, 0.0, 0.0, 0.0);
+
+	for (uint b = 0u; b < nb; b++) {
+		for (uint pass = 0u; pass < TR / 16u; pass++) {
+			uint rl = pass * 16u + (tid >> 4), u = tid & 15u, row = r0 + rl;
+			if (row < pc.N) {
+				uint bw = pc.w_off + row * pc.row_words + b * BW;
+				su4[rl * SU4 + u] = uvec4(W[bw + 4u + 4u * u], W[bw + 5u + 4u * u],
+				    W[bw + 6u + 4u * u], W[bw + 7u + 4u * u]);
+				if (u < 4u) {
+					vec2 d2 = unpackHalf2x16(W[bw + u]);
+					sDq[rl * 8u + 2u * u] = d2.x;
+					sDq[rl * 8u + 2u * u + 1u] = d2.y;
+				}
+			} else {
+				su4[rl * SU4 + u] = uvec4(0u);
+				if (u < 8u)
+					sDq[rl * 8u + u] = 0.0;
+			}
+		}
+		/* the tokens' quants (64 words each) and scales (zero past the end) */
+		for (uint i = tid; i < TK * 64u; i += 256u) {
+			uint t = i >> 6, w = i & 63u;
+			uint v = k0 + t < pc.T ? X[pc.x_off + (k0 + t) * pc.x_stride + 73u * b + 1u + w] : 0u;
+			sx4[(t >> 1) * SP4 + (t & 1u) * 16u + (w >> 2)][w & 3u] = v;
+		}
+		if (tid < TK)
+			sxd[tid] = k0 + tid < pc.T ?
+			    uintBitsToFloat(X[pc.x_off + (k0 + tid) * pc.x_stride + 73u * b]) : 0.0;
+		barrier();
+
+		float f[4] = float[4](0.0, 0.0, 0.0, 0.0);
+		for (uint sq = 0u; sq < 8u; sq++) {
+			int d00 = 0, d01 = 0, d10 = 0, d11 = 0;
+			[[unroll]] for (uint h = 0u; h < 2u; h++) {
+				uvec4 u0 = su4[mr * SU4 + 2u * sq + h], u1 = su4[(mr + 1u) * SU4 + 2u * sq + h];
+				uvec4 x0 = sx4[mp * SP4 + 2u * sq + h], x1 = sx4[mp * SP4 + 16u + 2u * sq + h];
+				[[unroll]] for (uint c = 0u; c < 4u; c++) {
+					d00 += idot(u0[c], x0[c]);
+					d01 += idot(u0[c], x1[c]);
+					d10 += idot(u1[c], x0[c]);
+					d11 += idot(u1[c], x1[c]);
+				}
+			}
+			float D0 = sDq[mr * 8u + sq], D1 = sDq[(mr + 1u) * 8u + sq];
+			f[0] += D0 * float(d00); f[1] += D0 * float(d01);
+			f[2] += D1 * float(d10); f[3] += D1 * float(d11);
+		}
+		{
+			float xd0 = sxd[2u * mp], xd1 = sxd[2u * mp + 1u];
+			acc[0] += xd0 * f[0]; acc[1] += xd1 * f[1];
+			acc[2] += xd0 * f[2]; acc[3] += xd1 * f[3];
+		}
+		barrier();
+	}
+	[[unroll]] for (uint q = 0u; q < 4u; q++) {
+		uint row = r0 + mr + (q >> 1), t = k0 + 2u * mp + (q & 1u);
+		if (row < pc.N && t < pc.T)
+			Y[pc.y_off + t * pc.y_stride + row] = acc[q];
+	}
+}
+#else
 /* su rows padded to 72 words, ssa/ssb rows to 17: the inner loop's
  * reads of rows mr and mr + 2 fall on distinct banks (ucas memk under
  * gt1030: degree 2 -> 1; the decode's writes 4 -> 2).  Padding keeps
@@ -219,11 +301,6 @@ void dec(uint bw, uint l, out grp g)
 shared uint su[TR * SUW];
 shared int ssa[TR * SS], ssb[TR * SS];
 shared float sD[TR], sM[TR];
-#if QT == 8
-/* rows of 8: the inner loop's rows mr, mr + 1 (mr even, 2 per warp)
- * and the decode's 16 consecutive writes are conflict-free (ucas banks) */
-shared float sDq[TR * 8u];
-#endif
 shared uint sx[TK * 73u];
 
 void main()
@@ -243,15 +320,9 @@ void main()
 				dec(pc.w_off + row * pc.row_words + b * BW, u, g);
 				[[unroll]] for (uint j = 0u; j < 4u; j++) {
 					su[rl * SUW + (g.o[j] >> 2)] = g.q[j];
-#if QT != 8
 					ssa[rl * SS + (g.o[j] >> 4)] = g.sa[j];
 					ssb[rl * SS + (g.o[j] >> 4)] = g.sb[j];
-#endif
 				}
-#if QT == 8
-				if ((u & 1u) == 0u)
-					sDq[rl * 8u + (u >> 1)] = g.D;
-#endif
 				if (u == 0u) {
 					sD[rl] = g.D;
 					sM[rl] = g.M;
@@ -263,10 +334,6 @@ void main()
 					su[rl * SUW + i] = 0u;
 				for (uint i = 0u; i < 16u; i++)
 					ssa[rl * SS + i] = ssb[rl * SS + i] = 0;
-#if QT == 8
-				for (uint i = 0u; i < 8u; i++)
-					sDq[rl * 8u + i] = 0.0;
-#endif
 			}
 		}
 		/* the tokens' q8k blocks (zero past the end) */
@@ -276,28 +343,6 @@ void main()
 		}
 		barrier();
 
-#if QT == 8
-		float f[4] = float[4](0.0, 0.0, 0.0, 0.0);
-		for (uint sq = 0u; sq < 8u; sq++) {
-			int d00 = 0, d01 = 0, d10 = 0, d11 = 0;
-			[[unroll]] for (uint w = 0u; w < 8u; w++) {
-				uint u0 = su[mr * SUW + 8u * sq + w], u1 = su[(mr + 1u) * SUW + 8u * sq + w];
-				uint x0 = sx[mt * 73u + 1u + 8u * sq + w], x1 = sx[(mt + 1u) * 73u + 1u + 8u * sq + w];
-				d00 += idot(u0, x0);
-				d01 += idot(u0, x1);
-				d10 += idot(u1, x0);
-				d11 += idot(u1, x1);
-			}
-			float D0 = sDq[mr * 8u + sq], D1 = sDq[(mr + 1u) * 8u + sq];
-			f[0] += D0 * float(d00); f[1] += D0 * float(d01);
-			f[2] += D1 * float(d10); f[3] += D1 * float(d11);
-		}
-		{
-			float xd0 = uintBitsToFloat(sx[mt * 73u]), xd1 = uintBitsToFloat(sx[(mt + 1u) * 73u]);
-			acc[0] += xd0 * f[0]; acc[1] += xd1 * f[1];
-			acc[2] += xd0 * f[2]; acc[3] += xd1 * f[3];
-		}
-#else
 		int ia[4] = int[4](0, 0, 0, 0), ib[4] = int[4](0, 0, 0, 0);
 		for (uint gq = 0u; gq < 16u; gq++) {
 			int sa0 = ssa[mr * SS + gq], sa1 = ssa[(mr + 1u) * SS + gq];
@@ -325,7 +370,6 @@ void main()
 			acc[2] += xd0 * (D1 * float(ia[2]) + M1 * float(ib[2]));
 			acc[3] += xd1 * (D1 * float(ia[3]) + M1 * float(ib[3]));
 		}
-#endif
 		barrier();
 	}
 	[[unroll]] for (uint q = 0u; q < 4u; q++) {
@@ -334,3 +378,4 @@ void main()
 			Y[pc.y_off + t * pc.y_stride + row] = acc[q];
 	}
 }
+#endif
