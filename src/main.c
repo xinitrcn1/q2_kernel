@@ -20,7 +20,7 @@
 
 typedef struct {
 	const char *model, *prompt, *system, *dump, *transcode, *host, *alias, *api_key;
-	int server, port, n_given;
+	int server, port, n_given, g_given;
 	int n_predict, threads, ctx, gpu_mib, device, chat, raw, info, tokens;
 	int bench, check, kbench, top_k, verbose, show_special, logits, noprefill, think, sys_given, nomtp, ndraft;
 	float temp, top_p;
@@ -53,12 +53,14 @@ usage(void)
 	    "  --think        let thinking models think (chat; qwen35)\n"
 	    "  -t N           CPU threads (default: online CPUs - 1)\n"
 	    "  -c N           context size (default 4096)\n"
-	    "  -g MIB         GPU weight split in MiB (default 512, 0 = CPU only)\n"
+	    "  -g MIB         GPU weight split in MiB (default 512; llama: all of\n"
+	    "                 --vram; 0 = CPU only)\n"
 	    "  -d N           Vulkan device index\n"
 	    "  --split F      GPU share of Mamba2 heads and output rows (0.5)\n"
 	    "  --vram MIB     cap on all of our GPU memory (default 1280)\n"
 	    "  --stream F     prompts: GPU share of each matrix's rows, streaming\n"
-	    "                 what is not resident over PCIe (qwen35; 0.5, 0 = off)\n"
+	    "                 what is not resident over PCIe (qwen35 0.5, llama 0.65;\n"
+	    "                 0 = off)\n"
 	    "  --stream-mib M VRAM for streamed weights (default 64)\n"
 	    "  --temp F       temperature (default 0 = greedy)\n"
 	    "  --top-k N      (default 40)  --top-p F (default 0.95)  --seed N\n"
@@ -136,7 +138,7 @@ parse(int argc, char **argv)
 		else if (!strcmp(a, "--api-key")) O.api_key = ARG();
 		else if (!strcmp(a, "-t")) O.threads = atoi(ARG());
 		else if (!strcmp(a, "-c")) O.ctx = atoi(ARG());
-		else if (!strcmp(a, "-g")) O.gpu_mib = atoi(ARG());
+		else if (!strcmp(a, "-g")) { O.gpu_mib = atoi(ARG()); O.g_given = 1; }
 		else if (!strcmp(a, "-d")) O.device = atoi(ARG());
 		else if (!strcmp(a, "--split")) g_split = atof(ARG());
 		else if (!strcmp(a, "--vram")) vk_vram_limit = (size_t)atoi(ARG()) << 20;
@@ -848,8 +850,14 @@ main(int argc, char **argv)
 	g_mtp = M.arch == ARCH_QWEN35 && M.mtp && (O.temp <= 0 || O.server) && !O.nomtp &&
 	    O.ndraft > 0 &&
 	    !O.check && !O.kbench;
+	/* llama (MiniCPM5): CPU-bound at any split the VRAM allows, so its
+	 * rows fill the --vram cap (vk_init clamps to what is free); prompts
+	 * balance at a 0.65 GPU share on the i5-9400 + GT 1030 */
+	if (M.arch == ARCH_LLAMA && !O.g_given)
+		O.gpu_mib = (int)(vk_vram_limit >> 20);
 	if (g_stream < 0)
-		g_stream = ARCH_DENSE(M.arch) && O.gpu_mib > 0 ? 0.5 : 0;
+		g_stream = M.arch == ARCH_LLAMA && O.gpu_mib > 0 ? 0.65 :
+		    ARCH_DENSE(M.arch) && O.gpu_mib > 0 ? 0.5 : 0;
 	if (g_stream > 0 && !vk_stream_bytes)
 		vk_stream_bytes = (size_t)64 << 20;
 	if (O.gpu_mib > 0 && !O.tokens && ARCH_DENSE(M.arch)) {
