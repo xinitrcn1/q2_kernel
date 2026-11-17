@@ -155,8 +155,26 @@ MoE `llama` files are rejected at load.  The `minicpm5` pre-tokenizer is
 llama3's expression run separately on the pieces between
 `\p{N}{1,3}` digit groups (matches `llama-tokenize`).  Q8_0 has a
 multi-token CPU kernel (`dotT`: `maddubs(|w|, sign(x, w))` per 32 with
-its float scale); prompt weight streaming does not handle Q8_0 yet, so
-only the resident rows (`-g`) run on the GPU in prompts.
+its float scale).
+
+On the GPU, Q8_0 is stored per 256 as d[8] qs[256] (no padding) and has
+its own tiled GEMM (128-bit shared loads; tokens in pairs at an odd
+stride, conflict degree 2 per ucas `banks`), so prompts stream it like
+the other types.  Attention reads each K/V row once per GQA group
+(decode: split over 256-position chunks, merged per head).  For llama,
+`-g` defaults to the whole `--vram` cap and `--stream` to 0.65.
+
+Decode is bound by the CPU's share of the weights (it reads ~24 GB/s,
+the GT 1030 ~43 GB/s and waits only past ~53% of the rows), so it scales
+with the VRAM given to the GPU.  This host (i5-9400, GT 1030; shared
+desktop, best of 3):
+
+| MiniCPM5-2B-Q8_0 | prompt (246 tok) | decode | prompt (2600 tok) | decode at 2600 |
+|---|---|---|---|---|
+| before (0338d05) | 58 | 11.0 | 36-60 | 8.1-11.4 |
+| defaults (`--vram 1280`) | 130-136 | 17.3 | 76-84 | 11-13.8 |
+| `--vram 1500` | 143 | 18-20 | 84 | 11.5 |
+| `-g 0` (CPU only) | 67 | 10.7 | | |
 
 Last-token logits vs llama.cpp's CPU build: top 2-3 identical; relative
 L2 ~3% on a short prompt, ~6-7% on 246 chat tokens (f32 `--ref`
